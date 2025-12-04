@@ -8,6 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		D88FFE982EB6A4BF00192353 /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = D88FFE972EB6A4BF00192353 /* FluidAudio */; };
+		D8DE463B2EE22E9E00316696 /* OrderedCollections in Frameworks */ = {isa = PBXBuildFile; productRef = D8DE463A2EE22E9E00316696 /* OrderedCollections */; };
+		D8DE463D2EE22EF000316696 /* Collections in Frameworks */ = {isa = PBXBuildFile; productRef = D8DE463C2EE22EF000316696 /* Collections */; };
+		D8DE463F2EE22F1500316696 /* BasicContainers in Frameworks */ = {isa = PBXBuildFile; productRef = D8DE463E2EE22F1500316696 /* BasicContainers */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -39,7 +42,10 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D8DE463D2EE22EF000316696 /* Collections in Frameworks */,
+				D8DE463B2EE22E9E00316696 /* OrderedCollections in Frameworks */,
 				D88FFE982EB6A4BF00192353 /* FluidAudio in Frameworks */,
+				D8DE463F2EE22F1500316696 /* BasicContainers in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -83,6 +89,9 @@
 			name = DiarizationTest;
 			packageProductDependencies = (
 				D88FFE972EB6A4BF00192353 /* FluidAudio */,
+				D8DE463A2EE22E9E00316696 /* OrderedCollections */,
+				D8DE463C2EE22EF000316696 /* Collections */,
+				D8DE463E2EE22F1500316696 /* BasicContainers */,
 			);
 			productName = DiarizationTest;
 			productReference = D88FFE8C2EB6A49100192353 /* DiarizationTest */;
@@ -114,6 +123,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				D88FFE962EB6A4BF00192353 /* XCRemoteSwiftPackageReference "FluidAudio" */,
+				D8DE46392EE22E9E00316696 /* XCRemoteSwiftPackageReference "swift-collections" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = D88FFE8D2EB6A49100192353 /* Products */;
@@ -340,6 +350,14 @@
 				kind = branch;
 			};
 		};
+		D8DE46392EE22E9E00316696 /* XCRemoteSwiftPackageReference "swift-collections" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-collections.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.3.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -347,6 +365,21 @@
 			isa = XCSwiftPackageProductDependency;
 			package = D88FFE962EB6A4BF00192353 /* XCRemoteSwiftPackageReference "FluidAudio" */;
 			productName = FluidAudio;
+		};
+		D8DE463A2EE22E9E00316696 /* OrderedCollections */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D8DE46392EE22E9E00316696 /* XCRemoteSwiftPackageReference "swift-collections" */;
+			productName = OrderedCollections;
+		};
+		D8DE463C2EE22EF000316696 /* Collections */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D8DE46392EE22E9E00316696 /* XCRemoteSwiftPackageReference "swift-collections" */;
+			productName = Collections;
+		};
+		D8DE463E2EE22F1500316696 /* BasicContainers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D8DE46392EE22E9E00316696 /* XCRemoteSwiftPackageReference "swift-collections" */;
+			productName = BasicContainers;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
