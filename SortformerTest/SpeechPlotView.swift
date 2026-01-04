@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Real-time speech diarization heatmap view matching mic_inference.py visualization.
+/// Real-time speech diarization heatmap view.
 /// Displays speaker probabilities as a viridis-colored heatmap with 4 speaker rows.
 struct SpeechPlotView: View {
     /// Timeline with diarization history
@@ -72,7 +72,7 @@ struct SpeechPlotView: View {
     
     private func mainHeatmapSection(width: CGFloat, height: CGFloat) -> some View {
         HStack(alignment: .top, spacing: 4) {
-            // Y-axis labels (left side)
+            // Y-axis labels
             VStack(spacing: 0) {
                 ForEach(0..<numSpeakers, id: \.self) { speaker in
                     Text("Spk \(speaker)")
@@ -94,12 +94,16 @@ struct SpeechPlotView: View {
                     .onTapGesture { location in
                         guard !isRecording, let tl = timeline else { return }
                         
-                        // Calculate frame from tap location
+                        // Calculate frame and speaker from tap location
                         let cellWidth = calculatedContentWidth(viewportWidth: width) / CGFloat(max(tl.numFrames + tl.numTentative, visibleFrames))
+                        let cellHeight = height / CGFloat(numSpeakers)
                         let clickedFrame = Int(location.x / cellWidth)
+                        let clickedSpeaker = Int(location.y / cellHeight)
                         
-                        // Find segment covering this frame
-                        if let segment = tl.segments.flatMap(\.self).first(where: { clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame }) {
+                        // Find segment covering this frame AND speaker
+                        if let segment = tl.segments.flatMap(\.self).first(where: { 
+                            clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
+                        }) {
                             onPlaySegment?(segment.startTime, segment.endTime)
                         }
                     }
@@ -130,9 +134,6 @@ struct SpeechPlotView: View {
                 .onAppear {
                     scrollProxy.scrollTo("canvas-\(updateTrigger)", anchor: .trailing)
                 }
-                .onAppear {
-                    scrollProxy.scrollTo("canvas-\(updateTrigger)", anchor: .trailing)
-                }
             }
         }
     }
@@ -141,17 +142,17 @@ struct SpeechPlotView: View {
     
     private func spkcacheSection(width: CGFloat, height: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Speaker Cache (\(actualSpkcacheFrames) / \(spkcacheSize) frames)")
-                .font(.subheadline)
+            Text("Speaker Cache (\(spkcacheSize) frames)")
+                .font(.caption)
                 .foregroundColor(.secondary)
-                .padding(.horizontal, 8)
+                .padding(.leading, 4)
             
             HStack(alignment: .top, spacing: 4) {
                 // Y-axis labels
                 VStack(spacing: 0) {
                     ForEach(0..<numSpeakers, id: \.self) { speaker in
                         Text("Spk \(speaker)")
-                            .font(.caption)
+                            .font(.caption2)
                             .foregroundColor(.secondary)
                             .frame(maxHeight: .infinity)
                     }
@@ -189,32 +190,30 @@ struct SpeechPlotView: View {
         return tl.numFrames + tl.numTentative
     }
     
-    private var actualSpkcacheFrames: Int {
-        guard let preds = spkcachePreds else { return 0 }
-        return preds.count / numSpeakers
-    }
-    
     private func calculatedContentWidth(viewportWidth: CGFloat) -> CGFloat {
-        let frameWidth = viewportWidth / CGFloat(visibleFrames)
-        let contentWidth = CGFloat(max(totalFrameCount, visibleFrames)) * frameWidth
-        return contentWidth
+        guard let tl = timeline else {
+            return viewportWidth
+        }
+        let totalFrames = tl.numFrames + tl.numTentative
+        let cellWidth = viewportWidth / CGFloat(visibleFrames)
+        return max(CGFloat(totalFrames) * cellWidth, viewportWidth)
     }
     
     // MARK: - Drawing Functions
     
     private func drawMainHeatmap(context: GraphicsContext, size: CGSize, viewportWidth: CGFloat) {
-        let cellWidth = viewportWidth / CGFloat(visibleFrames)
-        let cellHeight = size.height / CGFloat(numSpeakers)
-        
         guard let tl = timeline else {
-            // Draw empty grid
-            drawEmptyGrid(context: context, size: size, cellWidth: cellWidth, cellHeight: cellHeight)
+            // Draw empty placeholder
+            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(white: 0.1)))
             return
         }
         
         let numConfirmed = tl.numFrames
         let numTentative = tl.numTentative
         let framesToDraw = max(numConfirmed + numTentative, visibleFrames)
+        
+        let cellWidth = size.width / CGFloat(framesToDraw)
+        let cellHeight = size.height / CGFloat(numSpeakers)
         
         // Draw probability cells
         for frameIdx in 0..<framesToDraw {
@@ -245,7 +244,7 @@ struct SpeechPlotView: View {
             var path = Path()
             path.move(to: CGPoint(x: x, y: 0))
             path.addLine(to: CGPoint(x: x, y: size.height))
-            context.stroke(path, with: .color(.red.opacity(0.8)),
+            context.stroke(path, with: .color(.white.opacity(0.8)),
                           style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
         }
         
@@ -264,18 +263,6 @@ struct SpeechPlotView: View {
         }
     }
     
-    private func drawEmptyGrid(context: GraphicsContext, size: CGSize, cellWidth: CGFloat, cellHeight: CGFloat) {
-        for frameIdx in 0..<visibleFrames {
-            let x = CGFloat(frameIdx) * cellWidth
-            for speaker in 0..<numSpeakers {
-                let y = CGFloat(speaker) * cellHeight
-                let rect = CGRect(x: x, y: y, width: cellWidth + 0.5, height: cellHeight)
-                let color = Color(cgColor: ViridisColormap.cgColor(for: 0))
-                context.fill(Path(rect), with: .color(color))
-            }
-        }
-    }
-    
     private func drawSegmentOutline(context: GraphicsContext, segment: SortformerSegment,
                                     cellWidth: CGFloat, cellHeight: CGFloat, tentative: Bool) {
         let speaker = segment.speakerIndex
@@ -285,21 +272,16 @@ struct SpeechPlotView: View {
         let x = CGFloat(startFrame) * cellWidth
         let y = CGFloat(speaker) * cellHeight
         let width = CGFloat(endFrame - startFrame) * cellWidth
-        let height = cellHeight
         
-        let rect = CGRect(x: x + 1, y: y + 1, width: width - 2, height: height - 2)
-        let path = Path(roundedRect: rect, cornerRadius: 2)
-        
+        let rect = CGRect(x: x, y: y, width: width, height: cellHeight)
         let color = speakerColors[speaker % speakerColors.count]
         
-        if tentative {
-            // Dashed outline for tentative
-            context.stroke(path, with: .color(color.opacity(0.7)),
-                          style: StrokeStyle(lineWidth: 2, dash: [4, 2]))
-        } else {
-            // Solid outline for finalized
-            context.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: 2))
-        }
+        let lineWidth: CGFloat = 2
+        let strokeStyle: StrokeStyle = tentative
+            ? StrokeStyle(lineWidth: lineWidth, dash: [4, 2])
+            : StrokeStyle(lineWidth: lineWidth)
+        
+        context.stroke(Path(rect), with: .color(color.opacity(0.9)), style: strokeStyle)
     }
     
     private func drawSpkcacheHeatmap(context: GraphicsContext, size: CGSize) {

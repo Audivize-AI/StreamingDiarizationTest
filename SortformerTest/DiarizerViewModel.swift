@@ -3,7 +3,7 @@ import Combine
 import Foundation
 
 /// ViewModel managing real-time speaker diarization state.
-/// Uses FluidAudio's SortformerDiarizer with gradientDescent configuration.
+/// Uses FluidAudio's SortformerDiarizer with default configuration.
 @MainActor
 final class DiarizerViewModel: ObservableObject {
     
@@ -92,12 +92,119 @@ final class DiarizerViewModel: ObservableObject {
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine = nil
         
+        // Process any remaining audio in buffer
+        audioBufferLock.lock()
+        let remainingSamples = audioBuffer
+        audioBuffer = []
+        audioBufferLock.unlock()
+        
+        if !remainingSamples.isEmpty {
+            diarizer?.addAudio(remainingSamples)
+            // Process until no more chunks
+            while let _ = try? diarizer?.process() {
+                // Keep processing
+            }
+        }
+        
         // Finalize timeline
         timeline?.finalize()
         updateTrigger += 1
         
         isRecording = false
         statusMessage = "Ready - Click segments to play"
+    }
+    
+    /// Save recorded audio to WAV file
+    func saveRecording(to url: URL) {
+        guard !recordedAudio.isEmpty else {
+            statusMessage = "No recording to save"
+            return
+        }
+        
+        guard let wavData = createWAVData(from: recordedAudio, sampleRate: Int(sampleRate)) else {
+            statusMessage = "Failed to create WAV data"
+            return
+        }
+        
+        do {
+            try wavData.write(to: url)
+            statusMessage = "Saved to \(url.lastPathComponent)"
+        } catch {
+            statusMessage = "Save failed: \(error.localizedDescription)"
+        }
+    }
+    
+    /// Load and process an audio file
+    func loadAudioFile(from url: URL) async {
+        guard isReady, !isRecording else { return }
+        guard let diarizer = diarizer else { return }
+        
+        statusMessage = "Loading audio file..."
+        
+        // Start security-scoped access for sandboxed apps
+        let didStartAccessing = url.startAccessingSecurityScopedResource()
+        defer {
+            if didStartAccessing {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        
+        do {
+            // Load audio file
+            let audioFile = try AVAudioFile(forReading: url)
+            let format = audioFile.processingFormat
+            let frameCount = AVAudioFrameCount(audioFile.length)
+            
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+                statusMessage = "Failed to create audio buffer"
+                return
+            }
+            
+            try audioFile.read(into: buffer)
+            
+            guard let channelData = buffer.floatChannelData else {
+                statusMessage = "Failed to read audio data"
+                return
+            }
+            
+            // Convert to mono
+            let samples: [Float]
+            if format.channelCount > 1 {
+                samples = (0..<Int(frameCount)).map { i in
+                    var sum: Float = 0
+                    for ch in 0..<Int(format.channelCount) {
+                        sum += channelData[ch][i]
+                    }
+                    return sum / Float(format.channelCount)
+                }
+            } else {
+                samples = Array(UnsafeBufferPointer(start: channelData[0], count: Int(frameCount)))
+            }
+            
+            // Resample to 16kHz if needed
+            let resampledSamples: [Float]
+            if abs(format.sampleRate - sampleRate) > 1.0 {
+                resampledSamples = try audioConverter.resample(samples, from: format.sampleRate)
+            } else {
+                resampledSamples = samples
+            }
+            
+            // Store for playback
+            recordedAudio = resampledSamples
+            
+            statusMessage = "Processing \(url.lastPathComponent)..."
+            
+            // Process complete audio
+            timeline = try diarizer.processComplete(resampledSamples)
+            updateTrigger += 1
+            
+            let duration = Float(resampledSamples.count) / Float(sampleRate)
+            statusMessage = String(format: "Processed %.1fs - Click segments to play", duration)
+            
+        } catch {
+            statusMessage = "Load failed: \(error.localizedDescription)"
+            print("Audio load error: \(error)")
+        }
     }
     
     /// Play a segment of recorded audio
@@ -244,7 +351,7 @@ final class DiarizerViewModel: ObservableObject {
         let inputSampleRate = format.sampleRate
         let resampledSamples: [Float]
         if abs(inputSampleRate - sampleRate) > 1.0 {
-            resampledSamples = try resample(samples, from: inputSampleRate)
+            resampledSamples = try audioConverter.resample(samples, from: inputSampleRate)
         } else {
             resampledSamples = samples
         }
@@ -254,11 +361,6 @@ final class DiarizerViewModel: ObservableObject {
         audioBuffer.append(contentsOf: resampledSamples)
         recordedAudio.append(contentsOf: resampledSamples)
         audioBufferLock.unlock()
-    }
-    
-    private func resample(_ samples: [Float], from sourceSampleRate: Double) throws -> [Float] {
-        let output = try audioConverter.resample(samples, from: sourceSampleRate)
-        return output
     }
     
     private func processingLoop() async {
