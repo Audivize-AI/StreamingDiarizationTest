@@ -2,31 +2,16 @@
 //  SortformerTestApp.swift
 //  SortformerTest
 //
-//  Created by Benjamin Lee on 12/28/25.
+//  Real-time speech diarization test application
 //
 
 import SwiftUI
-import SwiftData
 
 @main
 struct SortformerTestApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-
-        do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
-        } catch {
-            fatalError("Could not create ModelContainer: \(error)")
-        }
-    }()
-
     var body: some Scene {
         WindowGroup {
             ContentView()
         }
-        .modelContainer(sharedModelContainer)
     }
 }
