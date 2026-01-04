@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreGraphics
 
 /// Real-time speech diarization heatmap view.
 /// Displays speaker probabilities as a viridis-colored heatmap with 4 speaker rows.
@@ -27,9 +28,11 @@ struct SpeechPlotView: View {
     /// Number of speakers (fixed at 4 for Sortformer)
     private let numSpeakers = 4
     
-    /// Auto-scroll delay after user interaction
-    @State private var lastScrollTime: Date = Date()
-    @State private var userIsScrolling = false
+    /// Maximum frames to draw individually (above this, use bitmap rendering)
+    private let maxFramesForDetailedDraw = 5000
+    
+    /// Track if we're at the trailing edge (following live updates)
+    @State private var isFollowingLive = true
     
     // Segment outline colors per speaker
     private let speakerColors: [Color] = [
@@ -39,8 +42,7 @@ struct SpeechPlotView: View {
     var body: some View {
         GeometryReader { geometry in
             let availableHeight = geometry.size.height - 80
-            let mainPlotHeight = availableHeight * 0.6
-            let spkcachePlotHeight = availableHeight * 0.3
+            let plotHeight = availableHeight * 0.45  // Same height for both plots
             
             VStack(alignment: .leading, spacing: 8) {
                 // Title with stats
@@ -49,7 +51,7 @@ struct SpeechPlotView: View {
                     .padding(.horizontal, 8)
                 
                 // Main diarization heatmap with labels
-                mainHeatmapSection(width: geometry.size.width - 60, height: mainPlotHeight)
+                mainHeatmapSection(width: geometry.size.width - 60, height: plotHeight)
                 
                 // X-axis label
                 Text("Time (frames, 80ms each) - \(totalFrameCount) total frames")
@@ -60,7 +62,7 @@ struct SpeechPlotView: View {
                 Divider()
                 
                 // Speaker cache visualization (always shown)
-                spkcacheSection(width: geometry.size.width - 60, height: spkcachePlotHeight)
+                spkcacheSection(width: geometry.size.width - 60, height: plotHeight)
             }
         }
         .padding(8)
@@ -86,53 +88,91 @@ struct SpeechPlotView: View {
             // Scrollable heatmap - keeps ALL history
             ScrollViewReader { scrollProxy in
                 ScrollView(.horizontal, showsIndicators: true) {
-                    Canvas { context, size in
-                        drawMainHeatmap(context: context, size: size, viewportWidth: width)
-                    }
-                    .id("canvas-\(updateTrigger)")  // Force redraw on updates
-                    .frame(width: calculatedContentWidth(viewportWidth: width), height: height)
-                    .onTapGesture { location in
-                        guard !isRecording, let tl = timeline else { return }
-                        
-                        // Calculate frame and speaker from tap location
-                        let cellWidth = calculatedContentWidth(viewportWidth: width) / CGFloat(max(tl.numFrames + tl.numTentative, visibleFrames))
-                        let cellHeight = height / CGFloat(numSpeakers)
-                        let clickedFrame = Int(location.x / cellWidth)
-                        let clickedSpeaker = Int(location.y / cellHeight)
-                        
-                        // Find segment covering this frame AND speaker
-                        if let segment = tl.segments.flatMap(\.self).first(where: { 
-                            clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
-                        }) {
-                            onPlaySegment?(segment.startTime, segment.endTime)
+                    HStack(spacing: 0) {
+                        Canvas { context, size in
+                            drawMainHeatmap(context: context, size: size, viewportWidth: width)
                         }
+                        .drawingGroup()  // Renders to bitmap - better performance
+                        .frame(width: calculatedContentWidth(viewportWidth: width), height: height)
+                        .onTapGesture { location in
+                            guard !isRecording, let tl = timeline else { return }
+                            
+                            // Calculate frame and speaker from tap location
+                            let cellWidth = calculatedContentWidth(viewportWidth: width) / CGFloat(max(tl.numFrames + tl.numTentative, visibleFrames))
+                            let cellHeight = height / CGFloat(numSpeakers)
+                            let clickedFrame = Int(location.x / cellWidth)
+                            let clickedSpeaker = Int(location.y / cellHeight)
+                            
+                            // Find segment covering this frame AND speaker
+                            if let segment = tl.segments.flatMap(\.self).first(where: { 
+                                clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
+                            }) {
+                                onPlaySegment?(segment.startTime, segment.endTime)
+                            }
+                        }
+                        .background(
+                            // Track scroll position
+                            GeometryReader { contentGeometry in
+                                Color.clear.preference(
+                                    key: ScrollOffsetPreferenceKey.self,
+                                    value: contentGeometry.frame(in: .named("scrollView")).minX
+                                )
+                            }
+                        )
+                        
+                        // Stable scroll target at the trailing edge
+                        Color.clear
+                            .frame(width: 1, height: height)
+                            .id("scrollEnd")
+                    }
+                }
+                .coordinateSpace(name: "scrollView")
+                .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
+                    // Check if we're near the trailing edge (within 50 points)
+                    let contentWidth = calculatedContentWidth(viewportWidth: width)
+                    let maxOffset = -(contentWidth - width)
+                    let isNearEnd = offset <= maxOffset + 50
+                    
+                    if isNearEnd && !isFollowingLive {
+                        isFollowingLive = true
+                    } else if !isNearEnd && isFollowingLive && isRecording {
+                        isFollowingLive = false
                     }
                 }
                 .frame(height: height)
                 .background(Color(white: 0.1))
                 .cornerRadius(8)
-                .simultaneousGesture(
-                    DragGesture()
-                        .onChanged { _ in
-                            userIsScrolling = true
-                            lastScrollTime = Date()
-                        }
-                        .onEnded { _ in
-                            userIsScrolling = false
-                            lastScrollTime = Date()
-                        }
-                )
                 .onChange(of: updateTrigger) { _, _ in
-                    // Auto-scroll after 3 seconds of inactivity while recording
-                    let timeSinceScroll = Date().timeIntervalSince(lastScrollTime)
-                    if isRecording && !userIsScrolling && timeSinceScroll > 3.0 {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            scrollProxy.scrollTo("canvas-\(updateTrigger)", anchor: .trailing)
-                        }
+                    // Only auto-scroll if following live
+                    if isRecording && isFollowingLive {
+                        scrollProxy.scrollTo("scrollEnd", anchor: .trailing)
                     }
                 }
                 .onAppear {
-                    scrollProxy.scrollTo("canvas-\(updateTrigger)", anchor: .trailing)
+                    scrollProxy.scrollTo("scrollEnd", anchor: .trailing)
+                    isFollowingLive = true
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    // Show "Follow Live" button when scrolled away during recording
+                    if isRecording && !isFollowingLive {
+                        Button(action: {
+                            isFollowingLive = true
+                            scrollProxy.scrollTo("scrollEnd", anchor: .trailing)
+                        }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.right.to.line")
+                                Text("Follow Live")
+                            }
+                            .font(.caption)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.blue)
+                            .foregroundColor(.white)
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(8)
+                    }
                 }
             }
         }
@@ -199,7 +239,7 @@ struct SpeechPlotView: View {
         return max(CGFloat(totalFrames) * cellWidth, viewportWidth)
     }
     
-    // MARK: - Drawing Functions
+    // MARK: - Optimized Drawing Functions
     
     private func drawMainHeatmap(context: GraphicsContext, size: CGSize, viewportWidth: CGFloat) {
         guard let tl = timeline else {
@@ -210,32 +250,21 @@ struct SpeechPlotView: View {
         
         let numConfirmed = tl.numFrames
         let numTentative = tl.numTentative
-        let framesToDraw = max(numConfirmed + numTentative, visibleFrames)
+        let totalFrames = numConfirmed + numTentative
+        let framesToDraw = max(totalFrames, visibleFrames)
         
         let cellWidth = size.width / CGFloat(framesToDraw)
         let cellHeight = size.height / CGFloat(numSpeakers)
         
-        // Draw probability cells
-        for frameIdx in 0..<framesToDraw {
-            let x = CGFloat(frameIdx) * cellWidth
-            
-            for speaker in 0..<numSpeakers {
-                let y = CGFloat(speaker) * cellHeight
-                let rect = CGRect(x: x, y: y, width: cellWidth + 0.5, height: cellHeight)
-                
-                let prob: Float
-                if frameIdx < numConfirmed {
-                    prob = tl.probability(speaker: speaker, frame: frameIdx)
-                } else if frameIdx < numConfirmed + numTentative {
-                    let tentativeFrame = frameIdx - numConfirmed
-                    prob = tl.tentativeProbability(speaker: speaker, frame: tentativeFrame)
-                } else {
-                    prob = 0 // Padding
-                }
-                
-                let color = Color(cgColor: ViridisColormap.cgColor(for: prob))
-                context.fill(Path(rect), with: .color(color))
-            }
+        // Use bitmap rendering for large timelines
+        if totalFrames > maxFramesForDetailedDraw {
+            drawHeatmapAsBitmap(context: context, size: size, timeline: tl, 
+                               numConfirmed: numConfirmed, numTentative: numTentative,
+                               cellWidth: cellWidth, cellHeight: cellHeight)
+        } else {
+            drawHeatmapDetailed(context: context, timeline: tl,
+                               numConfirmed: numConfirmed, numTentative: numTentative,
+                               framesToDraw: framesToDraw, cellWidth: cellWidth, cellHeight: cellHeight)
         }
         
         // Draw tentative boundary line
@@ -261,6 +290,102 @@ struct SpeechPlotView: View {
             drawSegmentOutline(context: context, segment: segment, cellWidth: cellWidth,
                              cellHeight: cellHeight, tentative: true)
         }
+    }
+    
+    /// Detailed drawing for short timelines - individual rectangles
+    private func drawHeatmapDetailed(context: GraphicsContext, timeline tl: SortformerTimeline,
+                                     numConfirmed: Int, numTentative: Int,
+                                     framesToDraw: Int, cellWidth: CGFloat, cellHeight: CGFloat) {
+        for frameIdx in 0..<framesToDraw {
+            let x = CGFloat(frameIdx) * cellWidth
+            
+            for speaker in 0..<numSpeakers {
+                let y = CGFloat(speaker) * cellHeight
+                let rect = CGRect(x: x, y: y, width: cellWidth + 0.5, height: cellHeight)
+                
+                let prob: Float
+                if frameIdx < numConfirmed {
+                    prob = tl.probability(speaker: speaker, frame: frameIdx)
+                } else if frameIdx < numConfirmed + numTentative {
+                    let tentativeFrame = frameIdx - numConfirmed
+                    prob = tl.tentativeProbability(speaker: speaker, frame: tentativeFrame)
+                } else {
+                    prob = 0 // Padding
+                }
+                
+                let color = Color(cgColor: ViridisColormap.cgColor(for: prob))
+                context.fill(Path(rect), with: .color(color))
+            }
+        }
+    }
+    
+    /// Bitmap-based drawing for long timelines - render to CGImage then draw once
+    private func drawHeatmapAsBitmap(context: GraphicsContext, size: CGSize, timeline tl: SortformerTimeline,
+                                     numConfirmed: Int, numTentative: Int,
+                                     cellWidth: CGFloat, cellHeight: CGFloat) {
+        let totalFrames = numConfirmed + numTentative
+        
+        // Downsample if needed - limit bitmap to reasonable size
+        let maxBitmapWidth = 4000
+        let downsampleFactor = max(1, totalFrames / maxBitmapWidth)
+        let bitmapWidth = (totalFrames + downsampleFactor - 1) / downsampleFactor
+        let bitmapHeight = numSpeakers
+        
+        // Create bitmap data (RGBA, 4 bytes per pixel)
+        var pixelData = [UInt8](repeating: 0, count: bitmapWidth * bitmapHeight * 4)
+        
+        for x in 0..<bitmapWidth {
+            // Sample frame (use max probability in downsampled range for visibility)
+            let frameStart = x * downsampleFactor
+            let frameEnd = min(frameStart + downsampleFactor, totalFrames)
+            
+            for speaker in 0..<bitmapHeight {
+                var maxProb: Float = 0
+                
+                for frameIdx in frameStart..<frameEnd {
+                    let prob: Float
+                    if frameIdx < numConfirmed {
+                        prob = tl.probability(speaker: speaker, frame: frameIdx)
+                    } else {
+                        let tentativeFrame = frameIdx - numConfirmed
+                        prob = tl.tentativeProbability(speaker: speaker, frame: tentativeFrame)
+                    }
+                    maxProb = max(maxProb, prob)
+                }
+                
+                let (r, g, b) = ViridisColormap.rgb(for: maxProb)
+                let pixelIndex = (speaker * bitmapWidth + x) * 4
+                pixelData[pixelIndex] = r
+                pixelData[pixelIndex + 1] = g
+                pixelData[pixelIndex + 2] = b
+                pixelData[pixelIndex + 3] = 255
+            }
+        }
+        
+        // Create CGImage from pixel data
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+        
+        guard let provider = CGDataProvider(data: Data(pixelData) as CFData),
+              let cgImage = CGImage(
+                width: bitmapWidth,
+                height: bitmapHeight,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: bitmapWidth * 4,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo,
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: true,  // Enable interpolation for smooth scaling
+                intent: .defaultIntent
+              ) else {
+            return
+        }
+        
+        // Draw the bitmap scaled to fill the canvas
+        let image = Image(decorative: cgImage, scale: 1.0, orientation: .up)
+        context.draw(image, in: CGRect(origin: .zero, size: size))
     }
     
     private func drawSegmentOutline(context: GraphicsContext, segment: SortformerSegment,
@@ -323,4 +448,13 @@ struct SpeechPlotView: View {
     )
     .frame(height: 400)
     .padding()
+}
+
+// MARK: - Preference Key for Scroll Tracking
+
+private struct ScrollOffsetPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
 }

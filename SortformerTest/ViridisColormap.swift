@@ -278,4 +278,12 @@ struct ViridisColormap {
         let (r, g, b) = colors[index]
         return CGColor(red: r, green: g, blue: b, alpha: 1.0)
     }
+    
+    /// Get RGB as UInt8 values for bitmap rendering
+    static func rgb(for value: Float) -> (r: UInt8, g: UInt8, b: UInt8) {
+        let clampedValue = max(0, min(1, value))
+        let index = Int(clampedValue * Float(colors.count - 1))
+        let (r, g, b) = colors[index]
+        return (UInt8(r * 255), UInt8(g * 255), UInt8(b * 255))
+    }
 }
