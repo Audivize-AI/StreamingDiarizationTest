@@ -196,6 +196,7 @@ final class DiarizerViewModel: ObservableObject {
             
             // Process complete audio
             timeline = try diarizer.processComplete(resampledSamples)
+            spkcachePreds = diarizer.state.spkcachePreds  // Update speaker cache display
             updateTrigger += 1
             
             let duration = Float(resampledSamples.count) / Float(sampleRate)
