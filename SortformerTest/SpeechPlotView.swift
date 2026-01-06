@@ -10,6 +10,15 @@ struct SpeechPlotView: View {
     /// Speaker cache predictions (optional, drawn as zeros if nil)
     let spkcachePreds: [Float]?
     
+    /// FIFO queue predictions (optional)
+    let fifoPreds: [Float]?
+    
+    /// Right context frames for FIFO alignment
+    let chunkRightContext: Int
+    
+    /// Left context frames for FIFO alignment
+    let chunkLeftContext: Int
+    
     /// Whether recording is active (for auto-scroll behavior)
     let isRecording: Bool
     
@@ -28,11 +37,17 @@ struct SpeechPlotView: View {
     /// Number of speakers (fixed at 4 for Sortformer)
     private let numSpeakers = 4
     
-    /// Maximum frames to draw individually (above this, use bitmap rendering)
-    private let maxFramesForDetailedDraw = 5000
+    /// Chunk size for virtualization (frames per chunk)
+    private let chunkSize = 500
+    
+    /// Buffer chunks to render outside visible area
+    private let bufferChunks = 2
     
     /// Track if we're at the trailing edge (following live updates)
     @State private var isFollowingLive = true
+    
+    /// Current scroll offset for virtualization
+    @State private var scrollOffset: CGFloat = 0
     
     // Segment outline colors per speaker
     private let speakerColors: [Color] = [
@@ -41,17 +56,19 @@ struct SpeechPlotView: View {
     
     var body: some View {
         GeometryReader { geometry in
-            let availableHeight = geometry.size.height - 80
-            let plotHeight = availableHeight * 0.45  // Same height for both plots
+            let availableHeight = geometry.size.height - 80  // Reserved for title/labels/padding
+            let plotHeight = availableHeight / 3.0  // Equal height for all 3 plots
+            // Subtract 49 for Y-axis labels (45) + spacing (4) to get actual plot width
+            let plotWidth = geometry.size.width - 49
             
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
                 // Title with stats
                 Text(titleText)
                     .font(.headline)
                     .padding(.horizontal, 8)
                 
                 // Main diarization heatmap with labels
-                mainHeatmapSection(width: geometry.size.width - 60, height: plotHeight)
+                mainHeatmapSection(width: plotWidth, height: plotHeight)
                 
                 // X-axis label
                 Text("Time (frames, 80ms each) - \(totalFrameCount) total frames")
@@ -59,13 +76,14 @@ struct SpeechPlotView: View {
                     .foregroundColor(.secondary)
                     .padding(.leading, 49)
                 
-                Divider()
+                // FIFO queue visualization (aligned with main timeline)
+                fifoSection(width: plotWidth, height: plotHeight)
                 
                 // Speaker cache visualization (always shown)
-                spkcacheSection(width: geometry.size.width - 60, height: plotHeight)
+                spkcacheSection(width: plotWidth, height: plotHeight)
             }
         }
-        .padding(8)
+        .padding(12)  // Match spacing with title text
         .background(Color(white: 0.05))
         .cornerRadius(12)
     }
@@ -85,62 +103,93 @@ struct SpeechPlotView: View {
             }
             .frame(width: 45, height: height)
             
-            // Scrollable heatmap - keeps ALL history
+            // Scrollable heatmap - virtualized chunks
             ScrollViewReader { scrollProxy in
                 ScrollView(.horizontal, showsIndicators: true) {
+                    let contentWidth = calculatedContentWidth(viewportWidth: width)
+                    let cellWidth = contentWidth / CGFloat(max(totalFrameCount, visibleFrames))
+                    let totalChunks = max(1, (totalFrameCount + chunkSize - 1) / chunkSize)
+                    
                     HStack(spacing: 0) {
-                        Canvas { context, size in
-                            drawMainHeatmap(context: context, size: size, viewportWidth: width)
-                        }
-                        .drawingGroup()  // Renders to bitmap - better performance
-                        .frame(width: calculatedContentWidth(viewportWidth: width), height: height)
-                        .onTapGesture { location in
-                            guard !isRecording, let tl = timeline else { return }
+                        // Render chunks - LazyHStack would be ideal but doesn't work well with ScrollViewReader
+                        ForEach(0..<totalChunks, id: \.self) { chunkIndex in
+                            let startFrame = chunkIndex * chunkSize
+                            let endFrame = min(startFrame + chunkSize, max(totalFrameCount, visibleFrames))
+                            let chunkWidth = CGFloat(endFrame - startFrame) * cellWidth
                             
-                            // Calculate frame and speaker from tap location
-                            let cellWidth = calculatedContentWidth(viewportWidth: width) / CGFloat(max(tl.numFrames + tl.numTentative, visibleFrames))
-                            let cellHeight = height / CGFloat(numSpeakers)
-                            let clickedFrame = Int(location.x / cellWidth)
-                            let clickedSpeaker = Int(location.y / cellHeight)
-                            
-                            // Find segment covering this frame AND speaker
-                            if let segment = tl.segments.flatMap(\.self).first(where: { 
-                                clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
-                            }) {
-                                onPlaySegment?(segment.startTime, segment.endTime)
+                            Canvas { context, size in
+                                drawChunk(context: context, size: size, 
+                                         startFrame: startFrame, endFrame: endFrame,
+                                         cellWidth: cellWidth, cellHeight: height / CGFloat(numSpeakers))
                             }
+                            .drawingGroup()
+                            .frame(width: chunkWidth, height: height)
+                            .id("chunk-\(chunkIndex)")
                         }
-                        .background(
-                            // Track scroll position
-                            GeometryReader { contentGeometry in
-                                Color.clear.preference(
-                                    key: ScrollOffsetPreferenceKey.self,
-                                    value: contentGeometry.frame(in: .named("scrollView")).minX
-                                )
-                            }
-                        )
+                        
+                        // Draw segment overlays on top (single canvas for segments)
+                        // Moved to overlay for proper layering
                         
                         // Stable scroll target at the trailing edge
                         Color.clear
                             .frame(width: 1, height: height)
                             .id("scrollEnd")
                     }
+                    .overlay {
+                        // Segment outlines layer
+                        Canvas { context, size in
+                            drawSegmentOverlays(context: context, size: size, viewportWidth: width)
+                        }
+                        .allowsHitTesting(false)
+                    }
+                    .onTapGesture { location in
+                        guard !isRecording, let tl = timeline else { return }
+                        
+                        // Calculate frame and speaker from tap location
+                        let cellHeight = height / CGFloat(numSpeakers)
+                        let clickedFrame = Int(location.x / cellWidth)
+                        let clickedSpeaker = Int(location.y / cellHeight)
+                        
+                        // Find segment covering this frame AND speaker
+                        if let segment = tl.segments.flatMap(\.self).first(where: { 
+                            clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
+                        }) {
+                            onPlaySegment?(segment.startTime, segment.endTime)
+                        }
+                    }
+                    .background(
+                        // Track scroll position
+                        GeometryReader { contentGeometry in
+                            Color.clear.preference(
+                                key: ScrollOffsetPreferenceKey.self,
+                                value: contentGeometry.frame(in: .named("scrollView")).minX
+                            )
+                        }
+                    )
                 }
                 .coordinateSpace(name: "scrollView")
                 .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
-                    // Check if we're near the trailing edge (within 50 points)
+                    scrollOffset = offset
+                    // Check if we're near the trailing edge
+                    // contentWidth is the full scrollable width, width is the viewport
                     let contentWidth = calculatedContentWidth(viewportWidth: width)
                     let maxOffset = -(contentWidth - width)
-                    let isNearEnd = offset <= maxOffset + 50
                     
-                    if isNearEnd && !isFollowingLive {
+                    // Only consider "at end" if within 20 points (stricter threshold)
+                    let isAtEnd = offset <= maxOffset + 20
+                    
+                    // Only set isFollowingLive = true if user scrolled all the way to end
+                    // Don't automatically follow just because content grew
+                    if isAtEnd && !isFollowingLive && offset < -10 {
+                        // User manually scrolled to end - only if content is actually scrolled
                         isFollowingLive = true
-                    } else if !isNearEnd && isFollowingLive && isRecording {
+                    } else if !isAtEnd && isFollowingLive && isRecording {
+                        // User scrolled away from end while recording
                         isFollowingLive = false
                     }
                 }
                 .frame(height: height)
-                .background(Color(white: 0.1))
+                .background(Color(cgColor: ViridisColormap.cgColor(for: 0)))  // Purple background
                 .cornerRadius(8)
                 .onChange(of: updateTrigger) { _, _ in
                     // Only auto-scroll if following live
@@ -178,6 +227,40 @@ struct SpeechPlotView: View {
         }
     }
     
+    // MARK: - FIFO Queue Section
+    
+    private func fifoSection(width: CGFloat, height: CGFloat) -> some View {
+        let fifoLength = (fifoPreds?.count ?? 0) / numSpeakers
+        
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("FIFO Queue (\(fifoLength) frames)")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.leading, 4)
+            
+            HStack(alignment: .top, spacing: 4) {
+                // Y-axis labels
+                VStack(spacing: 0) {
+                    ForEach(0..<numSpeakers, id: \.self) { speaker in
+                        Text("Spk \(speaker)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .frame(maxHeight: .infinity)
+                    }
+                }
+                .frame(width: 45, height: height)
+                
+                // FIFO heatmap - fixed width, right-aligned content
+                Canvas { context, size in
+                    drawFifoHeatmap(context: context, size: size)
+                }
+                .frame(width: width, height: height)
+                .background(Color(cgColor: ViridisColormap.cgColor(for: 0)))  // Purple background
+                .cornerRadius(6)
+            }
+        }
+    }
+    
     // MARK: - Speaker Cache Section
     
     private func spkcacheSection(width: CGFloat, height: CGFloat) -> some View {
@@ -205,7 +288,7 @@ struct SpeechPlotView: View {
                 }
                 .id("spkcache-\(updateTrigger)")  // Force redraw on updates
                 .frame(width: width, height: height)
-                .background(Color(white: 0.1))
+                .background(Color(cgColor: ViridisColormap.cgColor(for: 0)))  // Purple background
                 .cornerRadius(6)
             }
         }
@@ -239,12 +322,84 @@ struct SpeechPlotView: View {
         return max(CGFloat(totalFrames) * cellWidth, viewportWidth)
     }
     
-    // MARK: - Optimized Drawing Functions
+    // MARK: - Chunk-Based Drawing Functions
+    
+    /// Draw a single chunk of the heatmap
+    private func drawChunk(context: GraphicsContext, size: CGSize,
+                          startFrame: Int, endFrame: Int,
+                          cellWidth: CGFloat, cellHeight: CGFloat) {
+        guard let tl = timeline else {
+            // Draw purple background for empty chunk
+            context.fill(Path(CGRect(origin: .zero, size: size)), 
+                        with: .color(Color(cgColor: ViridisColormap.cgColor(for: 0))))
+            return
+        }
+        
+        let numConfirmed = tl.numFrames
+        let numTentative = tl.numTentative
+        
+        // Draw probability cells for this chunk
+        for frameIdx in startFrame..<endFrame {
+            let localX = CGFloat(frameIdx - startFrame) * cellWidth
+            
+            for speaker in 0..<numSpeakers {
+                let y = CGFloat(speaker) * cellHeight
+                let rect = CGRect(x: localX, y: y, width: cellWidth + 0.5, height: cellHeight)
+                
+                let prob: Float
+                if frameIdx < numConfirmed {
+                    prob = tl.probability(speaker: speaker, frame: frameIdx)
+                } else if frameIdx < numConfirmed + numTentative {
+                    let tentativeFrame = frameIdx - numConfirmed
+                    prob = tl.tentativeProbability(speaker: speaker, frame: tentativeFrame)
+                } else {
+                    prob = 0 // Padding
+                }
+                
+                let color = Color(cgColor: ViridisColormap.cgColor(for: prob))
+                context.fill(Path(rect), with: .color(color))
+            }
+        }
+        
+        // Draw tentative boundary line if it's in this chunk
+        if numTentative > 0 && numConfirmed >= startFrame && numConfirmed < endFrame {
+            let localX = CGFloat(numConfirmed - startFrame) * cellWidth
+            var path = Path()
+            path.move(to: CGPoint(x: localX, y: 0))
+            path.addLine(to: CGPoint(x: localX, y: size.height))
+            context.stroke(path, with: .color(.white.opacity(0.8)),
+                          style: StrokeStyle(lineWidth: 2, dash: [5, 3]))
+        }
+    }
+    
+    /// Draw segment outlines as an overlay
+    private func drawSegmentOverlays(context: GraphicsContext, size: CGSize, viewportWidth: CGFloat) {
+        guard let tl = timeline else { return }
+        
+        let totalFrames = max(tl.numFrames + tl.numTentative, visibleFrames)
+        let cellWidth = size.width / CGFloat(totalFrames)
+        let cellHeight = size.height / CGFloat(numSpeakers)
+        
+        // Draw finalized segments (solid)
+        for segment in tl.segments.flatMap({ $0 }) {
+            drawSegmentOutline(context: context, segment: segment, 
+                             cellWidth: cellWidth, cellHeight: cellHeight, tentative: false)
+        }
+        
+        // Draw tentative segments (dashed)
+        for segment in tl.tentativeSegments.flatMap({ $0 }) {
+            drawSegmentOutline(context: context, segment: segment, 
+                             cellWidth: cellWidth, cellHeight: cellHeight, tentative: true)
+        }
+    }
+    
+    // MARK: - Legacy Drawing Functions (kept for reference)
     
     private func drawMainHeatmap(context: GraphicsContext, size: CGSize, viewportWidth: CGFloat) {
         guard let tl = timeline else {
-            // Draw empty placeholder
-            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color(white: 0.1)))
+            // Draw empty placeholder with purple background
+            context.fill(Path(CGRect(origin: .zero, size: size)), 
+                        with: .color(Color(cgColor: ViridisColormap.cgColor(for: 0))))
             return
         }
         
@@ -256,16 +411,10 @@ struct SpeechPlotView: View {
         let cellWidth = size.width / CGFloat(framesToDraw)
         let cellHeight = size.height / CGFloat(numSpeakers)
         
-        // Use bitmap rendering for large timelines
-        if totalFrames > maxFramesForDetailedDraw {
-            drawHeatmapAsBitmap(context: context, size: size, timeline: tl, 
-                               numConfirmed: numConfirmed, numTentative: numTentative,
-                               cellWidth: cellWidth, cellHeight: cellHeight)
-        } else {
-            drawHeatmapDetailed(context: context, timeline: tl,
-                               numConfirmed: numConfirmed, numTentative: numTentative,
-                               framesToDraw: framesToDraw, cellWidth: cellWidth, cellHeight: cellHeight)
-        }
+        // Always use detailed drawing - Canvas with drawingGroup() is efficient enough
+        drawHeatmapDetailed(context: context, timeline: tl,
+                           numConfirmed: numConfirmed, numTentative: numTentative,
+                           framesToDraw: framesToDraw, cellWidth: cellWidth, cellHeight: cellHeight)
         
         // Draw tentative boundary line
         if numTentative > 0 && numConfirmed > 0 {
@@ -292,10 +441,15 @@ struct SpeechPlotView: View {
         }
     }
     
-    /// Detailed drawing for short timelines - individual rectangles
+    /// Detailed drawing for timelines - individual rectangles with viewport culling
     private func drawHeatmapDetailed(context: GraphicsContext, timeline tl: SortformerTimeline,
                                      numConfirmed: Int, numTentative: Int,
                                      framesToDraw: Int, cellWidth: CGFloat, cellHeight: CGFloat) {
+        // Estimate visible frames based on viewport (visibleFrames constant)
+        // We draw all frames since Canvas needs the full content, but drawingGroup()
+        // efficiently handles GPU clipping. For very long timelines (>10000 frames),
+        // consider chunking or virtualization.
+        
         for frameIdx in 0..<framesToDraw {
             let x = CGFloat(frameIdx) * cellWidth
             
@@ -380,6 +534,9 @@ struct SpeechPlotView: View {
                 shouldInterpolate: true,  // Enable interpolation for smooth scaling
                 intent: .defaultIntent
               ) else {
+            // Fallback: draw purple background if bitmap fails
+            context.fill(Path(CGRect(origin: .zero, size: size)), 
+                        with: .color(Color(cgColor: ViridisColormap.cgColor(for: 0))))
             return
         }
         
@@ -436,17 +593,81 @@ struct SpeechPlotView: View {
             }
         }
     }
+    
+    /// Draw FIFO queue heatmap - fixed viewport, right-aligned to show recent frames
+    private func drawFifoHeatmap(context: GraphicsContext, size: CGSize) {
+        let preds = fifoPreds ?? []
+        let fifoFrames = preds.count / numSpeakers
+        
+        // FIFO uses a fixed viewport of visibleFrames, with content right-aligned
+        let cellWidth = size.width / CGFloat(visibleFrames)
+        let cellHeight = size.height / CGFloat(numSpeakers)
+        
+        guard fifoFrames > 0 else {
+            // Empty - background color (purple) will show through
+            return
+        }
+        
+        // Right-align the FIFO content within the fixed viewport
+        // Leave chunkRightContext frames of empty space on the right
+        let rightPadding = chunkRightContext
+        let startX = size.width - CGFloat(fifoFrames + rightPadding) * cellWidth
+        
+        // Draw the FIFO predictions
+        for frameIdx in 0..<fifoFrames {
+            let x = startX + CGFloat(frameIdx) * cellWidth
+            
+            // Skip if off-screen to the left or right
+            if x + cellWidth < 0 || x > size.width { continue }
+            
+            for speaker in 0..<numSpeakers {
+                let y = CGFloat(speaker) * cellHeight
+                let rect = CGRect(x: x, y: y, width: cellWidth + 0.5, height: cellHeight)
+                
+                let probIdx = frameIdx * numSpeakers + speaker
+                let prob = probIdx < preds.count ? preds[probIdx] : 0
+                
+                let color = Color(cgColor: ViridisColormap.cgColor(for: prob))
+                context.fill(Path(rect), with: .color(color))
+            }
+        }
+        
+        // Draw dashed boundary lines for FIFO bounds
+        let fifoStartX = startX
+        let fifoEndX = startX + CGFloat(fifoFrames) * cellWidth
+        let dashStyle = StrokeStyle(lineWidth: 1.5, dash: [4, 3])
+        let boundaryColor = Color.white.opacity(0.6)
+        
+        // Left boundary
+        if fifoStartX >= 0 && fifoStartX <= size.width {
+            var leftPath = Path()
+            leftPath.move(to: CGPoint(x: fifoStartX, y: 0))
+            leftPath.addLine(to: CGPoint(x: fifoStartX, y: size.height))
+            context.stroke(leftPath, with: .color(boundaryColor), style: dashStyle)
+        }
+        
+        // Right boundary
+        if fifoEndX >= 0 && fifoEndX <= size.width {
+            var rightPath = Path()
+            rightPath.move(to: CGPoint(x: fifoEndX, y: 0))
+            rightPath.addLine(to: CGPoint(x: fifoEndX, y: size.height))
+            context.stroke(rightPath, with: .color(boundaryColor), style: dashStyle)
+        }
+    }
 }
 
 #Preview {
     SpeechPlotView(
         timeline: nil,
         spkcachePreds: nil,
+        fifoPreds: nil,
+        chunkRightContext: 7,
+        chunkLeftContext: 1,
         isRecording: false,
         updateTrigger: 0,
         onPlaySegment: nil
     )
-    .frame(height: 400)
+    .frame(height: 500)
     .padding()
 }
 

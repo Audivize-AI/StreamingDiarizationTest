@@ -45,6 +45,9 @@ struct ContentView: View {
                 SpeechPlotView(
                     timeline: viewModel.timeline,
                     spkcachePreds: viewModel.spkcachePreds,
+                    fifoPreds: viewModel.fifoPreds,
+                    chunkRightContext: viewModel.chunkRightContext,
+                    chunkLeftContext: viewModel.chunkLeftContext,
                     isRecording: viewModel.isRecording,
                     updateTrigger: viewModel.updateTrigger,
                     onPlaySegment: { start, end in
@@ -139,7 +142,7 @@ struct ContentView: View {
             .padding(.bottom)
         }
         .padding(.top)
-        .frame(minWidth: 800, minHeight: 500)
+        .frame(minWidth: 900, minHeight: 650)
         .fileImporter(
             isPresented: $showingFilePicker,
             allowedContentTypes: [

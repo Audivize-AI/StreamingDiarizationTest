@@ -24,8 +24,21 @@ final class DiarizerViewModel: ObservableObject {
     /// Speaker cache predictions for visualization
     @Published private(set) var spkcachePreds: [Float]?
     
+    /// FIFO queue predictions for visualization
+    @Published private(set) var fifoPreds: [Float]?
+    
     /// Trigger for UI updates (incremented when timeline changes)
     @Published private(set) var updateTrigger = 0
+    
+    /// Right context frames for FIFO alignment
+    var chunkRightContext: Int {
+        config.chunkRightContext
+    }
+    
+    /// Left context frames for FIFO alignment  
+    var chunkLeftContext: Int {
+        config.chunkLeftContext
+    }
     
     /// All recorded audio samples for playback (16kHz mono)
     private(set) var recordedAudio: [Float] = []
@@ -197,6 +210,7 @@ final class DiarizerViewModel: ObservableObject {
             // Process complete audio
             timeline = try diarizer.processComplete(resampledSamples)
             spkcachePreds = diarizer.state.spkcachePreds  // Update speaker cache display
+            fifoPreds = diarizer.state.fifoPreds  // Update FIFO queue display
             updateTrigger += 1
             
             let duration = Float(resampledSamples.count) / Float(sampleRate)
@@ -392,6 +406,7 @@ final class DiarizerViewModel: ObservableObject {
                 // Trigger UI refresh
                 updateTrigger += 1
                 spkcachePreds = diarizer.state.spkcachePreds
+                fifoPreds = diarizer.state.fifoPreds
             }
         } catch {
             statusMessage = "Processing error: \(error.localizedDescription)"
