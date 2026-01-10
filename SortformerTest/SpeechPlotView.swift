@@ -25,8 +25,14 @@ struct SpeechPlotView: View {
     /// Update trigger to force redraws
     let updateTrigger: Int
     
+    /// Segment annotations dictionary
+    let segmentAnnotations: [String: String]
+    
     /// Callback when a segment is clicked (start, end)
     let onPlaySegment: ((Float, Float) -> Void)?
+    
+    /// Callback when a segment is clicked for annotation
+    let onAnnotateSegment: ((SortformerSegment) -> Void)?
     
     /// Visible frames in the viewport (determines cell width relative to window)
     private let visibleFrames = 188
@@ -48,6 +54,10 @@ struct SpeechPlotView: View {
     
     /// Current scroll offset for virtualization
     @State private var scrollOffset: CGFloat = 0
+    
+    /// Hovered segment info for tooltip
+    @State private var hoveredSegment: SortformerSegment?
+    @State private var hoverLocation: CGPoint = .zero
     
     // Segment outline colors per speaker
     private let speakerColors: [Color] = [
@@ -142,15 +152,74 @@ struct SpeechPlotView: View {
                         }
                         .allowsHitTesting(false)
                     }
-                    .onTapGesture { location in
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let location):
+                            hoverLocation = location
+                            // Find segment at hover location
+                            guard let tl = timeline else {
+                                hoveredSegment = nil
+                                return
+                            }
+                            let cellHeight = height / CGFloat(numSpeakers)
+                            let hoverFrame = Int(location.x / cellWidth)
+                            let hoverSpeaker = Int(location.y / cellHeight)
+                            
+                            // Check finalized segments
+                            if let segment = tl.segments.flatMap(\.self).first(where: {
+                                hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
+                            }) {
+                                hoveredSegment = segment
+                            } else if let segment = tl.tentativeSegments.flatMap(\.self).first(where: {
+                                hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
+                            }) {
+                                hoveredSegment = segment
+                            } else {
+                                hoveredSegment = nil
+                            }
+                        case .ended:
+                            hoveredSegment = nil
+                        }
+                    }
+                    .overlay(alignment: .topLeading) {
+                        // Tooltip for hovered segment
+                        if let segment = hoveredSegment {
+                            let startStr = String(format: "%.2f", segment.startTime)
+                            let endStr = String(format: "%.2f", segment.endTime)
+                            let durationStr = String(format: "%.2f", segment.endTime - segment.startTime)
+                            
+                            Text("Spk \(segment.speakerIndex): \(startStr)s - \(endStr)s (\(durationStr)s)")
+                                .font(.caption)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.black.opacity(0.8))
+                                .foregroundColor(.white)
+                                .cornerRadius(4)
+                                .offset(x: hoverLocation.x + 10, y: hoverLocation.y - 30)
+                        }
+                    }
+                    .onTapGesture(count: 2) { location in
+                        // DOUBLE CLICK = ANNOTATE
                         guard !isRecording, let tl = timeline else { return }
                         
-                        // Calculate frame and speaker from tap location
                         let cellHeight = height / CGFloat(numSpeakers)
                         let clickedFrame = Int(location.x / cellWidth)
                         let clickedSpeaker = Int(location.y / cellHeight)
                         
-                        // Find segment covering this frame AND speaker
+                        if let segment = tl.segments.flatMap(\.self).first(where: {
+                            clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
+                        }) {
+                            onAnnotateSegment?(segment)
+                        }
+                    }
+                    .onTapGesture(count: 1) { location in
+                        // SINGLE CLICK = PLAY
+                        guard !isRecording, let tl = timeline else { return }
+                        
+                        let cellHeight = height / CGFloat(numSpeakers)
+                        let clickedFrame = Int(location.x / cellWidth)
+                        let clickedSpeaker = Int(location.y / cellHeight)
+                        
                         if let segment = tl.segments.flatMap(\.self).first(where: { 
                             clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
                         }) {
@@ -170,22 +239,18 @@ struct SpeechPlotView: View {
                 .coordinateSpace(name: "scrollView")
                 .onPreferenceChange(ScrollOffsetPreferenceKey.self) { offset in
                     scrollOffset = offset
-                    // Check if we're near the trailing edge
-                    // contentWidth is the full scrollable width, width is the viewport
-                    let contentWidth = calculatedContentWidth(viewportWidth: width)
-                    let maxOffset = -(contentWidth - width)
                     
-                    // Only consider "at end" if within 20 points (stricter threshold)
-                    let isAtEnd = offset <= maxOffset + 20
-                    
-                    // Only set isFollowingLive = true if user scrolled all the way to end
-                    // Don't automatically follow just because content grew
-                    if isAtEnd && !isFollowingLive && offset < -10 {
-                        // User manually scrolled to end - only if content is actually scrolled
-                        isFollowingLive = true
-                    } else if !isAtEnd && isFollowingLive && isRecording {
-                        // User scrolled away from end while recording
-                        isFollowingLive = false
+                    // Only detect when user scrolls AWAY from the end
+                    // Don't auto-enable following - user must click button
+                    if isRecording && isFollowingLive {
+                        let contentWidth = calculatedContentWidth(viewportWidth: width)
+                        let maxOffset = -(contentWidth - width)
+                        
+                        // User scrolled away if not within 50 points of end
+                        let isAtEnd = offset <= maxOffset + 50
+                        if !isAtEnd {
+                            isFollowingLive = false
+                        }
                     }
                 }
                 .frame(height: height)
@@ -380,17 +445,61 @@ struct SpeechPlotView: View {
         let cellWidth = size.width / CGFloat(totalFrames)
         let cellHeight = size.height / CGFloat(numSpeakers)
         
-        // Draw finalized segments (solid)
+        // Draw finalized segments (solid) with labels
         for segment in tl.segments.flatMap({ $0 }) {
             drawSegmentOutline(context: context, segment: segment, 
                              cellWidth: cellWidth, cellHeight: cellHeight, tentative: false)
+            drawSegmentLabel(context: context, segment: segment,
+                           cellWidth: cellWidth, cellHeight: cellHeight)
         }
         
-        // Draw tentative segments (dashed)
+        // Draw tentative segments (dashed) - no labels for tentative
         for segment in tl.tentativeSegments.flatMap({ $0 }) {
             drawSegmentOutline(context: context, segment: segment, 
                              cellWidth: cellWidth, cellHeight: cellHeight, tentative: true)
         }
+    }
+    
+    /// Draw label on a segment
+    private func drawSegmentLabel(context: GraphicsContext, segment: SortformerSegment,
+                                  cellWidth: CGFloat, cellHeight: CGFloat) {
+        let x = CGFloat(segment.startFrame) * cellWidth
+        let y = CGFloat(segment.speakerIndex) * cellHeight
+        let segmentWidth = CGFloat(segment.endFrame - segment.startFrame) * cellWidth
+        
+        // Get annotation or use speaker index
+        let key = DiarizerViewModel.segmentKey(segment)
+        let label = segmentAnnotations[key] ?? String(segment.speakerIndex)
+        
+        // Only draw if segment is wide enough
+        guard segmentWidth > 20 else { return }
+        
+        // Check if this is a custom annotation (not just a number)
+        let isCustomAnnotation = segmentAnnotations[key] != nil
+        
+        // Create styled text
+        let textStyle = Text(label)
+            .font(.system(size: isCustomAnnotation ? 11 : 10, weight: .bold))
+            .foregroundColor(.white)
+        
+        let resolved = context.resolve(textStyle)
+        let textSize = resolved.measure(in: CGSize(width: segmentWidth - 6, height: cellHeight))
+        
+        // Draw background pill for better visibility
+        let bgRect = CGRect(
+            x: x + 3,
+            y: y + (cellHeight - textSize.height) / 2 - 2,
+            width: min(textSize.width + 8, segmentWidth - 6),
+            height: textSize.height + 4
+        )
+        
+        // Use different colors for custom vs default labels
+        let bgColor = isCustomAnnotation ? Color.blue.opacity(0.85) : Color.black.opacity(0.6)
+        context.fill(Path(roundedRect: bgRect, cornerRadius: 3), with: .color(bgColor))
+        
+        // Draw text centered in background
+        let textPoint = CGPoint(x: bgRect.midX, y: bgRect.midY)
+        context.draw(resolved, at: textPoint, anchor: .center)
     }
     
     // MARK: - Legacy Drawing Functions (kept for reference)
@@ -665,7 +774,9 @@ struct SpeechPlotView: View {
         chunkLeftContext: 1,
         isRecording: false,
         updateTrigger: 0,
-        onPlaySegment: nil
+        segmentAnnotations: [:],
+        onPlaySegment: nil,
+        onAnnotateSegment: nil
     )
     .frame(height: 500)
     .padding()

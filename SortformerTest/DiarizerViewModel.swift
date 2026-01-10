@@ -40,6 +40,9 @@ final class DiarizerViewModel: ObservableObject {
         config.chunkLeftContext
     }
     
+    /// Segment annotations - maps "startFrame-endFrame-speaker" to custom label
+    @Published var segmentAnnotations: [String: String] = [:]
+    
     /// All recorded audio samples for playback (16kHz mono)
     private(set) var recordedAudio: [Float] = []
     
@@ -215,6 +218,9 @@ final class DiarizerViewModel: ObservableObject {
             
             let duration = Float(resampledSamples.count) / Float(sampleRate)
             statusMessage = String(format: "Processed %.1fs - Click segments to play", duration)
+            
+            // Print segments to console
+            printSegments()
             
         } catch {
             statusMessage = "Load failed: \(error.localizedDescription)"
@@ -411,6 +417,73 @@ final class DiarizerViewModel: ObservableObject {
         } catch {
             statusMessage = "Processing error: \(error.localizedDescription)"
             print("Diarizer processing error: \(error)")
+        }
+    }
+    
+    /// Print all segments in CSV format: speaker_id,start_time,end_time
+    private func printSegments() {
+        guard let tl = timeline else { return }
+        
+        print("\n--- Diarization Segments ---")
+        print("speaker_id,start_time,end_time")
+        
+        // Collect all segments and sort by start time
+        let allSegments = tl.segments.flatMap { $0 }.sorted { $0.startTime < $1.startTime }
+        
+        for segment in allSegments {
+            let startStr = String(format: "%.2f", segment.startTime)
+            let endStr = String(format: "%.2f", segment.endTime)
+            print("\(segment.speakerIndex),\(startStr),\(endStr)")
+        }
+        
+        print("--- End Segments (\(allSegments.count) total) ---\n")
+    }
+    
+    // MARK: - Segment Annotation
+    
+    /// Generate a unique key for a segment
+    static func segmentKey(_ segment: SortformerSegment) -> String {
+        return "\(segment.startFrame)-\(segment.endFrame)-\(segment.speakerIndex)"
+    }
+    
+    /// Set annotation for a segment
+    func setAnnotation(for segment: SortformerSegment, label: String) {
+        let key = Self.segmentKey(segment)
+        if label.isEmpty {
+            segmentAnnotations.removeValue(forKey: key)
+        } else {
+            segmentAnnotations[key] = label
+        }
+    }
+    
+    /// Get annotation for a segment (nil if not annotated)
+    func getAnnotation(for segment: SortformerSegment) -> String? {
+        let key = Self.segmentKey(segment)
+        return segmentAnnotations[key]
+    }
+    
+    /// Export segments to a text file
+    func exportSegments(to url: URL) {
+        guard let tl = timeline else { return }
+        
+        var output = "speaker_id,start_time,end_time\n"
+        
+        // Collect all segments and sort by start time
+        let allSegments = tl.segments.flatMap { $0 }.sorted { $0.startTime < $1.startTime }
+        
+        for segment in allSegments {
+            // Use annotation if available, otherwise use original speaker index
+            let label = getAnnotation(for: segment) ?? String(segment.speakerIndex)
+            let startStr = String(format: "%.2f", segment.startTime)
+            let endStr = String(format: "%.2f", segment.endTime)
+            output += "\(label),\(startStr),\(endStr)\n"
+        }
+        
+        do {
+            try output.write(to: url, atomically: true, encoding: .utf8)
+            statusMessage = "Exported \(allSegments.count) segments to \(url.lastPathComponent)"
+        } catch {
+            statusMessage = "Export failed: \(error.localizedDescription)"
         }
     }
 }

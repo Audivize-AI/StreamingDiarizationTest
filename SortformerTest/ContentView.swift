@@ -1,10 +1,3 @@
-//
-//  ContentView.swift
-//  SortformerTest
-//
-//  Real-time speech diarization with Sortformer
-//
-
 import SwiftUI
 import UniformTypeIdentifiers
 import AppKit
@@ -12,7 +5,13 @@ import AppKit
 struct ContentView: View {
     @StateObject private var viewModel = DiarizerViewModel()
     @State private var showingFilePicker = false
+    @State private var showingExportPicker = false
     @State private var isDragOver = false
+    
+    // Annotation dialog state
+    @State private var showingAnnotationDialog = false
+    @State private var selectedSegment: SortformerSegment?
+    @State private var annotationText = ""
     
     var body: some View {
         VStack(spacing: 16) {
@@ -50,8 +49,15 @@ struct ContentView: View {
                     chunkLeftContext: viewModel.chunkLeftContext,
                     isRecording: viewModel.isRecording,
                     updateTrigger: viewModel.updateTrigger,
+                    segmentAnnotations: viewModel.segmentAnnotations,
                     onPlaySegment: { start, end in
                         viewModel.playSegment(startTime: start, endTime: end)
+                    },
+                    onAnnotateSegment: { segment in
+                        // Show annotation dialog
+                        selectedSegment = segment
+                        annotationText = viewModel.getAnnotation(for: segment) ?? ""
+                        showingAnnotationDialog = true
                     }
                 )
                 
@@ -138,6 +144,24 @@ struct ContentView: View {
                 }
                 .disabled(viewModel.isRecording || viewModel.recordedAudio.isEmpty)
                 .buttonStyle(.plain)
+                
+                // Export segments button
+                Button(action: {
+                    showingExportPicker = true
+                }) {
+                    HStack {
+                        Image(systemName: "doc.text.fill")
+                        Text("Export")
+                    }
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 10)
+                    .background(Color.purple)
+                    .cornerRadius(8)
+                }
+                .disabled(viewModel.isRecording || viewModel.timeline == nil)
+                .buttonStyle(.plain)
             }
             .padding(.bottom)
         }
@@ -167,6 +191,60 @@ struct ContentView: View {
                 print("File picker error: \(error)")
             }
         }
+        .fileExporter(
+            isPresented: $showingExportPicker,
+            document: SegmentDocument(content: exportContent),
+            contentType: .plainText,
+            defaultFilename: "segments.txt"
+        ) { result in
+            switch result {
+            case .success(let url):
+                print("Exported segments to: \(url)")
+            case .failure(let error):
+                print("Export error: \(error)")
+            }
+        }
+        .sheet(isPresented: $showingAnnotationDialog) {
+            if let segment = selectedSegment {
+                VStack(spacing: 16) {
+                    Text("Annotate Segment")
+                        .font(.headline)
+                    
+                    Text("Speaker \(segment.speakerIndex): \(String(format: "%.2f", segment.startTime))s - \(String(format: "%.2f", segment.endTime))s")
+                        .foregroundColor(.secondary)
+                    
+                    TextField("Label (e.g., name or ID)", text: $annotationText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 200)
+                    
+                    HStack(spacing: 12) {
+                        Button("Play") {
+                            viewModel.playSegment(startTime: segment.startTime, endTime: segment.endTime)
+                        }
+                        .buttonStyle(.bordered)
+                        
+                        Button("Clear") {
+                            annotationText = ""
+                            viewModel.setAnnotation(for: segment, label: "")
+                        }
+                        .buttonStyle(.bordered)
+                        
+                        Button("Save") {
+                            viewModel.setAnnotation(for: segment, label: annotationText)
+                            showingAnnotationDialog = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                        
+                        Button("Cancel") {
+                            showingAnnotationDialog = false
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .padding(24)
+                .frame(minWidth: 350, minHeight: 180)
+            }
+        }
     }
     
     private var statusColor: Color {
@@ -177,6 +255,28 @@ struct ContentView: View {
         } else {
             return .orange
         }
+    }
+    
+    /// Generate export content for segments
+    private var exportContent: String {
+        guard let tl = viewModel.timeline else {
+            return "speaker_id,start_time,end_time\n"
+        }
+        
+        var output = "speaker_id,start_time,end_time\n"
+        
+        // Collect all segments and sort by start time
+        let allSegments = tl.segments.flatMap { $0 }.sorted { $0.startTime < $1.startTime }
+        
+        for segment in allSegments {
+            // Use annotation if available, otherwise use original speaker index
+            let label = viewModel.getAnnotation(for: segment) ?? String(segment.speakerIndex)
+            let startStr = String(format: "%.2f", segment.startTime)
+            let endStr = String(format: "%.2f", segment.endTime)
+            output += "\(label),\(startStr),\(endStr)\n"
+        }
+        
+        return output
     }
     
     private func saveRecording() {
@@ -228,6 +328,31 @@ struct ContentView: View {
             }
         }
         return true
+    }
+}
+
+// MARK: - Segment Document for Export
+
+struct SegmentDocument: FileDocument {
+    static var readableContentTypes: [UTType] { [.plainText] }
+    
+    let content: String
+    
+    init(content: String) {
+        self.content = content
+    }
+    
+    init(configuration: ReadConfiguration) throws {
+        if let data = configuration.file.regularFileContents {
+            content = String(data: data, encoding: .utf8) ?? ""
+        } else {
+            content = ""
+        }
+    }
+    
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        let data = content.data(using: .utf8) ?? Data()
+        return FileWrapper(regularFileWithContents: data)
     }
 }
 
