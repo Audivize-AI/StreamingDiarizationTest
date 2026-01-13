@@ -32,12 +32,12 @@ final class DiarizerViewModel: ObservableObject {
     
     /// Right context frames for FIFO alignment
     var chunkRightContext: Int {
-        config.chunkRightContext
+        globalConfig.chunkRightContext
     }
     
     /// Left context frames for FIFO alignment  
     var chunkLeftContext: Int {
-        config.chunkLeftContext
+        globalConfig.chunkLeftContext
     }
     
     /// Segment annotations - maps "startFrame-endFrame-speaker" to custom label
@@ -54,7 +54,6 @@ final class DiarizerViewModel: ObservableObject {
     private var audioPlayer: AVAudioPlayer?
     private var audioConverter: AudioConverter
     
-    private let config = SortformerConfig.default
     private let sampleRate: Double = 16000.0
     
     // Audio buffer for accumulating samples between processing
@@ -320,8 +319,8 @@ final class DiarizerViewModel: ObservableObject {
         statusMessage = "Loading models from HuggingFace..."
         
         do {
-            let newDiarizer = SortformerDiarizer(config: config)
-            let models = try await SortformerModels.loadFromHuggingFace(config: config)
+            let newDiarizer = SortformerDiarizer(config: globalConfig)
+            let models = try await SortformerModels.loadFromHuggingFace(config: globalConfig)
             newDiarizer.initialize(models: models)
             
             self.diarizer = newDiarizer

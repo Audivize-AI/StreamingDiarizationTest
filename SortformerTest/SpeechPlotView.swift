@@ -35,13 +35,13 @@ struct SpeechPlotView: View {
     let onAnnotateSegment: ((SortformerSegment) -> Void)?
     
     /// Visible frames in the viewport (determines cell width relative to window)
-    private let visibleFrames = 188
+    private let visibleFrames = globalConfig.spkcacheLen
     
     /// Speaker cache size
-    private let spkcacheSize = 188
+    private let spkcacheSize = globalConfig.spkcacheLen
     
     /// Number of speakers (fixed at 4 for Sortformer)
-    private let numSpeakers = 4
+    private let numSpeakers = globalConfig.numSpeakers
     
     /// Chunk size for virtualization (frames per chunk)
     private let chunkSize = 500
@@ -770,8 +770,8 @@ struct SpeechPlotView: View {
         timeline: nil,
         spkcachePreds: nil,
         fifoPreds: nil,
-        chunkRightContext: 7,
-        chunkLeftContext: 1,
+        chunkRightContext: globalConfig.chunkRightContext,
+        chunkLeftContext: globalConfig.chunkLeftContext,
         isRecording: false,
         updateTrigger: 0,
         segmentAnnotations: [:],
