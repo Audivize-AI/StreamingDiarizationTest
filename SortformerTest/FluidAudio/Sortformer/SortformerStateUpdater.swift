@@ -42,6 +42,7 @@ public struct SortformerStateUpdater {
 
         let currentSpkcacheLength = state.spkcacheLength
         let currentFifoLength = state.fifoLength
+        var fifoPreds: [Float] = []
 
         // Extract FIFO predictions if FIFO exists
         if currentFifoLength > 0 {
@@ -51,7 +52,8 @@ public struct SortformerStateUpdater {
                 throw SortformerError.insufficientPredsLength(
                     "Not enough predictions for FIFO in streaming update: \(fifoPredsEnd) > \(preds.count)")
             }
-            state.fifoPreds = Array(preds[fifoPredsStart..<fifoPredsEnd])
+            fifoPreds = Array(preds[fifoPredsStart..<fifoPredsEnd])
+            state.fifoPreds = fifoPreds
         }
 
         // Extract only CORE frames from chunk embeddings (skip left context, take chunkLen frames)
@@ -96,7 +98,7 @@ public struct SortformerStateUpdater {
         // Append chunk core to FIFO
         state.fifo.append(contentsOf: chunkEmbs)
         state.fifoLength += coreFrames
-
+        
         if state.fifoPreds != nil {
             state.fifoPreds?.append(contentsOf: chunkPreds)
         } else {
@@ -112,7 +114,11 @@ public struct SortformerStateUpdater {
                     "FIFO predictions are nil immediately after updating them during streaming update. THIS SHOULD NEVER HAPPEN!"
                 )
                 return StreamingUpdateResult(
-                    confirmed: chunkPreds, tentative: tentativePreds, numSpeakers: config.numSpeakers)
+                    confirmed: chunkPreds,
+                    tentative: tentativePreds,
+                    fifo: fifoPreds,
+                    numSpeakers: config.numSpeakers
+                )
             }
 
             // Calculate how many frames to pop
@@ -161,7 +167,12 @@ public struct SortformerStateUpdater {
             }
         }
 
-        return StreamingUpdateResult(confirmed: chunkPreds, tentative: tentativePreds, numSpeakers: config.numSpeakers)
+        return StreamingUpdateResult(
+            confirmed: chunkPreds,
+            tentative: tentativePreds,
+            fifo: fifoPreds,
+            numSpeakers: config.numSpeakers
+        )
     }
 
     // MARK: - Silence Profile

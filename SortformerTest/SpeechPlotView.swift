@@ -35,7 +35,8 @@ struct SpeechPlotView: View {
     let onAnnotateSegment: ((SortformerSegment) -> Void)?
     
     /// Visible frames in the viewport (determines cell width relative to window)
-    private let visibleFrames = globalConfig.spkcacheLen
+    private let visibleFrames = max(
+        globalConfig.fifoLen + globalConfig.chunkLen + globalConfig.chunkRightContext, globalConfig.spkcacheLen)
     
     /// Speaker cache size
     private let spkcacheSize = globalConfig.spkcacheLen
@@ -66,8 +67,8 @@ struct SpeechPlotView: View {
     
     var body: some View {
         GeometryReader { geometry in
-            let availableHeight = geometry.size.height - 80  // Reserved for title/labels/padding
-            let plotHeight = availableHeight / 3.0  // Equal height for all 3 plots
+            let availableHeight = geometry.size.height - 90  // Reserved for title/labels/padding
+            let plotHeight = availableHeight / 3.0  // Equal height for all 4 plots
             // Subtract 49 for Y-axis labels (45) + spacing (4) to get actual plot width
             let plotWidth = geometry.size.width - 49
             
@@ -365,24 +366,24 @@ struct SpeechPlotView: View {
         guard let tl = timeline else {
             return "Live Diarization - No data"
         }
-        let totalFrames = tl.numFrames + tl.numTentative
+        let totalFrames = tl.nextFrame + tl.numTentative
         let elapsedSeconds = Float(totalFrames) * 0.08
         return String(format: "Live Diarization - Confirmed: %d | Tentative: %d | Segments: %d + %d | (%.1fs)",
-                      tl.numFrames, tl.numTentative,
+                      tl.nextFrame, tl.numTentative,
                       tl.segments.flatMap(\.self).count, tl.tentativeSegments.flatMap(\.self).count,
                       elapsedSeconds)
     }
     
     private var totalFrameCount: Int {
         guard let tl = timeline else { return 0 }
-        return tl.numFrames + tl.numTentative
+        return tl.nextFrame + tl.numTentative
     }
     
     private func calculatedContentWidth(viewportWidth: CGFloat) -> CGFloat {
         guard let tl = timeline else {
             return viewportWidth
         }
-        let totalFrames = tl.numFrames + tl.numTentative
+        let totalFrames = tl.nextFrame + tl.numTentative
         let cellWidth = viewportWidth / CGFloat(visibleFrames)
         return max(CGFloat(totalFrames) * cellWidth, viewportWidth)
     }
@@ -400,7 +401,7 @@ struct SpeechPlotView: View {
             return
         }
         
-        let numConfirmed = tl.numFrames
+        let numConfirmed = tl.nextFrame
         let numTentative = tl.numTentative
         
         // Draw probability cells for this chunk
@@ -441,9 +442,32 @@ struct SpeechPlotView: View {
     private func drawSegmentOverlays(context: GraphicsContext, size: CGSize, viewportWidth: CGFloat) {
         guard let tl = timeline else { return }
         
-        let totalFrames = max(tl.numFrames + tl.numTentative, visibleFrames)
+        let totalFrames = max(tl.nextFrame + tl.numTentative, visibleFrames)
         let cellWidth = size.width / CGFloat(totalFrames)
         let cellHeight = size.height / CGFloat(numSpeakers)
+        
+        // Draw disjoint segments (single-speaker regions) as full-height translucent rectangles
+        // Finalized segments: teal
+        for segment in tl.embeddingSegments {
+            let x = CGFloat(segment.startFrame) * cellWidth
+            let segmentWidth = CGFloat(segment.endFrame - segment.startFrame) * cellWidth
+            let rect = CGRect(x: x, y: 0, width: segmentWidth, height: size.height)
+            
+            context.fill(Path(rect), with: .color(Color.white.opacity(0.25)))
+            context.stroke(Path(rect), with: .color(Color.white.opacity(0.6)),
+                          style: StrokeStyle(lineWidth: 3))
+        }
+        
+        // Tentative disjoint segments: orange with dashed border
+        for segment in tl.tentativeEmbeddingSegments {
+            let x = CGFloat(segment.startFrame) * cellWidth
+            let segmentWidth = CGFloat(segment.endFrame - segment.startFrame) * cellWidth
+            let rect = CGRect(x: x, y: 0, width: segmentWidth, height: size.height)
+            
+            context.fill(Path(rect), with: .color(Color.orange.opacity(0.15)))
+            context.stroke(Path(rect), with: .color(Color.orange.opacity(0.5)),
+                          style: StrokeStyle(lineWidth: 2, dash: [4, 2]))
+        }
         
         // Draw finalized segments (solid) with labels
         for segment in tl.segments.flatMap({ $0 }) {
@@ -512,7 +536,7 @@ struct SpeechPlotView: View {
             return
         }
         
-        let numConfirmed = tl.numFrames
+        let numConfirmed = tl.nextFrame
         let numTentative = tl.numTentative
         let totalFrames = numConfirmed + numTentative
         let framesToDraw = max(totalFrames, visibleFrames)

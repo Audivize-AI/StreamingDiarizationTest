@@ -2,27 +2,12 @@ import Foundation
 import CoreML
 import Accelerate
 
-public struct TitaNetConfig {
-    let inputLength: Int = 31 /// Number of input Sortformer frames
-    let minRequiredFrames: Int = 13 /// Minimum number of input Sortformer frames
-    let frameDuration: Float = 0.08
-    let subsamplingFactor: Int = 8
-    let melFeatures: Int = 80
-    let melStride: Int = 160
-    let melWindow: Int = 400
-    let melPadTo: Int = 16
-    var melLength: Int { inputLength * subsamplingFactor }
-    var paddedMelLength: Int { ((melLength - 1) / melPadTo + 1) * melPadTo }
-    var audioSignalLength: Int { melLength * melStride }
-    var inputDuration: Float { Float(inputLength) * frameDuration }
-}
-
 public struct TitaNetEmbeddingExtractor {
     public let config: TitaNetConfig
     public let model: MLModel
     public let preprocessor: NeMoMelSpectrogram
     private let memoryOptimizer: ANEMemoryOptimizer
-    private let speechArray: MLMultiArray
+    private let processedSignalArray: MLMultiArray
     private let lengthArray: MLMultiArray
     private let sampleRate: Float = 16_000
     
@@ -34,10 +19,12 @@ public struct TitaNetEmbeddingExtractor {
         self.model = try TitaNet_small_2_48s(configuration: configuration).model
         self.preprocessor = NeMoMelSpectrogram(nMels: 80, padTo: 16)
         self.memoryOptimizer = ANEMemoryOptimizer()
-        self.speechArray = try memoryOptimizer.createAlignedArray(
-            shape: [1,
-                    NSNumber(value: config.melFeatures),
-                    NSNumber(value: config.paddedMelLength)],
+        self.processedSignalArray = try memoryOptimizer.createAlignedArray(
+            shape: [
+                1,
+                NSNumber(value: config.melFeatures),
+                NSNumber(value: IndexUtils.nextMultiple(of: config.melPadTo, for: config.maxMelLength))
+            ],
             dataType: .float32
         )
         self.lengthArray = try memoryOptimizer.createAlignedArray(
@@ -46,34 +33,30 @@ public struct TitaNetEmbeddingExtractor {
         )
     }
     
-    public func getEmbedding<C>(
-        from audioSignal: C,
-        length: Int? = nil
+    /// Extract a speaker embedding from an audio signal
+    /// - Parameter audioSignal: A raw 16kHz audio signal. Must fit within the configured input size limits
+    /// - Returns: A 192D speaker identity embedding vector
+    public func extractEmbedding<C>(
+        from audioSignal: C
     ) throws -> [Float] where C: AccelerateBuffer & Collection, C.Element == Float, C.Index == Int {
-        let length = length ?? audioSignal.count
+        
         // Preprocess audio
         let (mels, melLength, _) = preprocessor.computeFlat(audio: audioSignal)
         
-        return try getEmbedding(mels: mels, melLength: melLength)
-    }
-    
-    public func getEmbedding<C>(
-        mels: C,
-        melLength: Int
-    ) throws -> [Float] where C: Collection, C.Element == Float {
-        // Ensure input fits
-        guard melLength > 0 else {
-            throw TitaNetError.invalidAudioInput("Empty audio input")
+        // Ensure input size is within bounds
+        guard melLength > config.minMelLength else {
+            throw TitaNetError.invalidAudioInput(
+                "Audio is too short to extract speaker identity (\(melLength) < \(config.minMelLength))")
         }
         
-        guard melLength <= config.paddedMelLength else {
-            fatalError("Audio too long for this model (\(melLength) > \(config.paddedMelLength))")
+        guard melLength <= config.maxMelLength else {
+            fatalError("Audio too long for TitaNet model (\(melLength) > \(config.maxMelLength))")
         }
         
         // Copy inputs to MLMultiArrays
         memoryOptimizer.optimizedCopy(
             from: mels,
-            to: speechArray,
+            to: processedSignalArray,
             pad: true
         )
         
@@ -81,7 +64,7 @@ public struct TitaNetEmbeddingExtractor {
         
         // Build input
         let input = try MLDictionaryFeatureProvider(dictionary: [
-            "processed_signal": MLFeatureValue(multiArray: speechArray),
+            "processed_signal": MLFeatureValue(multiArray: processedSignalArray),
             "length": MLFeatureValue(multiArray: lengthArray)
         ])
         
@@ -94,10 +77,6 @@ public struct TitaNetEmbeddingExtractor {
         
         return embedding
     }
-    
-
-    
-    
 }
 
 

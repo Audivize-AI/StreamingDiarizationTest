@@ -202,6 +202,26 @@ public struct SortformerPostProcessingConfig {
 
     /// Threshold for small non-speech deletion in frames
     public var minFramesOff: Int
+    
+    public var numFilteredFrames: Int
+    
+    // MARK: - Embedding Extraction Parameters
+    
+    /// Maximum embedding duration in seconds (TitaNet typically uses 3s)
+    public var maxEmbeddingDurationSeconds: Float
+    
+    /// Maximum embedding duration in frames
+    public var maxEmbeddingFrames: Int {
+        Int(ceil(maxEmbeddingDurationSeconds / frameDurationSeconds))
+    }
+    
+    /// Minimum coverage ratio for embeddings within a segment (0.0-1.0)
+    /// If coverage drops below this, new embeddings must be extracted
+    public var minEmbeddingCoverageRatio: Float
+    
+    /// Maximum proportion of an embedding that can extend outside the segment boundary (0.0-1.0)
+    /// Used to determine if an embedding is valid for a segment that was split
+    public var maxEmbeddingBoundaryOverlapRatio: Float
 
     /// Adding durations before each speech segment
     public var onsetPadSeconds: Float {
@@ -237,17 +257,22 @@ public struct SortformerPostProcessingConfig {
     public let frameDurationSeconds: Float = 0.08
 
     /// Default configurations
-    public static var `default`: SortformerPostProcessingConfig {
+    public static func `default`(for config: SortformerConfig) -> SortformerPostProcessingConfig {
         SortformerPostProcessingConfig(
             onsetThreshold: 0.5,
             offsetThreshold: 0.5,
             onsetPadFrames: 0,
             offsetPadFrames: 0,
-            minFramesOn: 0,
-            minFramesOff: 0
+            minFramesOn: 1,
+            minFramesOff: 1,
+            numFilteredFrames: config.fifoLen,
+            maxEmbeddingDurationSeconds: 3.0,
+            minEmbeddingCoverageRatio: 0.7,
+            maxEmbeddingBoundaryOverlapRatio: 0.3
         )
+        
     }
-
+    
     public init(
         onsetThreshold: Float = 0.5,
         offsetThreshold: Float = 0.5,
@@ -255,7 +280,11 @@ public struct SortformerPostProcessingConfig {
         offsetPadSeconds: Float = 0,
         minDurationOn: Float = 0,
         minDurationOff: Float = 0,
-        maxStoredFrames: Int? = nil
+        maxStoredFrames: Int? = nil,
+        numFilteredFrames: Int = 0,
+        maxEmbeddingDurationSeconds: Float = 3.0,
+        minEmbeddingCoverageRatio: Float = 0.7,
+        maxEmbeddingBoundaryOverlapRatio: Float = 0.3
     ) {
         self.onsetThreshold = onsetThreshold
         self.offsetThreshold = offsetThreshold
@@ -264,6 +293,10 @@ public struct SortformerPostProcessingConfig {
         self.minFramesOn = Int(round(minDurationOn / frameDurationSeconds))
         self.minFramesOff = Int(round(minDurationOff / frameDurationSeconds))
         self.maxStoredFrames = maxStoredFrames
+        self.numFilteredFrames = numFilteredFrames
+        self.maxEmbeddingDurationSeconds = maxEmbeddingDurationSeconds
+        self.minEmbeddingCoverageRatio = minEmbeddingCoverageRatio
+        self.maxEmbeddingBoundaryOverlapRatio = maxEmbeddingBoundaryOverlapRatio
     }
 
     public init(
@@ -273,7 +306,11 @@ public struct SortformerPostProcessingConfig {
         offsetPadFrames: Int = 0,
         minFramesOn: Int = 0,
         minFramesOff: Int = 0,
-        maxStoredFrames: Int? = nil
+        maxStoredFrames: Int? = nil,
+        numFilteredFrames: Int = 0,
+        maxEmbeddingDurationSeconds: Float = 3.0,
+        minEmbeddingCoverageRatio: Float = 0.7,
+        maxEmbeddingBoundaryOverlapRatio: Float = 0.3
     ) {
         self.onsetThreshold = onsetThreshold
         self.offsetThreshold = offsetThreshold
@@ -282,6 +319,10 @@ public struct SortformerPostProcessingConfig {
         self.minFramesOn = minFramesOn
         self.minFramesOff = minFramesOff
         self.maxStoredFrames = maxStoredFrames
+        self.numFilteredFrames = numFilteredFrames
+        self.maxEmbeddingDurationSeconds = maxEmbeddingDurationSeconds
+        self.minEmbeddingCoverageRatio = minEmbeddingCoverageRatio
+        self.maxEmbeddingBoundaryOverlapRatio = maxEmbeddingBoundaryOverlapRatio
     }
 }
 
@@ -426,19 +467,26 @@ public struct StreamingUpdateResult: Sendable {
     /// Tentative predictions for right context frames [rightContext * numSpeakers]
     /// May change with next chunk. Empty if rightContext=0.
     public let tentative: [Float]
+    
+    /// Speaker probabilities for frames in the FIFO queue
+    /// Shape: [fifoLength, numSpeakers] (e.g., [20, 4])
+    public let fifo: [Float]
 
     /// Number of speakers
     public let numSpeakers: Int
 
     /// Number of confirmed frames
-    public var confirmedFrameCount: Int { confirmed.count / numSpeakers }  // Assumes 4 speakers
+    public var confirmedFrameCount: Int { confirmed.count / numSpeakers }
 
     /// Number of tentative frames
-    public var tentativeFrameCount: Int { tentative.count / numSpeakers }  // Assumes 4 speakers
+    public var tentativeFrameCount: Int { tentative.count / numSpeakers }
+    
+    public var fifoFrameCount: Int { fifo.count / numSpeakers }
 
-    public init(confirmed: [Float], tentative: [Float], numSpeakers: Int = 4) {
+    public init(confirmed: [Float], tentative: [Float], fifo: [Float], numSpeakers: Int) {
         self.confirmed = confirmed
         self.tentative = tentative
+        self.fifo = fifo
         self.numSpeakers = numSpeakers
     }
 }
@@ -458,13 +506,25 @@ public struct SortformerChunkResult: Sendable {
     /// Tentative predictions for right context frames (may change with next chunk)
     /// Shape: [rightContext, numSpeakers]. Empty if no right context.
     public let tentativePredictions: [Float]
-
+    
     /// Number of tentative frames
     public let tentativeFrameCount: Int
-
+    
     /// Frame index of first tentative frame
     public var tentativeStartFrame: Int {
         startFrame + frameCount
+    }
+    
+    /// Speaker probabilities for frames in the FIFO queue
+    /// Shape: [fifoLength, numSpeakers] (e.g., [20, 4])
+    public let fifoPredictions: [Float]
+    
+    /// Number of frames in the FIFO queue
+    public let fifoFrameCount: Int
+
+    /// Frame index of the first frame in the FIFO queue
+    public var fifoStartFrame: Int {
+        startFrame - fifoFrameCount
     }
 
     public init(
@@ -472,13 +532,17 @@ public struct SortformerChunkResult: Sendable {
         speakerPredictions: [Float],
         frameCount: Int,
         tentativePredictions: [Float] = [],
-        tentativeFrameCount: Int = 0
+        tentativeFrameCount: Int = 0,
+        fifoPredictions: [Float],
+        fifoFrameCount: Int
     ) {
         self.speakerPredictions = speakerPredictions
         self.frameCount = frameCount
         self.startFrame = startFrame
         self.tentativePredictions = tentativePredictions
         self.tentativeFrameCount = tentativeFrameCount
+        self.fifoPredictions = fifoPredictions
+        self.fifoFrameCount = fifoFrameCount
     }
 
     /// Get probability for a specific speaker at a specific confirmed frame
@@ -529,4 +593,34 @@ public enum SortformerError: Error, LocalizedError {
             return "Insufficient preds length: \(message)"
         }
     }
+}
+
+public protocol SortformerFrameRange {
+    /// Start frame index
+    var startFrame: Int { get }
+    
+    /// End frame index
+    var endFrame: Int { get }
+    
+    /// Range of frames spanned
+    var frames: Range<Int> { get }
+    
+    /// Length of the frame range
+    var length: Int { get }
+    
+    /// Check if the range contains a frame
+    func contains(_ frame: Int) -> Bool
+    
+    /// Check if the ranges overlap or touch
+    func isContiguous<T>(with other: T) -> Bool
+    where T: SortformerFrameRange
+    
+    /// Check if the ranges share any frames
+    func overlaps<T>(with other: T) -> Bool
+    where T: SortformerFrameRange
+}
+
+public protocol SpeakerFrameRange: SortformerFrameRange {
+    /// Speaker index in Sortformer's output
+    var speakerIndex: Int { get }
 }
