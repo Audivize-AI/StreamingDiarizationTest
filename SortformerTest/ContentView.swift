@@ -39,47 +39,56 @@ struct ContentView: View {
             }
             .padding(.horizontal)
             
-            // Speech plot - fills available space
-            ZStack {
-                SpeechPlotView(
-                    timeline: viewModel.timeline,
-                    spkcachePreds: viewModel.spkcachePreds,
-                    fifoPreds: viewModel.fifoPreds,
-                    chunkRightContext: viewModel.chunkRightContext,
-                    chunkLeftContext: viewModel.chunkLeftContext,
-                    isRecording: viewModel.isRecording,
-                    updateTrigger: viewModel.updateTrigger,
-                    segmentAnnotations: viewModel.segmentAnnotations,
-                    onPlaySegment: { start, end in
-                        viewModel.playSegment(startTime: start, endTime: end)
-                    },
-                    onAnnotateSegment: { segment in
-                        // Show annotation dialog
-                        selectedSegment = segment
-                        annotationText = viewModel.getAnnotation(for: segment) ?? ""
-                        showingAnnotationDialog = true
+            // Speech plot and Embedding Graph
+            HSplitView {
+                // Left side: Speech Plot (Heatmaps)
+                ZStack {
+                    SpeechPlotView(
+                        timeline: viewModel.timeline,
+                        spkcachePreds: viewModel.spkcachePreds,
+                        fifoPreds: viewModel.fifoPreds,
+                        chunkRightContext: viewModel.chunkRightContext,
+                        chunkLeftContext: viewModel.chunkLeftContext,
+                        isRecording: viewModel.isRecording,
+                        updateTrigger: viewModel.updateTrigger,
+                        segmentAnnotations: viewModel.segmentAnnotations,
+                        embeddingGraphModel: viewModel.embeddingGraphModel,
+                        onPlaySegment: { start, end in
+                            viewModel.playSegment(startTime: start, endTime: end)
+                        },
+                        onAnnotateSegment: { segment in
+                            // Show annotation dialog
+                            selectedSegment = segment
+                            annotationText = viewModel.getAnnotation(for: segment) ?? ""
+                            showingAnnotationDialog = true
+                        }
+                    )
+                    
+                    // Drag and drop overlay
+                    if isDragOver {
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color.blue, style: StrokeStyle(lineWidth: 3, dash: [10]))
+                            .background(Color.blue.opacity(0.1))
+                            .cornerRadius(12)
+                            .overlay(
+                                VStack(spacing: 8) {
+                                    Image(systemName: "arrow.down.doc.fill")
+                                        .font(.system(size: 48))
+                                        .foregroundColor(.blue)
+                                    Text("Drop audio file here")
+                                        .font(.headline)
+                                        .foregroundColor(.blue)
+                                }
+                            )
                     }
-                )
-                
-                // Drag and drop overlay
-                if isDragOver {
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.blue, style: StrokeStyle(lineWidth: 3, dash: [10]))
-                        .background(Color.blue.opacity(0.1))
-                        .cornerRadius(12)
-                        .overlay(
-                            VStack(spacing: 8) {
-                                Image(systemName: "arrow.down.doc.fill")
-                                    .font(.system(size: 48))
-                                    .foregroundColor(.blue)
-                                Text("Drop audio file here")
-                                    .font(.headline)
-                                    .foregroundColor(.blue)
-                            }
-                        )
                 }
+                .layoutPriority(1)
+                .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
+                
+                // Right side: Embedding Graph
+                EmbeddingGraphView(model: viewModel.embeddingGraphModel)
+                    .frame(minWidth: 350, maxWidth: 600, maxHeight: .infinity)
             }
-            .frame(maxHeight: .infinity)
             .padding(.horizontal)
             .onDrop(of: [.audio, .fileURL], isTargeted: $isDragOver) { providers in
                 handleDrop(providers: providers)

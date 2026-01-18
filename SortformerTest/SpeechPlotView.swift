@@ -28,6 +28,9 @@ struct SpeechPlotView: View {
     /// Segment annotations dictionary
     let segmentAnnotations: [String: String]
     
+    /// Embedding graph model for cross-view selection
+    @ObservedObject var embeddingGraphModel: EmbeddingGraphModel
+    
     /// Callback when a segment is clicked (start, end)
     let onPlaySegment: ((Float, Float) -> Void)?
     
@@ -214,13 +217,25 @@ struct SpeechPlotView: View {
                         }
                     }
                     .onTapGesture(count: 1) { location in
-                        // SINGLE CLICK = PLAY
+                        // SINGLE CLICK - check for embedding stroke first, then segment play
                         guard !isRecording, let tl = timeline else { return }
                         
                         let cellHeight = height / CGFloat(numSpeakers)
                         let clickedFrame = Int(location.x / cellWidth)
                         let clickedSpeaker = Int(location.y / cellHeight)
                         
+                        // Check if clicked on an embedding stroke
+                        if let embeddingId = findEmbeddingAtLocation(location, cellWidth: cellWidth, cellHeight: cellHeight, height: height) {
+                            // Toggle selection
+                            if embeddingGraphModel.selectedEmbeddingId == embeddingId {
+                                embeddingGraphModel.selectByEmbeddingId(nil)
+                            } else {
+                                embeddingGraphModel.selectByEmbeddingId(embeddingId)
+                            }
+                            return
+                        }
+                        
+                        // Otherwise, play the segment
                         if let segment = tl.segments.flatMap(\.self).first(where: { 
                             clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
                         }) {
@@ -482,6 +497,179 @@ struct SpeechPlotView: View {
             drawSegmentOutline(context: context, segment: segment, 
                              cellWidth: cellWidth, cellHeight: cellHeight, tentative: true)
         }
+        
+        // Draw embedding strokes within each speaker row
+        drawEmbeddingStrokes(context: context, cellWidth: cellWidth, cellHeight: cellHeight)
+    }
+    
+    /// Draw embedding region strokes within each speaker row
+    /// Strokes are staggered if they overlap in time
+    private func drawEmbeddingStrokes(context: GraphicsContext, cellWidth: CGFloat, cellHeight: CGFloat) {
+        guard let tl = timeline else { return }
+        
+        // Collect all embeddings with their info
+        var allEmbeddings: [(emb: TitaNetEmbedding, speakerIndex: Int)] = []
+        for segment in tl.embeddingSegments {
+            for emb in segment.embeddings {
+                allEmbeddings.append((emb, segment.speakerIndex))
+            }
+        }
+        
+        guard !allEmbeddings.isEmpty else { return }
+        
+        // Group by speaker
+        var embeddingsBySpeaker: [[Int]] = Array(repeating: [], count: numSpeakers)
+        for (idx, (_, speakerIndex)) in allEmbeddings.enumerated() {
+            if speakerIndex < numSpeakers {
+                embeddingsBySpeaker[speakerIndex].append(idx)
+            }
+        }
+        
+        let strokeHeight: CGFloat = 6
+        let strokeMargin: CGFloat = 3
+        let maxStaggerLevels = 3
+        
+        // Draw for each speaker
+        for speakerIndex in 0..<numSpeakers {
+            let indices = embeddingsBySpeaker[speakerIndex]
+            guard !indices.isEmpty else { continue }
+            
+            // Sort by start frame
+            let sortedIndices = indices.sorted { allEmbeddings[$0].emb.startFrame < allEmbeddings[$1].emb.startFrame }
+            
+            // Assign stagger levels to avoid overlap
+            var staggerLevels: [Int: Int] = [:]
+            var levelEndFrames: [Int] = Array(repeating: -1, count: maxStaggerLevels)
+            
+            for idx in sortedIndices {
+                let emb = allEmbeddings[idx].emb
+                // Find first level that doesn't overlap
+                var assignedLevel = 0
+                for level in 0..<maxStaggerLevels {
+                    if levelEndFrames[level] <= emb.startFrame {
+                        assignedLevel = level
+                        break
+                    }
+                    if level == maxStaggerLevels - 1 {
+                        assignedLevel = level // Force last level if all overlap
+                    }
+                }
+                staggerLevels[idx] = assignedLevel
+                levelEndFrames[assignedLevel] = emb.endFrame
+            }
+            
+            // Draw strokes
+            let speakerColor = speakerColors[speakerIndex % speakerColors.count]
+            let rowY = CGFloat(speakerIndex) * cellHeight
+            let baseY = rowY + (cellHeight - CGFloat(maxStaggerLevels) * (strokeHeight + strokeMargin)) / 2
+            
+            for idx in sortedIndices {
+                let (emb, _) = allEmbeddings[idx]
+                let level = staggerLevels[idx] ?? 0
+                
+                let x = CGFloat(emb.startFrame) * cellWidth
+                let width = CGFloat(emb.endFrame - emb.startFrame) * cellWidth
+                let y = baseY + CGFloat(level) * (strokeHeight + strokeMargin)
+                
+                let strokeRect = CGRect(x: x, y: y, width: max(width, 4), height: strokeHeight)
+                
+                // Check if this embedding is selected
+                let isSelected = embeddingGraphModel.selectedEmbeddingId == emb.id
+                
+                // Draw the stroke
+                let path = Path(roundedRect: strokeRect, cornerRadius: 2)
+                
+                if isSelected {
+                    // Highlight selected embedding
+                    context.fill(path, with: .color(speakerColor))
+                    context.stroke(path, with: .color(.white), style: StrokeStyle(lineWidth: 2))
+                    
+                    // Add glow effect
+                    let glowRect = strokeRect.insetBy(dx: -2, dy: -2)
+                    context.fill(Path(roundedRect: glowRect, cornerRadius: 4), with: .color(.white.opacity(0.3)))
+                } else {
+                    context.fill(path, with: .color(speakerColor.opacity(0.8)))
+                    context.stroke(path, with: .color(speakerColor.opacity(0.5)), style: StrokeStyle(lineWidth: 1))
+                }
+            }
+        }
+    }
+    
+    /// Find embedding at a click location
+    /// Returns the embedding UUID if found, nil otherwise
+    private func findEmbeddingAtLocation(_ location: CGPoint, cellWidth: CGFloat, cellHeight: CGFloat, height: CGFloat) -> UUID? {
+        guard let tl = timeline else { return nil }
+        
+        let strokeHeight: CGFloat = 6
+        let strokeMargin: CGFloat = 3
+        let maxStaggerLevels = 3
+        
+        // Collect all embeddings with their info
+        var allEmbeddings: [(emb: TitaNetEmbedding, speakerIndex: Int)] = []
+        for segment in tl.embeddingSegments {
+            for emb in segment.embeddings {
+                allEmbeddings.append((emb, segment.speakerIndex))
+            }
+        }
+        
+        guard !allEmbeddings.isEmpty else { return nil }
+        
+        // Group by speaker
+        var embeddingsBySpeaker: [[Int]] = Array(repeating: [], count: numSpeakers)
+        for (idx, (_, speakerIndex)) in allEmbeddings.enumerated() {
+            if speakerIndex < numSpeakers {
+                embeddingsBySpeaker[speakerIndex].append(idx)
+            }
+        }
+        
+        // Check each speaker's embeddings
+        for speakerIndex in 0..<numSpeakers {
+            let indices = embeddingsBySpeaker[speakerIndex]
+            guard !indices.isEmpty else { continue }
+            
+            // Sort by start frame and compute stagger levels (same logic as draw)
+            let sortedIndices = indices.sorted { allEmbeddings[$0].emb.startFrame < allEmbeddings[$1].emb.startFrame }
+            
+            var staggerLevels: [Int: Int] = [:]
+            var levelEndFrames: [Int] = Array(repeating: -1, count: maxStaggerLevels)
+            
+            for idx in sortedIndices {
+                let emb = allEmbeddings[idx].emb
+                var assignedLevel = 0
+                for level in 0..<maxStaggerLevels {
+                    if levelEndFrames[level] <= emb.startFrame {
+                        assignedLevel = level
+                        break
+                    }
+                    if level == maxStaggerLevels - 1 {
+                        assignedLevel = level
+                    }
+                }
+                staggerLevels[idx] = assignedLevel
+                levelEndFrames[assignedLevel] = emb.endFrame
+            }
+            
+            let rowY = CGFloat(speakerIndex) * cellHeight
+            let baseY = rowY + (cellHeight - CGFloat(maxStaggerLevels) * (strokeHeight + strokeMargin)) / 2
+            
+            // Check each embedding's hit rect
+            for idx in sortedIndices {
+                let (emb, _) = allEmbeddings[idx]
+                let level = staggerLevels[idx] ?? 0
+                
+                let x = CGFloat(emb.startFrame) * cellWidth
+                let width = CGFloat(emb.endFrame - emb.startFrame) * cellWidth
+                let y = baseY + CGFloat(level) * (strokeHeight + strokeMargin)
+                
+                let hitRect = CGRect(x: x - 2, y: y - 2, width: max(width, 4) + 4, height: strokeHeight + 4)
+                
+                if hitRect.contains(location) {
+                    return emb.id
+                }
+            }
+        }
+        
+        return nil
     }
     
     /// Draw label on a segment
@@ -799,6 +987,7 @@ struct SpeechPlotView: View {
         isRecording: false,
         updateTrigger: 0,
         segmentAnnotations: [:],
+        embeddingGraphModel: EmbeddingGraphModel(),
         onPlaySegment: nil,
         onAnnotateSegment: nil
     )

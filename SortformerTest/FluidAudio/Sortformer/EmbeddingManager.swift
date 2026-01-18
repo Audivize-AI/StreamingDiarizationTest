@@ -46,8 +46,15 @@ public class EmbeddingManager {
     /// Lock for thread-safe access
     private let lock = NSLock()
     
-    /// Currently processing requests (to avoid duplicates)
-    private var processingRequests: Set<ObjectIdentifier> = []
+    /// Currently processing requests by key (speaker_start_end) to avoid duplicates
+    private var processingRequests: Set<String> = []
+    
+    /// Orphaned embeddings that couldn't be assigned to a segment
+    /// Will try to assign on subsequent processRequests calls
+    private var orphanedEmbeddings: [(embedding: [Float], speakerIndex: Int, startFrame: Int, endFrame: Int, age: Int)] = []
+    
+    /// Maximum age before orphans are discarded
+    private let maxOrphanAge: Int = 10
     
     /// Logger
     private static let logger = AppLogger(category: "EmbeddingManager")
@@ -57,7 +64,7 @@ public class EmbeddingManager {
     public init(
         config: EmbeddingConfig = EmbeddingConfig(),
         titanetConfig: TitaNetConfig = TitaNetConfig(),
-        frameDurationSeconds: Float = 0.04
+        frameDurationSeconds: Float = 0.08  // Match Sortformer's frame duration
     ) {
         self.config = config
         self.titanetConfig = titanetConfig
@@ -120,6 +127,15 @@ public class EmbeddingManager {
         audioBufferStartFrame = 0
     }
     
+    /// Get the frame range currently available in the audio buffer
+    public var availableAudioFrameRange: Range<Int> {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        let endFrame = audioBufferStartFrame + (audioBuffer.count / samplesPerFrame)
+        return audioBufferStartFrame..<endFrame
+    }
+    
     // MARK: - Embedding Extraction
     
     /// Process pending embedding requests from a timeline asynchronously
@@ -134,19 +150,136 @@ public class EmbeddingManager {
             return
         }
         
-        extractionQueue.async { [weak self] in
-            guard let self = self else { return }
+        // Get available audio range and filter requests
+        let availableRange = availableAudioFrameRange
+        let validRequests = requests.filter { req in
+            req.startFrame >= availableRange.lowerBound && req.endFrame <= availableRange.upperBound
+        }
+        
+        // Log filtered requests for debugging
+        let filteredCount = requests.count - validRequests.count
+        if filteredCount > 0 {
+            Self.logger.debug("Filtered \(filteredCount)/\(requests.count) requests. Available range: [\(availableRange.lowerBound)-\(availableRange.upperBound)]")
+            for req in requests where !(req.startFrame >= availableRange.lowerBound && req.endFrame <= availableRange.upperBound) {
+                Self.logger.debug("  Filtered: [\(req.startFrame)-\(req.endFrame)] (outside buffer)")
+            }
+        }
+        
+        guard !validRequests.isEmpty else {
+            completion?(0)
+            return
+        }
+        
+        // Capture timeline reference - we'll access current segments at extraction time
+        // to ensure we add embeddings to the current segments, not stale ones
+        
+        extractionQueue.async { [weak self, weak timeline] in
+            guard let self = self, let timeline = timeline else { return }
             
             var successCount = 0
             
-            for request in requests {
-                // Check if already processing
-                let requestId = ObjectIdentifier(request.segment)
+            // First, try to assign orphaned embeddings to current segments
+            self.lock.lock()
+            var remainingOrphans: [(embedding: [Float], speakerIndex: Int, startFrame: Int, endFrame: Int, age: Int)] = []
+            let currentOrphans = self.orphanedEmbeddings
+            self.orphanedEmbeddings = []
+            self.lock.unlock()
+            
+            // Search both finalized and tentative segments for matches
+            let currentSegments = timeline.embeddingSegments
+            let tentativeSegments = timeline.tentativeEmbeddingSegments
+            let allSegments = currentSegments + tentativeSegments
+            
+            for orphan in currentOrphans {
+                // First, try to find a segment with matching speaker
+                var matchedSegment: EmbeddingSegment? = allSegments.first(where: { seg in
+                    seg.speakerIndex == orphan.speakerIndex &&
+                    seg.startFrame <= orphan.startFrame &&
+                    seg.endFrame >= orphan.endFrame
+                })
+                
+                // Fallback: if no speaker match, try frame range only (speaker assignments can change in tentative)
+                if matchedSegment == nil {
+                    matchedSegment = allSegments.first(where: { seg in
+                        seg.startFrame <= orphan.startFrame &&
+                        seg.endFrame >= orphan.endFrame
+                    })
+                    if matchedSegment != nil {
+                        Self.logger.debug("Speaker-agnostic match for orphan [\(orphan.startFrame)-\(orphan.endFrame)] (was speaker \(orphan.speakerIndex), now \(matchedSegment!.speakerIndex))")
+                    }
+                }
+                
+                if let segment = matchedSegment {
+                    // Found a matching segment!
+                    let titanetEmb = TitaNetEmbedding(
+                        embedding: orphan.embedding,
+                        startFrame: orphan.startFrame,
+                        endFrame: orphan.endFrame
+                    )
+                    
+                    // Only add if not already present
+                    if !segment.embeddings.contains(where: { $0.startFrame == orphan.startFrame && $0.endFrame == orphan.endFrame }) {
+                        segment.addEmbeddings([titanetEmb])
+                        Self.logger.debug("Assigned orphaned embedding [\(orphan.startFrame)-\(orphan.endFrame)] to segment")
+                    }
+                } else {
+                    // Still no match - keep as orphan if not too old
+                    let newAge = orphan.age + 1
+                    if newAge <= self.maxOrphanAge {
+                        remainingOrphans.append((orphan.embedding, orphan.speakerIndex, orphan.startFrame, orphan.endFrame, newAge))
+                    }
+                }
+            }
+            
+            // Process new requests
+            for request in validRequests {
+                // Get CURRENT segments from timeline at extraction time
+                // ALWAYS check both finalized and tentative
+                let currentSegments = timeline.embeddingSegments
+                let tentativeSegments = timeline.tentativeEmbeddingSegments
+                let allSegments = currentSegments + tentativeSegments
+                
+                // First try speaker-specific match
+                var targetSegment = allSegments.first { seg in
+                    seg.speakerIndex == request.speakerIndex &&
+                    seg.startFrame <= request.startFrame &&
+                    seg.endFrame >= request.endFrame
+                }
+                
+                // Fallback: speaker-agnostic match (speaker IDs can change in tentative predictions)
+                if targetSegment == nil {
+                    targetSegment = allSegments.first { seg in
+                        seg.startFrame <= request.startFrame &&
+                        seg.endFrame >= request.endFrame
+                    }
+                }
+                
+                // Skip if segment already has an embedding covering this range (strict overlap)
+                if let segment = targetSegment {
+                    let alreadyHasEmbedding = segment.embeddings.contains { emb in
+                        // Check if existing embedding covers 90% of the requested range
+                        // Or if the requested range is fully contained in an existing embedding
+                        let intersectionStart = max(emb.startFrame, request.startFrame)
+                        let intersectionEnd = min(emb.endFrame, request.endFrame)
+                        let overlap = max(0, intersectionEnd - intersectionStart)
+                        
+                        let requestLen = request.endFrame - request.startFrame
+                        let coverage = Float(overlap) / Float(requestLen)
+                        
+                        return coverage > 0.9
+                    }
+                    if alreadyHasEmbedding {
+                        continue
+                    }
+                }
+                
+                // Deduplicate by request frame range (not segment object which changes each update)
+                let requestKey = "\(request.speakerIndex)_\(request.startFrame)_\(request.endFrame)"
                 
                 self.lock.lock()
-                let isProcessing = self.processingRequests.contains(requestId)
+                let isProcessing = self.processingRequests.contains(requestKey)
                 if !isProcessing {
-                    self.processingRequests.insert(requestId)
+                    self.processingRequests.insert(requestKey)
                 }
                 self.lock.unlock()
                 
@@ -156,7 +289,7 @@ public class EmbeddingManager {
                 
                 defer {
                     self.lock.lock()
-                    self.processingRequests.remove(requestId)
+                    self.processingRequests.remove(requestKey)
                     self.lock.unlock()
                 }
                 
@@ -173,12 +306,26 @@ public class EmbeddingManager {
                 
                 do {
                     let embedding = try extractor.extractEmbedding(from: audio)
-                    request.addEmbedding(embedding)
-                    successCount += 1
+                    
+                    // Try to add to segment
+                    if let segment = targetSegment {
+                        if request.addEmbedding(embedding, fallbackSegment: segment) {
+                            successCount += 1
+                        }
+                    } else {
+                        // No segment found - cache as orphan
+                        Self.logger.debug("Caching orphan embedding [\(request.startFrame)-\(request.endFrame)] speaker \(request.speakerIndex)")
+                        remainingOrphans.append((embedding, request.speakerIndex, request.startFrame, request.endFrame, 0))
+                    }
                 } catch {
-                    Self.logger.error("Embedding extraction failed: \(error.localizedDescription)")
+                    Self.logger.error("Embedding extraction failed for [\(request.startFrame)-\(request.endFrame)] (audio: \(audio.count) samples): \(error)")
                 }
             }
+            
+            // Store remaining orphans
+            self.lock.lock()
+            self.orphanedEmbeddings.append(contentsOf: remainingOrphans)
+            self.lock.unlock()
             
             DispatchQueue.main.async {
                 completion?(successCount)

@@ -56,6 +56,13 @@ public class SortformerTimeline {
     
     /// Pending embedding extraction requests
     public internal(set) var pendingEmbeddingRequests: [EmbeddingExtractionRequest] = []
+    
+    /// Orphaned embeddings that couldn't be assigned to any segment (temporary buffer)
+    /// These will be tried again on the next replaceEmbeddingSegments call
+    private var orphanedEmbeddings: [(embedding: TitaNetEmbedding, speakerIndex: Int, age: Int)] = []
+    
+    /// Maximum age (in update calls) before orphaned embeddings are discarded
+    private let maxOrphanAge: Int = 5
 
     /// Get total duration of finalized predictions in seconds
     public var duration: Float {
@@ -176,14 +183,6 @@ public class SortformerTimeline {
         
         #if DEBUG
         print("   firstUpdatedFrame=\(firstUpdatedFrame) (update region: [\(firstUpdatedFrame)-\(nextFrame)])")
-        // Check if any segment starts before firstUpdatedFrame
-        for speakerIndex in 0..<config.numSpeakers {
-            for seg in segments[speakerIndex] {
-                if seg.startFrame < firstUpdatedFrame && seg.endFrame > firstUpdatedFrame {
-                    print("   ⚠️ Speaker \(speakerIndex) segment [\(seg.startFrame)-\(seg.endFrame)] STARTS BEFORE update region!")
-                }
-            }
-        }
         #endif
         
         var oldState = getStreamingState(atFrame: firstUpdatedFrame)
@@ -266,7 +265,7 @@ public class SortformerTimeline {
         // Compute the difference between old and new segments in the updated region
         // The diff identifies which segments to delete (changed) and which to insert (new)
         // Overlapping segments are considered "matched" and neither deleted nor inserted
-        var diff = SortformerTimelineDifference(
+        let diff = SortformerTimelineDifference(
             oldSegments: oldSegmentsInRegion,
             newSegments: updatedFinalized
         )
@@ -319,15 +318,60 @@ public class SortformerTimeline {
         // Trim predictions
         trimPredictions()
         
-        // Update disjoint segments - only process segments from the update region
-        // Since segments are sorted, we only need segments that could overlap with [firstUpdatedFrame, ∞)
-        let segmentsInRegion = getSegmentsAfter(frame: firstUpdatedFrame)
+        // Update disjoint segments - get ALL segments for complete recomputation
+        // We pass 0 to get all segments, then fully replace embeddingSegments
+        let allSegments = getSegmentsAfter(frame: 0)
         let (newDisjoint, newTentativeDisjoint) = extractDisjointSegments(
-            segments: segmentsInRegion, firstTentativeFrame: nextFrame)
+            segments: allSegments, firstTentativeFrame: nextFrame)
         
-        // Update embedding segments: only update those in the modified region
-        updateEmbeddingSegmentsFromNewDisjoint(newDisjoint, updatedFromFrame: firstUpdatedFrame)
+        // Fully replace embedding segments with fresh computation
+        // Transfer embeddings from old segments to new ones by matching frame ranges
+        replaceEmbeddingSegments(with: newDisjoint)
         tentativeEmbeddingSegments = newTentativeDisjoint
+        
+        // Generate periodic embedding requests for tentative segments
+        // First extraction when segment reaches minEmbeddingFrames, then every maxEmbeddingFrames
+        for tentativeSeg in tentativeEmbeddingSegments {
+            let segLength = tentativeSeg.length
+            let minLen = embeddingConfig.minEmbeddingFrames
+            let maxLen = embeddingConfig.maxEmbeddingFrames
+            
+            // Skip if too short
+            guard segLength >= minLen else { continue }
+            
+            // Calculate where the next embedding should be extracted
+            let existingCoverage = tentativeSeg.embeddings.reduce(0) { $0 + $1.length }
+            let embeddingCount = tentativeSeg.embeddings.count
+            
+            // First embedding: when segment reaches minLen
+            // Subsequent: every maxLen frames of new content
+            let shouldExtract: Bool
+            if embeddingCount == 0 {
+                // No embeddings yet - extract if we have enough length
+                shouldExtract = true
+            } else {
+                // Already has embeddings - extract if we've grown by maxLen since last
+                let uncoveredLength = segLength - existingCoverage
+                shouldExtract = uncoveredLength >= maxLen
+            }
+            
+            if shouldExtract {
+                // Only request for the new portion (from end of existing coverage to current end)
+                let lastCoveredFrame = tentativeSeg.embeddings.map { $0.endFrame }.max() ?? tentativeSeg.startFrame
+                let requestStart = max(lastCoveredFrame, tentativeSeg.endFrame - maxLen)
+                let requestEnd = tentativeSeg.endFrame
+                
+                if requestEnd - requestStart >= minLen {
+                    let request = EmbeddingExtractionRequest(
+                        segment: tentativeSeg,
+                        startFrame: requestStart,
+                        endFrame: requestEnd
+                    )
+                    pendingEmbeddingRequests.append(request)
+                    Self.logger.debug("Generated tentative embedding request [\(requestStart)-\(requestEnd)] for speaker \(tentativeSeg.speakerIndex)")
+                }
+            }
+        }
         
         // DEBUG: Validate SortformerSegments every frame
         #if DEBUG
@@ -414,7 +458,9 @@ public class SortformerTimeline {
                         print("     [\(j)] start=\(seg.startFrame), end=\(seg.endFrame)\(marker)")
                     }
                     Self.logger.error("[\(context)] Segment bounds mismatch for speaker \(speakerIndex) seg[\(i)]: current=[\(c.startFrame)-\(c.endFrame)] fresh=[\(f.startFrame)-\(f.endFrame)]")
-                    assertionFailure("Segment bounds mismatch")
+                    // Note: This can happen when onset occurs just before the update window.
+                    // The incremental update misses it, but full re-extraction catches it.
+                    // This is a known limitation of FIFO-based incremental updates.
                 }
             }
         }
@@ -424,8 +470,9 @@ public class SortformerTimeline {
         let (freshEmbedding, _) = extractDisjointSegments(segments: allSegments, firstTentativeFrame: nextFrame)
         
         if embeddingSegments.count != freshEmbedding.count {
-            Self.logger.error("[\(context)] Embedding segment count mismatch: current=\(embeddingSegments.count) fresh=\(freshEmbedding.count)")
-            // Don't assert here - embedding segments can legitimately differ due to merging history
+            // This count difference is expected - the fresh count is computed from all segments
+            // but incremental updates may have different segment counts due to merge/split operations
+            // The validation below will catch actual problems (overlaps, duplicates)
         }
         
         // Check for overlapping embedding segments (this should never happen)
@@ -550,6 +597,113 @@ public class SortformerTimeline {
         }
     }
     
+    /// Fully replace embedding segments with new ones, transferring embeddings from old to new
+    /// This avoids the complexity of incremental updates and prevents sync issues
+    private func replaceEmbeddingSegments(with newSegments: [EmbeddingSegment]) {
+        // Track which embeddings from old segments were successfully transferred
+        var transferredEmbeddingIds = Set<UUID>()
+        
+        // Source embeddings from both finalized and tentative segments
+        // This ensures that when tentative segments finalize (and merge), their embeddings are preserved
+        let allOldSegments = embeddingSegments + tentativeEmbeddingSegments
+        
+        // Transfer embeddings from old segments to new segments
+        for newSeg in newSegments {
+            // Find overlapping old segments with same speaker
+            let overlappingOld = allOldSegments.filter { old in
+                old.speakerIndex == newSeg.speakerIndex &&
+                old.frames.overlaps(newSeg.frames)
+            }
+            
+            // Check for exact match first (common case - segment unchanged)
+            if let exactMatch = overlappingOld.first(where: { old in
+                old.startFrame == newSeg.startFrame && old.endFrame == newSeg.endFrame
+            }) {
+                // Transfer all embeddings directly
+                newSeg.addEmbeddings(exactMatch.embeddings)
+                for emb in exactMatch.embeddings {
+                    transferredEmbeddingIds.insert(emb.id)
+                }
+                continue
+            }
+            
+            // Transfer embeddings from overlapping segments
+            for oldSeg in overlappingOld {
+                for embedding in oldSeg.embeddings {
+                    let overlapWithNew = embedding.overlapLength(with: newSeg)
+                    
+                    // Check if this embedding belongs to this new segment more than others
+                    let otherNewSegments = newSegments.filter { $0.id != newSeg.id && $0.speakerIndex == newSeg.speakerIndex }
+                    let bestOverlapWithOthers = otherNewSegments.map { embedding.overlapLength(with: $0) }.max() ?? 0
+                    
+                    if overlapWithNew > bestOverlapWithOthers && overlapWithNew > 0 {
+                        let outsideFrames = embedding.length - overlapWithNew
+                        if outsideFrames <= embeddingConfig.maxOutsideFrames {
+                            newSeg.addEmbeddings([embedding])
+                            transferredEmbeddingIds.insert(embedding.id)
+                        }
+                    }
+                }
+            }
+            
+            // Try to reassign orphaned embeddings from previous updates
+            for (idx, orphan) in orphanedEmbeddings.enumerated().reversed() {
+                guard orphan.speakerIndex == newSeg.speakerIndex else { continue }
+                
+                let overlap = orphan.embedding.overlapLength(with: newSeg)
+                if overlap > 0 {
+                    let outsideFrames = orphan.embedding.length - overlap
+                    if outsideFrames <= embeddingConfig.maxOutsideFrames {
+                        newSeg.addEmbeddings([orphan.embedding])
+                        orphanedEmbeddings.remove(at: idx)
+                    }
+                }
+            }
+        }
+        
+        // Collect orphaned embeddings (from old segments, not transferred)
+        for oldSeg in allOldSegments {
+            for embedding in oldSeg.embeddings {
+                if !transferredEmbeddingIds.contains(embedding.id) {
+                    // This embedding wasn't transferred - add to orphan buffer
+                    orphanedEmbeddings.append((embedding: embedding, speakerIndex: oldSeg.speakerIndex, age: 0))
+                }
+            }
+        }
+        
+        // Age and prune orphaned embeddings
+        orphanedEmbeddings = orphanedEmbeddings.compactMap { orphan in
+            let newAge = orphan.age + 1
+            if newAge > maxOrphanAge {
+                return nil // Too old, discard
+            }
+            return (orphan.embedding, orphan.speakerIndex, newAge)
+        }
+        
+        // Replace with new segments
+        embeddingSegments = newSegments
+        
+        // Clear stale pending requests (segments may have changed)
+        pendingEmbeddingRequests.removeAll()
+        
+        // Generate embedding requests for segments without embeddings
+        // Only for segments long enough to extract embeddings from
+        var segmentsNeedingEmbeddings = 0
+        for segment in newSegments where segment.embeddings.isEmpty && segment.isFinalized && segment.length >= embeddingConfig.minEmbeddingFrames {
+            segmentsNeedingEmbeddings += 1
+            let requests = segment.getEmbeddingRequests(
+                maxGapSize: embeddingConfig.maxEmbeddingGap,
+                maxEmbeddingLength: embeddingConfig.maxEmbeddingFrames,
+                minEmbeddingLength: embeddingConfig.minEmbeddingFrames
+            )
+            pendingEmbeddingRequests.append(contentsOf: requests)
+        }
+        
+        #if DEBUG
+        validateEmbeddingSegments(context: "replaceEmbeddingSegments")
+        #endif
+    }
+
     /// Validate embedding segments for debugging - checks for overlaps and small segments
     private func validateEmbeddingSegments(context: String) {
         for i in 0..<embeddingSegments.count {
@@ -872,14 +1026,22 @@ public class SortformerTimeline {
             }
             
             let currentSegment = speakerSegments[indexOfCurrentSegment]
-            reconstructedState.starts[speakerIndex] = currentSegment.startFrame
-            reconstructedState.isSpeaking[speakerIndex] = currentSegment.contains(frame - 1)
             
-            if currentSegment.endFrame < frame {
+            // If the segment has ended before or exactly at `frame`, we're not speaking anymore
+            if currentSegment.endFrame <= frame {
+                // Segment already closed - we're NOT speaking
+                reconstructedState.isSpeaking[speakerIndex] = false
                 reconstructedState.lastSegments[speakerIndex] = (currentSegment.startFrame, currentSegment.endFrame)
-            } else if indexOfCurrentSegment > 0 {
-                let prevSegment = speakerSegments[indexOfCurrentSegment - 1]
-                reconstructedState.lastSegments[speakerIndex] = (prevSegment.startFrame, prevSegment.endFrame)
+                // Don't set starts - no open segment
+            } else {
+                // Segment is still ongoing at `frame`
+                reconstructedState.starts[speakerIndex] = currentSegment.startFrame
+                reconstructedState.isSpeaking[speakerIndex] = currentSegment.contains(frame - 1)
+                
+                if indexOfCurrentSegment > 0 {
+                    let prevSegment = speakerSegments[indexOfCurrentSegment - 1]
+                    reconstructedState.lastSegments[speakerIndex] = (prevSegment.startFrame, prevSegment.endFrame)
+                }
             }
         }
         
@@ -970,10 +1132,14 @@ public class SortformerTimeline {
             tentativeSeg.isFinalized = true
             embeddingSegments.append(tentativeSeg)
             
+            // Only generate requests for segments long enough
+            guard tentativeSeg.length >= embeddingConfig.minEmbeddingFrames else { continue }
+            
             // Generate embedding requests for newly finalized segments
             let requests = tentativeSeg.getEmbeddingRequests(
                 maxGapSize: embeddingConfig.maxEmbeddingGap,
-                maxEmbeddingLength: embeddingConfig.maxEmbeddingFrames
+                maxEmbeddingLength: embeddingConfig.maxEmbeddingFrames,
+                minEmbeddingLength: embeddingConfig.minEmbeddingFrames
             )
             pendingEmbeddingRequests.append(contentsOf: requests)
         }

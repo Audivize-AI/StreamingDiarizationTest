@@ -32,7 +32,7 @@ public struct TitaNetConfig {
     var maxInputDuration: Float { Float(maxInputFrames) * frameDuration }
 
     public init(
-        minInputFrames: Int = 13,
+        minInputFrames: Int = 12,
         maxInputFrames: Int = 31
     ) {
         self.minInputFrames = minInputFrames
@@ -57,7 +57,7 @@ public struct EmbeddingConfig {
     public let maxOutsideFrames: Int
     
     public init(
-        minEmbeddingFrames: Int = 13,
+        minEmbeddingFrames: Int = 12,
         maxEmbeddingFrames: Int = 31,
         maxEmbeddingGap: Int = 6,
         minSegmentGap: Int = 4,

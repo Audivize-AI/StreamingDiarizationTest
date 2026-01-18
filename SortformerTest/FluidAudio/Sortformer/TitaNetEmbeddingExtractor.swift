@@ -11,7 +11,7 @@ public struct TitaNetEmbeddingExtractor {
     private let lengthArray: MLMultiArray
     private let sampleRate: Float = 16_000
     
-    init(config: TitaNetConfig) throws {
+    public init(config: TitaNetConfig) throws {
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .all
         
@@ -22,8 +22,8 @@ public struct TitaNetEmbeddingExtractor {
         self.processedSignalArray = try memoryOptimizer.createAlignedArray(
             shape: [
                 1,
-                NSNumber(value: config.melFeatures),
-                NSNumber(value: IndexUtils.nextMultiple(of: config.melPadTo, for: config.maxMelLength))
+                NSNumber(value: IndexUtils.nextMultiple(of: config.melPadTo, for: config.maxMelLength)),
+                NSNumber(value: config.melFeatures)
             ],
             dataType: .float32
         )
@@ -41,16 +41,17 @@ public struct TitaNetEmbeddingExtractor {
     ) throws -> [Float] where C: AccelerateBuffer & Collection, C.Element == Float, C.Index == Int {
         
         // Preprocess audio
-        let (mels, melLength, _) = preprocessor.computeFlat(audio: audioSignal)
+        let (mels, melLength, _) = preprocessor.computeFlatTransposed(audio: audioSignal)
         
         // Ensure input size is within bounds
-        guard melLength > config.minMelLength else {
+        guard melLength >= config.minMelLength else {
             throw TitaNetError.invalidAudioInput(
                 "Audio is too short to extract speaker identity (\(melLength) < \(config.minMelLength))")
         }
         
         guard melLength <= config.maxMelLength else {
-            fatalError("Audio too long for TitaNet model (\(melLength) > \(config.maxMelLength))")
+            throw TitaNetError.invalidAudioInput(
+                "Audio too long for TitaNet model (\(melLength) > \(config.maxMelLength))")
         }
         
         // Copy inputs to MLMultiArrays
@@ -63,13 +64,23 @@ public struct TitaNetEmbeddingExtractor {
         lengthArray[0] = NSNumber(value: Int32(melLength))
         
         // Build input
-        let input = try MLDictionaryFeatureProvider(dictionary: [
-            "processed_signal": MLFeatureValue(multiArray: processedSignalArray),
-            "length": MLFeatureValue(multiArray: lengthArray)
-        ])
+        let input: MLDictionaryFeatureProvider
+        do {
+            input = try MLDictionaryFeatureProvider(dictionary: [
+                "processed_signal": MLFeatureValue(multiArray: processedSignalArray),
+                "length": MLFeatureValue(multiArray: lengthArray)
+            ])
+        } catch {
+            throw TitaNetError.predictionFailed("Failed to create input features: \(error)")
+        }
         
         // Get prediction
-        let output = try model.prediction(from: input)
+        let output: MLFeatureProvider
+        do {
+            output = try model.prediction(from: input)
+        } catch {
+            throw TitaNetError.predictionFailed("CoreML prediction failed (melLength=\(melLength), shape=\(processedSignalArray.shape)): \(error)")
+        }
         
         guard let embedding = output.featureValue(for: "embedding")?.shapedArrayValue(of: Float.self)?.scalars else {
             throw TitaNetError.predictionFailed("Missing embedding output")

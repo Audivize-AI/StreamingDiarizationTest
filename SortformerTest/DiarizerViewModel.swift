@@ -30,6 +30,9 @@ final class DiarizerViewModel: ObservableObject {
     /// Trigger for UI updates (incremented when timeline changes)
     @Published private(set) var updateTrigger = 0
     
+    /// Embedding graph model for visualization
+    let embeddingGraphModel = EmbeddingGraphModel()
+    
     /// Right context frames for FIFO alignment
     var chunkRightContext: Int {
         globalConfig.chunkRightContext
@@ -49,6 +52,7 @@ final class DiarizerViewModel: ObservableObject {
     // MARK: - Private Properties
     
     private var diarizer: SortformerDiarizer?
+    private var embeddingManager: EmbeddingManager?
     private var audioEngine: AVAudioEngine?
     private var processingTask: Task<Void, Never>?
     private var audioPlayer: AVAudioPlayer?
@@ -79,6 +83,7 @@ final class DiarizerViewModel: ObservableObject {
         audioBuffer = []
         recordedAudio = []
         diarizer?.reset()
+        embeddingManager?.resetAudioBuffer()
         timeline = diarizer?.timeline
         
         // Start audio capture
@@ -115,6 +120,7 @@ final class DiarizerViewModel: ObservableObject {
         
         if !remainingSamples.isEmpty {
             diarizer?.addAudio(remainingSamples)
+            embeddingManager?.appendAudio(remainingSamples)
             // Process until no more chunks
             while let _ = try? diarizer?.process() {
                 // Keep processing
@@ -124,6 +130,17 @@ final class DiarizerViewModel: ObservableObject {
         // Finalize timeline
         timeline?.finalize()
         updateTrigger += 1
+        
+        // Extract any remaining embeddings
+        if let tl = timeline, let embMgr = embeddingManager {
+            embMgr.processRequests(from: tl) { [weak self] count in
+                guard let self = self else { return }
+                print("[Embeddings] Final extraction: \(count) embeddings")
+                self.updateGraph()
+            }
+        }
+        
+        updateGraph()
         
         isRecording = false
         statusMessage = "Ready - Click segments to play"
@@ -207,6 +224,10 @@ final class DiarizerViewModel: ObservableObject {
             // Store for playback
             recordedAudio = resampledSamples
             
+            // Reset and feed audio to embedding manager
+            embeddingManager?.resetAudioBuffer()
+            embeddingManager?.appendAudio(resampledSamples)
+            
             statusMessage = "Processing \(url.lastPathComponent)..."
             
             // Process complete audio
@@ -214,6 +235,18 @@ final class DiarizerViewModel: ObservableObject {
             spkcachePreds = diarizer.state.spkcachePreds  // Update speaker cache display
             fifoPreds = diarizer.state.fifoPreds  // Update FIFO queue display
             updateTrigger += 1
+            
+            // Extract embeddings for all segments
+            if let tl = timeline, let embMgr = embeddingManager {
+                statusMessage = "Extracting embeddings..."
+                embMgr.processRequests(from: tl) { [weak self] count in
+                    guard let self = self else { return }
+                    print("[Embeddings] Extracted \(count) embeddings")
+                    self.updateGraph()
+                }
+            }
+            
+            updateGraph()
             
             let duration = Float(resampledSamples.count) / Float(sampleRate)
             statusMessage = String(format: "Processed %.1fs - Click segments to play", duration)
@@ -323,7 +356,14 @@ final class DiarizerViewModel: ObservableObject {
             let models = try await SortformerModels.loadFromHuggingFace(config: globalConfig)
             newDiarizer.initialize(models: models)
             
+            // Initialize embedding manager
+            let newEmbeddingManager = EmbeddingManager(
+                frameDurationSeconds: globalConfig.frameDurationSeconds
+            )
+            try newEmbeddingManager.initialize()
+            
             self.diarizer = newDiarizer
+            self.embeddingManager = newEmbeddingManager
             self.timeline = newDiarizer.timeline
             self.isReady = true
             self.statusMessage = "Ready"
@@ -381,6 +421,9 @@ final class DiarizerViewModel: ObservableObject {
         audioBuffer.append(contentsOf: resampledSamples)
         recordedAudio.append(contentsOf: resampledSamples)
         audioBufferLock.unlock()
+        
+        // Also feed to embedding manager for extraction
+        embeddingManager?.appendAudio(resampledSamples)
     }
     
     private func processingLoop() async {
@@ -412,11 +455,41 @@ final class DiarizerViewModel: ObservableObject {
                 updateTrigger += 1
                 spkcachePreds = diarizer.state.spkcachePreds
                 fifoPreds = diarizer.state.fifoPreds
+                
+                // Process embedding extraction requests
+                if let tl = timeline, let embMgr = embeddingManager {
+                    embMgr.processRequests(from: tl) { [weak self] count in
+                        guard let self = self, count > 0 else { return }
+                        // Update graph when new embeddings are extracted
+                        self.updateGraph()
+                    }
+                }
+                
+                // Update graph occasionally (every 5 updates or if small) to save perf
+                if updateTrigger % 5 == 0 || (timeline?.embeddingSegments.count ?? 0) < 50 {
+                   updateGraph()
+                }
             }
         } catch {
             statusMessage = "Processing error: \(error.localizedDescription)"
             print("Diarizer processing error: \(error)")
         }
+    }
+    
+    /// Update the embedding graph model from the current timeline
+    private func updateGraph() {
+        guard let tl = timeline else { return }
+        
+        #if DEBUG
+        let segCount = tl.embeddingSegments.count
+        let embCount = tl.embeddingSegments.reduce(0) { $0 + $1.embeddings.count }
+        if segCount > 0 || embCount > 0 {
+            print("[Graph] Updating with \(segCount) segments, \(embCount) total embeddings")
+        }
+        #endif
+        
+        // Run on main actor (already on main actor)
+        embeddingGraphModel.update(from: tl.embeddingSegments)
     }
     
     /// Print all segments in CSV format: speaker_id,start_time,end_time
