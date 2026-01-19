@@ -115,7 +115,7 @@ struct SpeechPlotView: View {
                         .frame(maxHeight: .infinity)
                 }
             }
-            .frame(width: 45, height: height)
+            .frame(width: 45, height: max(0, height))
             
             // Scrollable heatmap - virtualized chunks
             ScrollViewReader { scrollProxy in
@@ -137,7 +137,7 @@ struct SpeechPlotView: View {
                                          cellWidth: cellWidth, cellHeight: height / CGFloat(numSpeakers))
                             }
                             .drawingGroup()
-                            .frame(width: chunkWidth, height: height)
+                            .frame(width: chunkWidth, height: max(0, height))
                             .id("chunk-\(chunkIndex)")
                         }
                         
@@ -146,7 +146,7 @@ struct SpeechPlotView: View {
                         
                         // Stable scroll target at the trailing edge
                         Color.clear
-                            .frame(width: 1, height: height)
+                            .frame(width: 1, height: max(1, height))
                             .id("scrollEnd")
                     }
                     .overlay {
@@ -269,7 +269,7 @@ struct SpeechPlotView: View {
                         }
                     }
                 }
-                .frame(height: height)
+                .frame(height: max(0, height))
                 .background(Color(cgColor: ViridisColormap.cgColor(for: 0)))  // Purple background
                 .cornerRadius(8)
                 .onChange(of: updateTrigger) { _, _ in
@@ -329,13 +329,13 @@ struct SpeechPlotView: View {
                             .frame(maxHeight: .infinity)
                     }
                 }
-                .frame(width: 45, height: height)
+                .frame(width: 45, height: max(height, 0))
                 
                 // FIFO heatmap - fixed width, right-aligned content
                 Canvas { context, size in
                     drawFifoHeatmap(context: context, size: size)
                 }
-                .frame(width: width, height: height)
+                .frame(width: width, height: max(height, 0))
                 .background(Color(cgColor: ViridisColormap.cgColor(for: 0)))  // Purple background
                 .cornerRadius(6)
             }
@@ -361,14 +361,14 @@ struct SpeechPlotView: View {
                             .frame(maxHeight: .infinity)
                     }
                 }
-                .frame(width: 45, height: height)
+                .frame(width: 45, height: max(0, height))
                 
                 // Speaker cache heatmap
                 Canvas { context, size in
                     drawSpkcacheHeatmap(context: context, size: size)
                 }
                 .id("spkcache-\(updateTrigger)")  // Force redraw on updates
-                .frame(width: width, height: height)
+                .frame(width: width, height: max(0, height))
                 .background(Color(cgColor: ViridisColormap.cgColor(for: 0)))  // Purple background
                 .cornerRadius(6)
             }
