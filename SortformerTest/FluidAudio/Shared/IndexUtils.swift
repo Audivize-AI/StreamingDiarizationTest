@@ -13,7 +13,7 @@ public struct IndexUtils {
     }
     
     public static func ceilDiv(_ a: Int, _ b: Int) -> Int {
-        return (a - 1) / b + 1
+        return (a + b - 1) / b 
     }
     
     public static func nextMultiple(of step: Int, for value: Int) -> Int {

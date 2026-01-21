@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		D8CBBAB42F1EF3B400C0B240 /* OrderedCollections in Frameworks */ = {isa = PBXBuildFile; productRef = D8CBBAB32F1EF3B400C0B240 /* OrderedCollections */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		D831B4B22F0239610089CDFA /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -53,6 +57,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D8CBBAB42F1EF3B400C0B240 /* OrderedCollections in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -122,6 +127,7 @@
 			);
 			name = SortformerTest;
 			packageProductDependencies = (
+				D8CBBAB32F1EF3B400C0B240 /* OrderedCollections */,
 			);
 			productName = SortformerTest;
 			productReference = D831B4A22F0239600089CDFA /* SortformerTest.app */;
@@ -209,6 +215,7 @@
 			mainGroup = D831B4992F0239600089CDFA;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				D8CBBAB22F1EF3B400C0B240 /* XCRemoteSwiftPackageReference "swift-collections" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = D831B4A32F0239600089CDFA /* Products */;
@@ -616,6 +623,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		D8CBBAB22F1EF3B400C0B240 /* XCRemoteSwiftPackageReference "swift-collections" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-collections.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.3.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		D8CBBAB32F1EF3B400C0B240 /* OrderedCollections */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D8CBBAB22F1EF3B400C0B240 /* XCRemoteSwiftPackageReference "swift-collections" */;
+			productName = OrderedCollections;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = D831B49A2F0239600089CDFA /* Project object */;
 }

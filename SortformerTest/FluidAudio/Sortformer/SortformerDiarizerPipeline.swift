@@ -28,13 +28,13 @@ public final class SortformerDiarizer {
     private let lock = NSLock()
 
     /// Accumulated results
-    public var timeline: SortformerTimeline {
+    public var timeline: SortformerVectorClustering {
         lock.lock()
         defer { lock.unlock() }
         return _timeline
     }
     
-    private var _timeline: SortformerTimeline
+    private var _timeline: SortformerVectorClustering
 
     /// Check if diarizer is ready for processing.
     public var isAvailable: Bool {
@@ -53,11 +53,8 @@ public final class SortformerDiarizer {
 
     /// Number of frames processed
     public var numFramesProcessed: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _numFramesProcessed
+        return state.nextNewFrame
     }
-    private var _numFramesProcessed: Int = 0
 
     /// Configuration
     public let config: SortformerConfig
@@ -69,13 +66,11 @@ public final class SortformerDiarizer {
 
     // Native mel spectrogram (used when useNativePreprocessing is enabled)
     private let melSpectrogram = NeMoMelSpectrogram()
+    private let embeddingManager: EmbeddingManager
 
     // Audio buffering
     private var audioBuffer: [Float] = []
     private var lastAudioSample: Float = 0
-    private var audioStartFrame: Int = 0
-    internal var newAudioStartIndex: Int = 0
-    internal let audioContextSize: Int
 
     // Feature buffering
     internal var featureBuffer: [Float] = []
@@ -86,13 +81,20 @@ public final class SortformerDiarizer {
 
     // MARK: - Initialization
 
-    public init(config: SortformerConfig = .default, postProcessingConfig: SortformerPostProcessingConfig? = nil) {
+    public init(
+        config: SortformerConfig = .default,
+        postProcessingConfig: SortformerPostProcessingConfig? = nil,
+        embeddingConfig: EmbeddingConfig? = nil
+    ) {
         self.config = config
-        let contextFrames = config.fifoLen + config.chunkLeftContext + config.chunkLen + config.chunkRightContext
-        self.audioContextSize = contextFrames * config.subsamplingFactor * config.melStride
         self.stateUpdater = SortformerStateUpdater(config: config)
         self._state = SortformerStreamingState(config: config)
-        self._timeline = SortformerTimeline(config: postProcessingConfig ?? .default(for: config))
+        self.embeddingManager = EmbeddingManager(config: .default)
+        try? self.embeddingManager.initialize()
+        self._timeline = SortformerVectorClustering(
+            config: postProcessingConfig ?? .default(for: config),
+            embeddingManager: embeddingManager
+        )
     }
 
     /// Initialize with CoreML models (combined pipeline mode).
@@ -156,11 +158,9 @@ public final class SortformerDiarizer {
         lastAudioSample = 0
         startFeat = 0
         diarizerChunkIndex = 0
-        newAudioStartIndex = 0
-        audioStartFrame = 0
         _timeline.reset()
         
-        audioBuffer.reserveCapacity(audioContextSize + config.chunkMelFrames * config.melStride)
+        audioBuffer.reserveCapacity(config.chunkMelFrames * config.melStride)
         featureBuffer.reserveCapacity((config.chunkMelFrames + config.coreFrames) * config.melFeatures)
     }
 
@@ -192,7 +192,7 @@ public final class SortformerDiarizer {
     /// Call this after adding audio with `addAudio()`.
     ///
     /// - Returns: New chunk results if enough audio was processed, nil otherwise
-    public func process() throws -> SortformerChunkResult? {
+    public func process() throws -> SortformerTimelineDifference? {
         lock.lock()
         defer { lock.unlock() }
         return try processLocked()
@@ -204,7 +204,7 @@ public final class SortformerDiarizer {
     ///
     /// - Parameter samples: Audio samples (16kHz mono)
     /// - Returns: New chunk results if enough audio was processed
-    public func processSamples(_ samples: [Float]) throws -> SortformerChunkResult? {
+    public func processSamples(_ samples: [Float]) throws -> SortformerTimelineDifference? {
         lock.lock()
         defer { lock.unlock() }
 
@@ -213,20 +213,18 @@ public final class SortformerDiarizer {
     }
 
     /// Internal process - caller must hold lock
-    private func processLocked() throws -> SortformerChunkResult? {
+    private func processLocked() throws -> SortformerTimelineDifference? {
         guard let models = _models else {
             throw SortformerError.notInitialized
         }
-
-        var newPredictions: [Float] = []
-        var newTentativePredictions: [Float] = []
-        var newFrameCount = 0
-        var firstFifoPreds: [Float]? = nil
-        var firstFifoFrameCount = 0
-        var newTentativeFrameCount = 0
+        
+        // TODO: INIT EMPTY DIFF
+        var difference = SortformerTimelineDifference()
+        var ran = false
 
         // Step 1: Run preprocessor on available audio
         while let (chunkFeatures, chunkLengths) = getNextChunkFeaturesLocked() {
+            ran = true
             let output = try models.runMainModel(
                 chunk: chunkFeatures,
                 chunkLength: chunkLengths,
@@ -246,56 +244,23 @@ public final class SortformerDiarizer {
             let chunkEmbs = Array(output.chunkEmbeddings.prefix(embLength * config.preEncoderDims))
 
             // Update state with correct context values
-            let updateResult = try stateUpdater.streamingUpdate(
+            let chunk = try stateUpdater.streamingUpdate(
                 state: &_state,
                 chunk: chunkEmbs,
                 preds: probabilities,
                 leftContext: diarizerChunkIndex > 0 ? config.chunkLeftContext : 0,
                 rightContext: config.chunkRightContext
             )
-            
-            let chunk = SortformerChunkResult(
-                startFrame: _numFramesProcessed,
-                speakerPredictions: updateResult.confirmed,
-                frameCount: updateResult.confirmedFrameCount,
-                tentativePredictions: updateResult.tentative,
-                tentativeFrameCount: updateResult.tentativeFrameCount,
-                fifoPredictions: updateResult.fifo,
-                fifoFrameCount: updateResult.fifoFrameCount
-            )
 
-            _timeline.addChunk(chunk)
-
-            // Accumulate confirmed results
-            _numFramesProcessed += updateResult.confirmedFrameCount
-            newPredictions.append(contentsOf: updateResult.confirmed)
-            newTentativePredictions = updateResult.tentative
-            newFrameCount += updateResult.confirmedFrameCount
-            newTentativeFrameCount = updateResult.tentativeFrameCount
-            
-            if firstFifoPreds == nil {
-                firstFifoPreds = updateResult.fifo
-                firstFifoFrameCount = updateResult.fifoFrameCount
-            }
+            let diff = try _timeline.addChunk(chunk)
+            difference.apply(diff)
 
             diarizerChunkIndex += 1
         }
 
-        // Return new results if any
-        if newPredictions.count > 0 {
-            let chunk = SortformerChunkResult(
-                startFrame: _numFramesProcessed,
-                speakerPredictions: newPredictions,
-                frameCount: newFrameCount,
-                tentativePredictions: newTentativePredictions,
-                tentativeFrameCount: newTentativeFrameCount,
-                fifoPredictions: firstFifoPreds ?? [],
-                fifoFrameCount: firstFifoFrameCount
-            )
-
-            return chunk
+        if ran {
+            return difference
         }
-
         return nil
     }
 
@@ -313,7 +278,7 @@ public final class SortformerDiarizer {
     public func processComplete(
         _ samples: [Float],
         progressCallback: ProgressCallback? = nil
-    ) throws -> SortformerTimeline {
+    ) throws -> SortformerVectorClustering {
         lock.lock()
         defer { lock.unlock() }
 
@@ -326,13 +291,11 @@ public final class SortformerDiarizer {
         lastAudioSample = 0
         resetBuffersLocked()
 
+        var difference = SortformerTimelineDifference()
         var featureProvider = SortformerFeatureLoader(config: self.config, audio: samples)
         var chunksProcessed = 0
-        var predictions: [Float] = []
-        var lastTentative: [Float] = []
-
-        let coreFrames = config.chunkLen * config.subsamplingFactor  // 48 mel frames core
-
+        let coreFrames = config.chunkLen * config.subsamplingFactor
+        
         while let (chunkFeatures, chunkLength, leftOffset, rightOffset) = featureProvider.next() {
             // Run main model
             let output = try models.runMainModel(
@@ -356,19 +319,18 @@ public final class SortformerDiarizer {
             let rightContext = IndexUtils.ceilDiv(rightOffset, config.subsamplingFactor)
 
             // Update state
-            let updateResult = try stateUpdater.streamingUpdate(
+            let chunk = try stateUpdater.streamingUpdate(
                 state: &_state,
                 chunk: chunkEmbs,
                 preds: probabilities,
                 leftContext: leftContext,
                 rightContext: rightContext
             )
-
-            // Accumulate confirmed results (tentative not needed for batch processing)
-            predictions.append(contentsOf: updateResult.confirmed)
-            lastTentative = updateResult.tentative
+            
+            let diff = try _timeline.addChunk(chunk)
             chunksProcessed += 1
             diarizerChunkIndex += 1
+            difference.apply(diff)
 
             // Progress callback
             // processedFrames is in mel frames (after subsampling)
@@ -377,23 +339,15 @@ public final class SortformerDiarizer {
             let progress = min(processedMelFrames * config.melStride, samples.count)
             progressCallback?(progress, samples.count, chunksProcessed)
         }
-        predictions.append(contentsOf: lastTentative)
 
         // Save updated state
-        _numFramesProcessed = predictions.count / config.numSpeakers
 
         if config.debugMode {
             print(
-                "[DEBUG] Phase 2 complete: diarizerChunks=\(diarizerChunkIndex), totalProbs=\(predictions.count), totalFrames=\(_numFramesProcessed)"
+                "[DEBUG] Phase 2 complete: diarizerChunks=\(diarizerChunkIndex), totalProbs=\(_timeline.framePredictions.count + _timeline.tentativePredictions.count), totalFrames=\(_state.nextNewFrame)"
             )
             fflush(stdout)
         }
-
-        _timeline = SortformerTimeline(
-            allPredictions: predictions,
-            config: _timeline.config,
-            isComplete: true
-        )
 
         return _timeline
     }
@@ -402,7 +356,7 @@ public final class SortformerDiarizer {
 
     /// Preprocess audio into mel features - caller must hold lock
     private func preprocessAudioToFeaturesLocked() {
-        guard audioBuffer.count >= newAudioStartIndex + config.melWindow else {
+        guard audioBuffer.count >= config.melWindow else {
             return
         }
 
@@ -439,16 +393,21 @@ public final class SortformerDiarizer {
         }
 
         // Wait until we have enough audio to satisfy the demand
-        let requiredBufferSize = newAudioStartIndex + samplesNeeded
-        guard audioBuffer.count >= requiredBufferSize else {
+        guard audioBuffer.count >= samplesNeeded else {
             return
         }
 
+        let audioSlice = audioBuffer.prefix(samplesNeeded)
         let (mel, melFrames, _) = melSpectrogram.computeFlatTransposed(
-            audio: audioBuffer[newAudioStartIndex..<requiredBufferSize],
+            audio: audioSlice,
             lastAudioSample: lastAudioSample
         )
-
+        
+        self.embeddingManager.addAudio(
+            from: audioSlice,
+            lastAudioSample: lastAudioSample
+        )
+        
         guard melFrames > 0 else {
             return
         }
@@ -457,15 +416,8 @@ public final class SortformerDiarizer {
         
         // Remove old audio context
         let samplesConsumed = melFrames * config.melStride
-        newAudioStartIndex += samplesConsumed
-        lastAudioSample = audioBuffer[newAudioStartIndex - 1] // For preemph filter
-        let numToRemove = newAudioStartIndex - audioContextSize
-        
-        if numToRemove > 0 {
-            audioBuffer.removeFirst(numToRemove)
-            audioStartFrame += numToRemove
-            newAudioStartIndex = audioContextSize
-        }
+        lastAudioSample = audioBuffer[samplesConsumed - 1] // For preemph filter
+        audioBuffer.removeFirst(samplesConsumed)
     }
 
     /// Get next chunk features (for testing)
@@ -516,12 +468,5 @@ public final class SortformerDiarizer {
         }
 
         return (mel, chunkLength)
-    }
-    
-    private func getAudio(fromFrame startFrame: Int, toFrame endFrame: Int) -> ArraySlice<Float> {
-        let samplesPerFrame = config.subsamplingFactor * config.melStride
-        let startSample = (startFrame - audioStartFrame) * samplesPerFrame
-        let endSample = (endFrame - audioStartFrame) * samplesPerFrame
-        return audioBuffer[startSample..<endSample]
     }
 }

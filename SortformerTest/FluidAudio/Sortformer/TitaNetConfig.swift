@@ -7,39 +7,6 @@
 
 import Foundation
 
-
-public struct TitaNetConfig {
-    /// Minimum number Sortformer frames to extract a speaker embedding
-    public let minInputFrames: Int
-
-    /// Maximum mumber Sortformer frames the model can fit
-    public let maxInputFrames: Int
-
-    // Non-configurable properties
-    public let frameDuration: Float = 0.08
-    public let subsamplingFactor: Int = 8
-    public let melFeatures: Int = 80
-    public let melStride: Int = 160
-    public let melWindow: Int = 400
-    public let melPadTo: Int = 16
-
-    // Computed properties
-    var minMelLength: Int { minInputFrames * subsamplingFactor }
-    var maxMelLength: Int { maxInputFrames * subsamplingFactor }
-    var minInputSamples: Int { minMelLength * melStride }
-    var maxInputSamples: Int { maxMelLength * melStride }
-    var minInputDuration: Float { Float(minInputFrames) * frameDuration }
-    var maxInputDuration: Float { Float(maxInputFrames) * frameDuration }
-
-    public init(
-        minInputFrames: Int = 12,
-        maxInputFrames: Int = 31
-    ) {
-        self.minInputFrames = minInputFrames
-        self.maxInputFrames = maxInputFrames
-    }
-}
-
 public struct EmbeddingConfig {
     /// Minimum number of frames in a segment to receive an embedding
     public let minEmbeddingFrames: Int
@@ -55,6 +22,25 @@ public struct EmbeddingConfig {
 
     /// Maximum number of frames outside a segment an embedding may cover
     public let maxOutsideFrames: Int
+    
+    // Non-configurable properties
+    public let frameDuration: Float = 0.08
+    public let subsamplingFactor: Int = 8
+    public let melFeatures: Int = 80
+    public let melStride: Int = 160
+    public let melWindow: Int = 400
+    public let melPadTo: Int = 16
+
+    // Computed properties
+    var minMelLength: Int { minEmbeddingFrames * subsamplingFactor }
+    var maxMelLength: Int { IndexUtils.nextMultiple(of: melPadTo, for: maxEmbeddingFrames * subsamplingFactor) }
+    var melFeaturesPerFrame: Int { subsamplingFactor * melFeatures }
+    var minInputSamples: Int { minMelLength * melStride }
+    var maxInputSamples: Int { maxMelLength * melStride }
+    var minInputDuration: Float { Float(minEmbeddingFrames) * frameDuration }
+    var maxInputDuration: Float { Float(maxEmbeddingFrames) * frameDuration }
+    
+    public static let `default` = EmbeddingConfig()
     
     public init(
         minEmbeddingFrames: Int = 12,

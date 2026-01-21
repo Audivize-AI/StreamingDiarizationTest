@@ -246,6 +246,11 @@ public struct SortformerPostProcessingConfig {
         get { Float(minFramesOff) * frameDurationSeconds }
         set { minFramesOff = Int(round(newValue / frameDurationSeconds)) }
     }
+    
+    /// Minimum gap between two segments
+    public var minUnpaddedGap: Int {
+        onsetPadFrames + offsetPadFrames + minFramesOff
+    }
 
     /// Maximum number of predictions to retain
     public var maxStoredFrames: Int? = nil
@@ -342,7 +347,7 @@ public struct SortformerStreamingState: Sendable {
 
     /// Speaker predictions for cached embeddings
     /// Shape: [spkcacheLen, numSpeakers] (e.g., [188, 4])
-    public var spkcachePreds: [Float]?
+    public var spkcachePreds: [Float]
 
     /// FIFO queue of recent chunk embeddings
     /// Shape: [fifoLen, fcDModel] (e.g., [188, 512])
@@ -353,7 +358,7 @@ public struct SortformerStreamingState: Sendable {
 
     /// Speaker predictions for FIFO embeddings
     /// Shape: [fifoLen, numSpeakers] (e.g., [188, 4])
-    public var fifoPreds: [Float]?
+    public var fifoPreds: [Float] = []
 
     /// Running mean of silence embeddings
     /// Shape: [fcDModel] (e.g., [512])
@@ -361,15 +366,21 @@ public struct SortformerStreamingState: Sendable {
 
     /// Count of silence frames observed
     public var silenceFrameCount: Int
+    
+    /// Frame index of the next new frame
+    public var nextNewFrame: Int
+    
+    /// Previous right context frames
+    public var lastRightContext: Int
 
     /// Initialize empty streaming state
     public init(config: SortformerConfig) {
         self.spkcache = []
-        self.spkcachePreds = nil
+        self.spkcachePreds = []
         self.spkcacheLength = 0
 
         self.fifo = []
-        self.fifoPreds = nil
+        self.fifoPreds = []
         self.fifoLength = 0
 
         self.fifo.reserveCapacity((config.fifoLen + config.chunkLen) * config.preEncoderDims)
@@ -377,17 +388,22 @@ public struct SortformerStreamingState: Sendable {
 
         self.meanSilenceEmbedding = [Float](repeating: 0.0, count: config.preEncoderDims)
         self.silenceFrameCount = 0
+        
+        self.nextNewFrame = 0
+        self.lastRightContext = 0
     }
 
     public mutating func cleanup() {
         self.fifo.removeAll(keepingCapacity: false)
         self.spkcache.removeAll(keepingCapacity: false)
-        self.fifoPreds = nil
-        self.spkcachePreds = nil
+        self.fifoPreds.removeAll(keepingCapacity: false)
+        self.spkcachePreds.removeAll(keepingCapacity: false)
         self.spkcacheLength = 0
         self.fifoLength = 0
         self.meanSilenceEmbedding.removeAll(keepingCapacity: false)
         self.silenceFrameCount = 0
+        self.nextNewFrame = 0
+        self.lastRightContext = 0
     }
 }
 
@@ -451,110 +467,45 @@ public struct SortformerFeatureLoader: Sendable {
 
 // MARK: - Result Types
 
-/// Result from streaming state update containing both confirmed and tentative predictions.
-///
-/// - `confirmed`: Predictions for frames that have passed beyond the right context window.
-///   These are final and will not change.
-/// - `tentative`: Predictions for frames still within the right context window.
-///   These may change when the next chunk arrives with more future context.
-///
-/// This enables real-time UI display without waiting for the full right context delay.
-/// With rightContext=7 and 80ms frames, tentative predictions provide 560ms earlier feedback.
-public struct StreamingUpdateResult: Sendable {
-    /// Final predictions for confirmed frames [chunkLen * numSpeakers]
-    public let confirmed: [Float]
-
-    /// Tentative predictions for right context frames [rightContext * numSpeakers]
-    /// May change with next chunk. Empty if rightContext=0.
-    public let tentative: [Float]
-    
-    /// Speaker probabilities for frames in the FIFO queue
-    /// Shape: [fifoLength, numSpeakers] (e.g., [20, 4])
-    public let fifo: [Float]
-
-    /// Number of speakers
-    public let numSpeakers: Int
-
-    /// Number of confirmed frames
-    public var confirmedFrameCount: Int { confirmed.count / numSpeakers }
-
-    /// Number of tentative frames
-    public var tentativeFrameCount: Int { tentative.count / numSpeakers }
-    
-    public var fifoFrameCount: Int { fifo.count / numSpeakers }
-
-    public init(confirmed: [Float], tentative: [Float], fifo: [Float], numSpeakers: Int) {
-        self.confirmed = confirmed
-        self.tentative = tentative
-        self.fifo = fifo
-        self.numSpeakers = numSpeakers
-    }
-}
-
 /// Result from a single streaming diarization step
-public struct SortformerChunkResult: Sendable {
-    /// Speaker probabilities for confirmed frames in this chunk
+public struct SortformerStateUpdateResult: Sendable {
+    /// Speaker probabilities for frames in this chunk that don't overlap with anything else
     /// Shape: [chunkLen, numSpeakers] (e.g., [6, 4])
-    public let speakerPredictions: [Float]
+    public let newPredictions: [Float]
 
     /// Number of confirmed frames in this result
-    public let frameCount: Int
+    public let newFrameCount: Int
 
-    /// Frame index of the first confirmed frame
-    public let startFrame: Int
-
-    /// Tentative predictions for right context frames (may change with next chunk)
-    /// Shape: [rightContext, numSpeakers]. Empty if no right context.
-    public let tentativePredictions: [Float]
+    /// Global index of the first new frame
+    public let firstNewFrame: Int
     
-    /// Number of tentative frames
-    public let tentativeFrameCount: Int
-    
-    /// Frame index of first tentative frame
-    public var tentativeStartFrame: Int {
-        startFrame + frameCount
-    }
-    
-    /// Speaker probabilities for frames in the FIFO queue
-    /// Shape: [fifoLength, numSpeakers] (e.g., [20, 4])
-    public let fifoPredictions: [Float]
+    /// Speaker probabilities for frames that overlap with old predictions
+    /// Shape: [fifoLength + rc, numSpeakers] (e.g., [47, 4])
+    public let oldPredictions: [Float]
     
     /// Number of frames in the FIFO queue
-    public let fifoFrameCount: Int
+    public let oldFrameCount: Int
 
-    /// Frame index of the first frame in the FIFO queue
-    public var fifoStartFrame: Int {
-        startFrame - fifoFrameCount
-    }
-
+    /// Global index of the first frame in the FIFO queue
+    public var firstOldFrame: Int { firstNewFrame - oldFrameCount }
+    
+    /// Number of frames that should be finalized
+    public let finalizedFrameCount: Int
+    
     public init(
-        startFrame: Int,
-        speakerPredictions: [Float],
-        frameCount: Int,
-        tentativePredictions: [Float] = [],
-        tentativeFrameCount: Int = 0,
-        fifoPredictions: [Float],
-        fifoFrameCount: Int
+        firstNewFrame: Int,
+        newPredictions: [Float],
+        newFrameCount: Int,
+        oldPredictions: [Float],
+        oldFrameCount: Int,
+        finalizedFrameCount: Int
     ) {
-        self.speakerPredictions = speakerPredictions
-        self.frameCount = frameCount
-        self.startFrame = startFrame
-        self.tentativePredictions = tentativePredictions
-        self.tentativeFrameCount = tentativeFrameCount
-        self.fifoPredictions = fifoPredictions
-        self.fifoFrameCount = fifoFrameCount
-    }
-
-    /// Get probability for a specific speaker at a specific confirmed frame
-    public func getSpeakerPrediction(speaker: Int, frame: Int, numSpeakers: Int = 4) -> Float {
-        guard frame < frameCount, speaker < numSpeakers else { return 0.0 }
-        return speakerPredictions[frame * numSpeakers + speaker]
-    }
-
-    /// Get tentative probability for a specific speaker at a specific tentative frame
-    public func getTentativePrediction(speaker: Int, frame: Int, numSpeakers: Int = 4) -> Float {
-        guard frame < tentativeFrameCount, speaker < numSpeakers else { return 0.0 }
-        return tentativePredictions[frame * numSpeakers + speaker]
+        self.firstNewFrame = firstNewFrame
+        self.newPredictions = newPredictions
+        self.newFrameCount = newFrameCount
+        self.oldPredictions = oldPredictions
+        self.oldFrameCount = oldFrameCount
+        self.finalizedFrameCount = finalizedFrameCount
     }
 }
 
@@ -618,9 +569,66 @@ public protocol SortformerFrameRange {
     /// Check if the ranges share any frames
     func overlaps<T>(with other: T) -> Bool
     where T: SortformerFrameRange
+    
+    /// Count the number of overlapping frames
+    func overlapLength<T>(with other: T) -> Int
+    where T: SortformerFrameRange
 }
 
 public protocol SpeakerFrameRange: SortformerFrameRange {
     /// Speaker index in Sortformer's output
     var speakerIndex: Int { get }
+
+    /// Check if the ranges overlap or touch
+    func isContiguous<T>(with other: T, ensuringSameSpeaker: Bool) -> Bool
+    where T: SpeakerFrameRange
+    
+    /// Check if the ranges share any frames
+    func overlaps<T>(with other: T, ensuringSameSpeaker: Bool) -> Bool
+    where T: SpeakerFrameRange
+    
+    /// Count the number of overlapping frames
+    func overlapLength<T>(with other: T, ensuringSameSpeaker: Bool) -> Int
+    where T: SpeakerFrameRange
+}
+
+internal struct SortformerFrameRangeHelpers {
+    static func overlaps<L, R>(_ lhs: L, _ rhs: R, ensuringSameSpeaker: Bool) -> Bool where L: SpeakerFrameRange, R: SpeakerFrameRange {
+        let sameSpeaker = !ensuringSameSpeaker || lhs.speakerIndex == rhs.speakerIndex
+        return sameSpeaker && lhs.frames.overlaps(rhs.frames)
+    }
+    
+    static func isContiguous<L, R>(_ lhs: L, _ rhs: R) -> Bool where L: SortformerFrameRange, R: SortformerFrameRange {
+        return lhs.startFrame <= rhs.endFrame && lhs.endFrame >= rhs.startFrame
+    }
+    
+    static func isContiguous<L, R>(_ lhs: L, _ rhs: R, ensuringSameSpeaker: Bool) -> Bool where L: SpeakerFrameRange, R: SpeakerFrameRange {
+        let sameSpeaker = !ensuringSameSpeaker || lhs.speakerIndex == rhs.speakerIndex
+        return sameSpeaker && lhs.startFrame <= rhs.endFrame && lhs.endFrame >= rhs.startFrame
+    }
+    
+    static func overlapLength<L, R>(_ lhs: L, _ rhs: R) -> Int where L: SortformerFrameRange, R: SortformerFrameRange {
+        let overlapStart = max(lhs.startFrame, rhs.startFrame)
+        let overlapEnd = min(lhs.endFrame, rhs.endFrame)
+        return max(0, overlapEnd - overlapStart)
+    }
+    
+    static func overlapLength<L, R>(_ lhs: L, _ rhs: R, ensuringSameSpeaker: Bool) -> Int where L: SpeakerFrameRange, R: SpeakerFrameRange {
+        guard !ensuringSameSpeaker || lhs.speakerIndex == rhs.speakerIndex else { return 0 }
+        let overlapStart = max(lhs.startFrame, rhs.startFrame)
+        let overlapEnd = min(lhs.endFrame, rhs.endFrame)
+        return max(0, overlapEnd - overlapStart)
+    }
+    
+    static func checkEqual<L, R>(_ lhs: L, _ rhs: R) -> Bool where L: SortformerFrameRange, R: SortformerFrameRange {
+        return lhs.startFrame == rhs.startFrame && lhs.endFrame == rhs.endFrame
+    }
+    
+    static func checkEqual<L, R>(_ lhs: L, _ rhs: R) -> Bool where L: SpeakerFrameRange, R: SpeakerFrameRange {
+        return lhs.speakerIndex == rhs.speakerIndex && lhs.startFrame == rhs.startFrame && lhs.endFrame == rhs.endFrame
+    }
+    
+    static func checkLessThan<L, R>(_ lhs: L, _ rhs: R) -> Bool where L: SortformerFrameRange, R: SortformerFrameRange {
+        return (lhs.startFrame, lhs.endFrame) < (rhs.startFrame, rhs.endFrame)
+    }
 }

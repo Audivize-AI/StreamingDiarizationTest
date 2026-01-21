@@ -32,9 +32,9 @@ public struct SortformerStateUpdater {
         state: inout SortformerStreamingState,
         chunk: [Float],
         preds: [Float],
-        leftContext: Int,
-        rightContext: Int
-    ) throws -> StreamingUpdateResult {
+        leftContext lc: Int,
+        rightContext rc: Int
+    ) throws -> SortformerStateUpdateResult {
         let fcDModel = config.preEncoderDims
         let numSpeakers = config.numSpeakers
         let spkcacheCapacity = config.spkcacheLen
@@ -42,7 +42,6 @@ public struct SortformerStateUpdater {
 
         let currentSpkcacheLength = state.spkcacheLength
         let currentFifoLength = state.fifoLength
-        var fifoPreds: [Float] = []
 
         // Extract FIFO predictions if FIFO exists
         if currentFifoLength > 0 {
@@ -52,15 +51,12 @@ public struct SortformerStateUpdater {
                 throw SortformerError.insufficientPredsLength(
                     "Not enough predictions for FIFO in streaming update: \(fifoPredsEnd) > \(preds.count)")
             }
-            fifoPreds = Array(preds[fifoPredsStart..<fifoPredsEnd])
-            state.fifoPreds = fifoPreds
+            state.fifoPreds = Array(preds[fifoPredsStart..<fifoPredsEnd])
         }
 
         // Extract only CORE frames from chunk embeddings (skip left context, take chunkLen frames)
         // This matches the default impl: chunk[0..., lc..<chunkLen+lc, 0...]
         // Use ACTUAL leftContext (varies by chunk position), not fixed config.chunkLeftContext
-        let lc = leftContext
-        let rc = rightContext
         let coreFrames = (chunk.count / fcDModel) - lc - rc
 
         // Extract core embeddings only (frames lc..<lc+coreFrames)
@@ -70,65 +66,48 @@ public struct SortformerStateUpdater {
             throw SortformerError.insufficientChunkLength(
                 "Not enough chunk embeddings for streaming update: \(embsEndIdx) > \(chunk.count)")
         }
-        let chunkEmbs = Array(chunk[embsStartIdx..<embsEndIdx])
+        let coreEmbs = Array(chunk[embsStartIdx..<embsEndIdx])
 
         // Extract chunk predictions for CORE frames only
         // This matches the default impl: preds[0..., chunkStart+lc..<chunkStart+chunkLen+lc, 0...]
-        let chunkStart = currentSpkcacheLength + currentFifoLength + lc
-        let chunkEnd = chunkStart + coreFrames
+        let coreStart = currentSpkcacheLength + currentFifoLength + lc
+        let coreEnd = coreStart + coreFrames
+        let newStart = coreStart + state.lastRightContext
+        let newEnd = coreEnd + rc
 
-        let chunkPredsStart = chunkStart * numSpeakers
-        let chunkPredsEnd = chunkEnd * numSpeakers
+        let corePredsStart = coreStart * numSpeakers
+        let corePredsEnd = coreEnd * numSpeakers
+        let newPredsStart = newStart * numSpeakers
+        let newPredsEnd = newEnd * numSpeakers
 
-        let tentativePredsStart = chunkPredsEnd
-        let tentativePredsEnd = (chunkEnd + rc) * numSpeakers
-
-        guard tentativePredsEnd <= preds.count else {
-            if chunkPredsEnd > preds.count {
-                throw SortformerError.insufficientPredsLength(
-                    "Not enough predictions for chunk in streaming update: \(chunkPredsEnd) > \(preds.count)")
-            }
+        guard newPredsEnd <= preds.count else {
             throw SortformerError.insufficientPredsLength(
-                "Not enough predictions for tentative predictions in streaming update: \(tentativePredsEnd) > \(preds.count)"
-            )
+                "Not enough predictions for chunk + right context in streaming update: \(newPredsEnd) > \(preds.count)")
         }
-        let chunkPreds: [Float] = Array(preds[chunkPredsStart..<chunkPredsEnd])
-        let tentativePreds: [Float] = Array(preds[tentativePredsStart..<tentativePredsEnd])
+        let corePreds: [Float] = Array(preds[corePredsStart..<corePredsEnd])
 
-        // Append chunk core to FIFO
-        state.fifo.append(contentsOf: chunkEmbs)
-        state.fifoLength += coreFrames
+        let newPreds: [Float] = Array(preds[newPredsStart..<newPredsEnd])
+        let oldPreds: [Float] = state.fifoPreds + preds[corePredsStart..<newPredsStart]
         
-        if state.fifoPreds != nil {
-            state.fifoPreds?.append(contentsOf: chunkPreds)
-        } else {
-            state.fifoPreds = chunkPreds
-        }
+        // Append chunk core to FIFO
+        state.fifo.append(contentsOf: coreEmbs)
+        state.fifoPreds.append(contentsOf: corePreds)
+        state.fifoLength += coreFrames
 
         // Update speaker cache if FIFO overflows
         // Use actualCoreFrames (not full chunk), matching the default impl: chunkLen + currentFifoLength
+        var popOutLength: Int = 0
         let contextLength = coreFrames + currentFifoLength
+        
         if contextLength > fifoCapacity {
-            guard let currentFifoPreds = state.fifoPreds else {
-                logger.error(
-                    "FIFO predictions are nil immediately after updating them during streaming update. THIS SHOULD NEVER HAPPEN!"
-                )
-                return StreamingUpdateResult(
-                    confirmed: chunkPreds,
-                    tentative: tentativePreds,
-                    fifo: fifoPreds,
-                    numSpeakers: config.numSpeakers
-                )
-            }
-
             // Calculate how many frames to pop
-            var popOutLength = config.spkcacheUpdatePeriod
+            popOutLength = config.spkcacheUpdatePeriod
             popOutLength = max(popOutLength, contextLength - fifoCapacity)
             popOutLength = min(popOutLength, contextLength)
 
             // Extract frames to pop from FIFO
             let popOutEmbs = Array(state.fifo.prefix(popOutLength * fcDModel))
-            let popOutPreds = Array(currentFifoPreds.prefix(popOutLength * numSpeakers))
+            let popOutPreds = Array(state.fifoPreds.prefix(popOutLength * numSpeakers))
 
             // Update silence profile
             updateSilenceProfile(
@@ -141,20 +120,20 @@ public struct SortformerStateUpdater {
             // Remove popped frames from FIFO
             state.fifo.removeFirst(popOutLength * fcDModel)
             state.fifoLength -= popOutLength
-            state.fifoPreds?.removeFirst(popOutLength * numSpeakers)
+            state.fifoPreds.removeFirst(popOutLength * numSpeakers)
 
             // Append popped embeddings to speaker cache
             state.spkcache.append(contentsOf: popOutEmbs)
             state.spkcacheLength += popOutLength
 
             // Update speaker cache predictions
-            if state.spkcachePreds != nil {
-                state.spkcachePreds?.append(contentsOf: popOutPreds)
+            if !state.spkcachePreds.isEmpty {
+                state.spkcachePreds.append(contentsOf: popOutPreds)
             }
 
             // Compress speaker cache if it overflows
             if state.spkcacheLength > spkcacheCapacity {
-                if state.spkcachePreds == nil {
+                if state.spkcachePreds.isEmpty {
                     // First time spkcache overflows - initialize predictions
                     if currentSpkcacheLength > 0 {
                         state.spkcachePreds = Array(preds.prefix(currentSpkcacheLength * numSpeakers)) + popOutPreds
@@ -167,11 +146,18 @@ public struct SortformerStateUpdater {
             }
         }
 
-        return StreamingUpdateResult(
-            confirmed: chunkPreds,
-            tentative: tentativePreds,
-            fifo: fifoPreds,
-            numSpeakers: config.numSpeakers
+        defer {
+            state.lastRightContext = rc
+            state.nextNewFrame += rc
+        }
+        
+        return SortformerStateUpdateResult(
+            firstNewFrame: state.nextNewFrame,
+            newPredictions: newPreds,
+            newFrameCount: newEnd - newStart,
+            oldPredictions: oldPreds,
+            oldFrameCount: currentFifoLength + state.lastRightContext,
+            finalizedFrameCount: popOutLength
         )
     }
 
@@ -229,8 +215,6 @@ public struct SortformerStateUpdater {
     /// This mirrors NeMo's _compress_spkcache() function,
     /// ported from the default implementation.
     private func compressSpkcache(state: inout SortformerStreamingState) {
-        guard let spkcachePreds = state.spkcachePreds else { return }
-
         let fcDModel = config.preEncoderDims
         let numSpeakers = config.numSpeakers
         let spkcacheCapacity = config.spkcacheLen
@@ -243,11 +227,11 @@ public struct SortformerStateUpdater {
         let minPosScoresPerSpk = Int(Float(spkcacheLenPerSpk) * config.minPosScoresRate)
 
         // Compute log-based prediction scores
-        var scores = getLogPredScores(preds: spkcachePreds, frameCount: currentLength)
+        var scores = getLogPredScores(preds: state.spkcachePreds, frameCount: currentLength)
 
         // Disable low scores
         scores = disableLowScores(
-            preds: spkcachePreds,
+            preds: state.spkcachePreds,
             scores: scores,
             frameCount: currentLength,
             minPosScores: minPosScoresPerSpk
@@ -303,8 +287,8 @@ public struct SortformerStateUpdater {
                 // Copy predictions
                 for s in 0..<numSpeakers {
                     let srcIdx = frameIdx * numSpeakers + s
-                    if srcIdx < spkcachePreds.count {
-                        newSpkcachePreds[i * numSpeakers + s] = spkcachePreds[srcIdx]
+                    if srcIdx < state.spkcachePreds.count {
+                        newSpkcachePreds[i * numSpeakers + s] = state.spkcachePreds[srcIdx]
                     }
                 }
             }

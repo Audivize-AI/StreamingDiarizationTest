@@ -5,7 +5,7 @@ import CoreGraphics
 /// Displays speaker probabilities as a viridis-colored heatmap with 4 speaker rows.
 struct SpeechPlotView: View {
     /// Timeline with diarization history
-    let timeline: SortformerTimeline?
+    let timeline: SortformerVectorClustering?
     
     /// Speaker cache predictions (optional, drawn as zeros if nil)
     let spkcachePreds: [Float]?
@@ -381,24 +381,24 @@ struct SpeechPlotView: View {
         guard let tl = timeline else {
             return "Live Diarization - No data"
         }
-        let totalFrames = tl.nextFrame + tl.numTentative
+        let totalFrames = tl.cursorFrame + tl.numTentative
         let elapsedSeconds = Float(totalFrames) * 0.08
         return String(format: "Live Diarization - Confirmed: %d | Tentative: %d | Segments: %d + %d | (%.1fs)",
-                      tl.nextFrame, tl.numTentative,
+                      tl.cursorFrame, tl.numTentative,
                       tl.segments.flatMap(\.self).count, tl.tentativeSegments.flatMap(\.self).count,
                       elapsedSeconds)
     }
     
     private var totalFrameCount: Int {
         guard let tl = timeline else { return 0 }
-        return tl.nextFrame + tl.numTentative
+        return tl.cursorFrame + tl.numTentative
     }
     
     private func calculatedContentWidth(viewportWidth: CGFloat) -> CGFloat {
         guard let tl = timeline else {
             return viewportWidth
         }
-        let totalFrames = tl.nextFrame + tl.numTentative
+        let totalFrames = tl.cursorFrame + tl.numTentative
         let cellWidth = viewportWidth / CGFloat(visibleFrames)
         return max(CGFloat(totalFrames) * cellWidth, viewportWidth)
     }
@@ -416,7 +416,7 @@ struct SpeechPlotView: View {
             return
         }
         
-        let numConfirmed = tl.nextFrame
+        let numConfirmed = tl.cursorFrame
         let numTentative = tl.numTentative
         
         // Draw probability cells for this chunk
@@ -457,7 +457,7 @@ struct SpeechPlotView: View {
     private func drawSegmentOverlays(context: GraphicsContext, size: CGSize, viewportWidth: CGFloat) {
         guard let tl = timeline else { return }
         
-        let totalFrames = max(tl.nextFrame + tl.numTentative, visibleFrames)
+        let totalFrames = max(tl.cursorFrame + tl.numTentative, visibleFrames)
         let cellWidth = size.width / CGFloat(totalFrames)
         let cellHeight = size.height / CGFloat(numSpeakers)
         
@@ -507,11 +507,20 @@ struct SpeechPlotView: View {
     private func drawEmbeddingStrokes(context: GraphicsContext, cellWidth: CGFloat, cellHeight: CGFloat) {
         guard let tl = timeline else { return }
         
-        // Collect all embeddings with their info
-        var allEmbeddings: [(emb: TitaNetEmbedding, speakerIndex: Int)] = []
+        // Collect all embeddings with their info (including tentative flag)
+        var allEmbeddings: [(emb: TitaNetEmbedding, speakerIndex: Int, isTentative: Bool)] = []
+        
+        // Finalized embeddings
         for segment in tl.embeddingSegments {
             for emb in segment.embeddings {
-                allEmbeddings.append((emb, segment.speakerIndex))
+                allEmbeddings.append((emb, segment.speakerIndex, false))
+            }
+        }
+        
+        // Tentative embeddings
+        for segment in tl.tentativeEmbeddingSegments {
+            for emb in segment.embeddings {
+                allEmbeddings.append((emb, segment.speakerIndex, true))
             }
         }
         
@@ -519,7 +528,7 @@ struct SpeechPlotView: View {
         
         // Group by speaker
         var embeddingsBySpeaker: [[Int]] = Array(repeating: [], count: numSpeakers)
-        for (idx, (_, speakerIndex)) in allEmbeddings.enumerated() {
+        for (idx, (_, speakerIndex, _)) in allEmbeddings.enumerated() {
             if speakerIndex < numSpeakers {
                 embeddingsBySpeaker[speakerIndex].append(idx)
             }
@@ -564,7 +573,7 @@ struct SpeechPlotView: View {
             let baseY = rowY + (cellHeight - CGFloat(maxStaggerLevels) * (strokeHeight + strokeMargin)) / 2
             
             for idx in sortedIndices {
-                let (emb, _) = allEmbeddings[idx]
+                let (emb, _, isTentative) = allEmbeddings[idx]
                 let level = staggerLevels[idx] ?? 0
                 
                 let x = CGFloat(emb.startFrame) * cellWidth
@@ -587,7 +596,12 @@ struct SpeechPlotView: View {
                     // Add glow effect
                     let glowRect = strokeRect.insetBy(dx: -2, dy: -2)
                     context.fill(Path(roundedRect: glowRect, cornerRadius: 4), with: .color(.white.opacity(0.3)))
+                } else if isTentative {
+                    // Tentative embeddings: dashed border, lighter fill
+                    context.fill(path, with: .color(speakerColor.opacity(0.4)))
+                    context.stroke(path, with: .color(speakerColor), style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))
                 } else {
+                    // Finalized embeddings: solid
                     context.fill(path, with: .color(speakerColor.opacity(0.8)))
                     context.stroke(path, with: .color(speakerColor.opacity(0.5)), style: StrokeStyle(lineWidth: 1))
                 }
@@ -604,9 +618,18 @@ struct SpeechPlotView: View {
         let strokeMargin: CGFloat = 3
         let maxStaggerLevels = 3
         
-        // Collect all embeddings with their info
+        // Collect all embeddings with their info (including tentative)
         var allEmbeddings: [(emb: TitaNetEmbedding, speakerIndex: Int)] = []
+        
+        // Finalized embeddings
         for segment in tl.embeddingSegments {
+            for emb in segment.embeddings {
+                allEmbeddings.append((emb, segment.speakerIndex))
+            }
+        }
+        
+        // Tentative embeddings
+        for segment in tl.tentativeEmbeddingSegments {
             for emb in segment.embeddings {
                 allEmbeddings.append((emb, segment.speakerIndex))
             }
@@ -724,7 +747,7 @@ struct SpeechPlotView: View {
             return
         }
         
-        let numConfirmed = tl.nextFrame
+        let numConfirmed = tl.cursorFrame
         let numTentative = tl.numTentative
         let totalFrames = numConfirmed + numTentative
         let framesToDraw = max(totalFrames, visibleFrames)
@@ -763,7 +786,7 @@ struct SpeechPlotView: View {
     }
     
     /// Detailed drawing for timelines - individual rectangles with viewport culling
-    private func drawHeatmapDetailed(context: GraphicsContext, timeline tl: SortformerTimeline,
+    private func drawHeatmapDetailed(context: GraphicsContext, timeline tl: SortformerVectorClustering,
                                      numConfirmed: Int, numTentative: Int,
                                      framesToDraw: Int, cellWidth: CGFloat, cellHeight: CGFloat) {
         // Estimate visible frames based on viewport (visibleFrames constant)
@@ -795,7 +818,7 @@ struct SpeechPlotView: View {
     }
     
     /// Bitmap-based drawing for long timelines - render to CGImage then draw once
-    private func drawHeatmapAsBitmap(context: GraphicsContext, size: CGSize, timeline tl: SortformerTimeline,
+    private func drawHeatmapAsBitmap(context: GraphicsContext, size: CGSize, timeline tl: SortformerVectorClustering,
                                      numConfirmed: Int, numTentative: Int,
                                      cellWidth: CGFloat, cellHeight: CGFloat) {
         let totalFrames = numConfirmed + numTentative

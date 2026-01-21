@@ -3,21 +3,19 @@ import CoreML
 import Accelerate
 
 public struct TitaNetEmbeddingExtractor {
-    public let config: TitaNetConfig
+    public let config: EmbeddingConfig
     public let model: MLModel
-    public let preprocessor: NeMoMelSpectrogram
     private let memoryOptimizer: ANEMemoryOptimizer
     private let processedSignalArray: MLMultiArray
     private let lengthArray: MLMultiArray
     private let sampleRate: Float = 16_000
     
-    public init(config: TitaNetConfig) throws {
+    public init(config: EmbeddingConfig) throws {
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .all
         
         self.config = config
         self.model = try TitaNet_small_2_48s(configuration: configuration).model
-        self.preprocessor = NeMoMelSpectrogram(nMels: 80, padTo: 16)
         self.memoryOptimizer = ANEMemoryOptimizer()
         self.processedSignalArray = try memoryOptimizer.createAlignedArray(
             shape: [
@@ -37,12 +35,8 @@ public struct TitaNetEmbeddingExtractor {
     /// - Parameter audioSignal: A raw 16kHz audio signal. Must fit within the configured input size limits
     /// - Returns: A 192D speaker identity embedding vector
     public func extractEmbedding<C>(
-        from audioSignal: C
+        mels: C, melLength: Int
     ) throws -> [Float] where C: AccelerateBuffer & Collection, C.Element == Float, C.Index == Int {
-        
-        // Preprocess audio
-        let (mels, melLength, _) = preprocessor.computeFlatTransposed(audio: audioSignal)
-        
         // Ensure input size is within bounds
         guard melLength >= config.minMelLength else {
             throw TitaNetError.invalidAudioInput(
@@ -77,7 +71,10 @@ public struct TitaNetEmbeddingExtractor {
         // Get prediction
         let output: MLFeatureProvider
         do {
+            let start = Date()
             output = try model.prediction(from: input)
+            let end = Date()
+            print("embeddings extracted in \(end.timeIntervalSince(start))s")
         } catch {
             throw TitaNetError.predictionFailed("CoreML prediction failed (melLength=\(melLength), shape=\(processedSignalArray.shape)): \(error)")
         }

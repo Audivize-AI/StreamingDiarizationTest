@@ -274,7 +274,7 @@ public final class NeMoMelSpectrogram {
         }
         
         // Ceil(numFrames / padTo) * padTo
-        let numPaddedFrames: Int = ((numFrames - 1) / padTo + 1) * padTo
+        let numPaddedFrames: Int = IndexUtils.nextMultiple(of: padTo, for: numFrames)
 
         // Step 1: Apply preemphasis filter using vDSP (y[n] = x[n] - preemph * x[n-1])
         // This will be copied into an already padded buffer to save time.
