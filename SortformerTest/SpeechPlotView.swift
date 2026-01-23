@@ -5,7 +5,7 @@ import CoreGraphics
 /// Displays speaker probabilities as a viridis-colored heatmap with 4 speaker rows.
 struct SpeechPlotView: View {
     /// Timeline with diarization history
-    let timeline: SortformerVectorClustering?
+    let timeline: SortformerTimeline?
     
     /// Speaker cache predictions (optional, drawn as zeros if nil)
     let spkcachePreds: [Float]?
@@ -508,7 +508,7 @@ struct SpeechPlotView: View {
         guard let tl = timeline else { return }
         
         // Collect all embeddings with their info (including tentative flag)
-        var allEmbeddings: [(emb: TitaNetEmbedding, speakerIndex: Int, isTentative: Bool)] = []
+        var allEmbeddings: [(emb: SpeakerEmbedding, speakerIndex: Int, isTentative: Bool)] = []
         
         // Finalized embeddings
         for segment in tl.embeddingSegments {
@@ -619,7 +619,7 @@ struct SpeechPlotView: View {
         let maxStaggerLevels = 3
         
         // Collect all embeddings with their info (including tentative)
-        var allEmbeddings: [(emb: TitaNetEmbedding, speakerIndex: Int)] = []
+        var allEmbeddings: [(emb: SpeakerEmbedding, speakerIndex: Int)] = []
         
         // Finalized embeddings
         for segment in tl.embeddingSegments {
@@ -786,7 +786,7 @@ struct SpeechPlotView: View {
     }
     
     /// Detailed drawing for timelines - individual rectangles with viewport culling
-    private func drawHeatmapDetailed(context: GraphicsContext, timeline tl: SortformerVectorClustering,
+    private func drawHeatmapDetailed(context: GraphicsContext, timeline tl: SortformerTimeline,
                                      numConfirmed: Int, numTentative: Int,
                                      framesToDraw: Int, cellWidth: CGFloat, cellHeight: CGFloat) {
         // Estimate visible frames based on viewport (visibleFrames constant)
@@ -818,7 +818,7 @@ struct SpeechPlotView: View {
     }
     
     /// Bitmap-based drawing for long timelines - render to CGImage then draw once
-    private func drawHeatmapAsBitmap(context: GraphicsContext, size: CGSize, timeline tl: SortformerVectorClustering,
+    private func drawHeatmapAsBitmap(context: GraphicsContext, size: CGSize, timeline tl: SortformerTimeline,
                                      numConfirmed: Int, numTentative: Int,
                                      cellWidth: CGFloat, cellHeight: CGFloat) {
         let totalFrames = numConfirmed + numTentative

@@ -11,7 +11,7 @@ import CoreML
 
 
 /// Represents a region where an embedding was extracted
-public struct TitaNetEmbedding: Identifiable, Hashable, SortformerFrameRange {
+public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFrameRange {
     /// Embedding ID
     public let id: UUID
     
@@ -38,7 +38,7 @@ public struct TitaNetEmbedding: Identifiable, Hashable, SortformerFrameRange {
     
     /// Get the cosine distance to another embedding
     /// - Warning: Does not check if any of the vectors have a magnitude of 0.
-    public func cosineDistance(to other: TitaNetEmbedding) -> Float {
+    public func cosineDistance(to other: SpeakerEmbedding) -> Float {
         let a = self.embedding
         let b = other.embedding
         var dot: Float = 0
@@ -80,16 +80,24 @@ public struct TitaNetEmbedding: Identifiable, Hashable, SortformerFrameRange {
         hasher.combine(startFrame)
         hasher.combine(endFrame)
     }
+    
+    public static func < (lhs: SpeakerEmbedding, rhs: SpeakerEmbedding) -> Bool {
+        (lhs.startFrame, lhs.endFrame) < (rhs.startFrame, rhs.endFrame)
+    }
+    
+    public static func == (lhs: SpeakerEmbedding, rhs: SpeakerEmbedding) -> Bool {
+        lhs.id == rhs.id
+    }
 }
 
 
 /// Tracks embeddings for a disjoint segment
-public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
+public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// Segment ID
     public let id: UUID
 
     /// Speaker index in Sortformer output
-    public var speakerIndex: Int
+    public let speakerIndex: Int
 
     /// Index of segment start frame
     public var startFrame: Int
@@ -106,40 +114,33 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// Whether this segment is subject to updates
     public var isFinalized: Bool
     
-    /// Lock for thread-safe access to mutable state
-    private let lock = NSLock()
-    
     /// Extracted embedding regions for this segment
-    private var _embeddings: [TitaNetEmbedding]
-    
-    /// Thread-safe access to embeddings
-    public var embeddings: [TitaNetEmbedding] {
-        lock.lock()
-        defer { lock.unlock() }
-        return _embeddings
-    }
+    public private(set) var embeddings: [SpeakerEmbedding]
     
     /// Intra-cluster distances
     public private(set) var distances: [Float] = []
     
+    public var isNone: Bool { speakerIndex < 0 }
+    public var isValid: Bool { speakerIndex >= 0 }
+    
+    public static let none: EmbeddingSegment = .init(speakerIndex: -1, startFrame: 0, endFrame: 0)
+    
+    // MARK: - Init
     public init(
         speakerIndex: Int,
         startFrame: Int,
         endFrame: Int,
-        finalized: Bool = true,
-        embeddings: [TitaNetEmbedding] = []
+        finalized: Bool = true
     ) {
         self.id = UUID()
         self.speakerIndex = speakerIndex
         self.startFrame = startFrame
         self.endFrame = endFrame
         self.isFinalized = finalized
-        self._embeddings = embeddings
-        _embeddings.sort {
-            SortformerFrameRangeHelpers.checkLessThan($0, $1)
-        }
+        self.embeddings = []
     }
     
+    // MARK: - Speaker Frame Range
     public func contains(_ frame: Int) -> Bool {
         frames.contains(frame)
     }
@@ -168,200 +169,258 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         SortformerFrameRangeHelpers.overlapLength(self, other, ensuringSameSpeaker: ensuringSameSpeaker)
     }
     
+    // MARK: - Embedding extraction
+    
     /// Determine the required embeddings needed to close all gaps
     /// Uses a greedy interval covering algorithm to minimize the number of requests
     /// - Parameters:
-    ///   - config: Embedding configuration
-    ///   - availableRange: Optional range of frames available in the mel buffer. Requests are clipped to this range.
-    public func getEmbeddingRequests(config: EmbeddingConfig, availableRange: Range<Int>? = nil) -> [EmbeddingExtractionRequest] {
-        lock.lock()
-        let currentEmbeddings = _embeddings
-        lock.unlock()
+    ///   - extractor: Embedding Manager
+    ///   - streamingHorizonFrame: If the segment ends before this frame, then its end frame is probably finalized.
+    public mutating func initializeEmbeddings(
+        with extractor: EmbeddingManager,
+        streamingHorizonFrame: Int
+    ) throws {
+        embeddings = extractor.takeMatches(for: self)
         
-        let minEmbeddingLength = config.minEmbeddingFrames
-        let maxEmbeddingLength = config.maxEmbeddingFrames
-        let maxGapSize = config.maxEmbeddingGap
+        let isComplete = endFrame < streamingHorizonFrame
+        let requests: [EmbeddingRequest]
+        let minEmbeddingLength = extractor.config.minEmbeddingFrames
+        let maxEmbeddingLength = extractor.config.maxEmbeddingFrames
+        let maxGapLength = extractor.config.maxEmbeddingGap
         
-        // Clip segment bounds to available range if provided
-        let effectiveStart: Int
-        let effectiveEnd: Int
-        if let availableRange = availableRange {
-            effectiveStart = max(startFrame, availableRange.lowerBound)
-            effectiveEnd = min(endFrame, availableRange.upperBound)
-        } else {
-            effectiveStart = startFrame
-            effectiveEnd = endFrame
-        }
-        
-        let effectiveLength = effectiveEnd - effectiveStart
-        
-        // Skip if effective segment is too short for valid embeddings
-        guard effectiveLength >= minEmbeddingLength else { return [] }
-        
-        // If no embeddings exist, create initial coverage for the effective range
-        if currentEmbeddings.isEmpty {
-            return generateInitialRequests(
-                effectiveStart: effectiveStart,
-                effectiveEnd: effectiveEnd,
+        if embeddings.isEmpty {
+            requests = generateInitialRequests(
+                minEmbeddingLength: minEmbeddingLength,
                 maxEmbeddingLength: maxEmbeddingLength,
-                minEmbeddingLength: minEmbeddingLength
+                maxGapLength: maxGapLength,
+                isComplete: isComplete
             )
-        }
-        
-        // Find all uncovered regions (gaps)
-        var gaps: [(start: Int, end: Int)] = []
-        var currentPos = startFrame
-        
-        for embedding in currentEmbeddings {
-            if embedding.startFrame > currentPos {
-                // There's a gap before this embedding
-                gaps.append((currentPos, embedding.startFrame))
+        } else {
+            let embeddingFrames = embeddings.map(\.frames).sorted {
+                ($0.lowerBound, $0.upperBound) < ($1.lowerBound, $1.upperBound)
             }
-            currentPos = max(currentPos, embedding.endFrame)
+            var cutoff = endFrame
+            if !isComplete {
+                cutoff -= maxEmbeddingLength
+            }
+            
+            let gaps = getGaps(
+                in: embeddingFrames,
+                before: cutoff,
+                ifAnyExceed: extractor.config.maxEmbeddingGap
+            )
+            
+            guard let lastEmbeddingEnd = embeddingFrames.last?.upperBound else {
+                preconditionFailure("Last embedding has no upper bound")
+            }
+            
+            let requestStarts = generateCovering(
+                for: gaps,
+                biggerThan: extractor.config.maxEmbeddingGap,
+                withCoverLength: extractor.config.maxEmbeddingFrames,
+                lastEmbeddingEnd: lastEmbeddingEnd,
+            )
+            
+            requests = requestStarts.map { start in
+                EmbeddingRequest(
+                    startFrame: max(startFrame, start),
+                    endFrame: start + extractor.config.maxEmbeddingFrames
+                )
+            }
         }
         
-        // Check for gap at the end
-        if currentPos < endFrame {
-            gaps.append((currentPos, endFrame))
+        let newEmbeddings = try extractor.processRequests(requests)
+        embeddings.append(contentsOf: newEmbeddings)
+    }
+    
+    /// - Parameters:
+    ///   - gaps: Disjoint gap intervals sorted by start frame in decending order
+    ///   - maxGapSize: Maximum gap between embeddings
+    ///   - coverLength: Number of frames that one embedding can cover
+    ///   - lastEmbeddingEnd: The end frame of the last embedding
+    /// - Returns: List of cover start indices
+    /// - Precondition: `gaps` is disjoint and sorted in decending order by start/end frame
+    /// - Precondition: The union of all intervals in `gaps` is a subset of `self.startFrame ..< self.endFrame`
+    /// - Precondition: `lastEmbeddingEnd <= self.endFrame`
+    /// - Precondition: If `lastEmbeddingEnd < self.endFrame`, then `gaps[0] = lastEmbeddingEnd ..< self.endFrame`
+    /// - Precondition: `coverLength <= self.length`
+    private func generateCovering(
+        for gaps: [(start: Int, end: Int)],
+        biggerThan maxGapSize: Int,
+        withCoverLength coverLength: Int,
+        lastEmbeddingEnd: Int,
+    ) -> [Int] {
+        print ("\tGENERATING COVERS")
+        guard gaps.count > 0 else { return [] }
+        
+        var covers: [(start: Int, gapStart: Int)] = []
+        
+        // It's covered starting from this frame
+        var coveredFrom = gaps[0].end
+        
+        // Backward pass to generate coverings
+        for (start, end) in gaps {
+            // Check if the gap overlaps with the last cover
+            if let previousCover = covers.last, previousCover.start < end {
+                covers[covers.count-1].gapStart = start
+            }
+            
+            // There is an embedding that starts at this gap's end, so extend the range of covered frames
+            coveredFrom = min(coveredFrom, end)
+            
+            // Tile the entire gap
+            while coveredFrom - maxGapSize > start {
+                coveredFrom = coveredFrom - maxGapSize - coverLength
+                covers.append((start: coveredFrom, gapStart: start))
+            }
         }
         
-        // Filter to only large gaps that need coverage
-        let largeGaps = gaps.filter { $0.end - $0.start > maxGapSize }
-        
-        guard !largeGaps.isEmpty else {
+        guard covers.count > 0 else {
             return []
         }
         
-        // Greedy algorithm: cover gaps with minimum number of requests
-        var requests: [EmbeddingExtractionRequest] = []
-        var coveredUntil = startFrame
-        var gapIndex = 0
+        // Forward pass to optimize coverage
         
-        while gapIndex < largeGaps.count {
-            let gap = largeGaps[gapIndex]
+        var previousEnd: Int = .min
+        var nextUncovered: Int = 0
+        
+        for i in (0..<covers.count).reversed() {
+            // Shift the segment as far forward as possible so it's not touching something in front
+            nextUncovered = max(previousEnd, covers[i].gapStart)
             
-            // Skip gaps we've already covered
-            if gap.end <= coveredUntil {
-                gapIndex += 1
-                continue
+            if nextUncovered > covers[i].start {
+                covers[i].start = nextUncovered
             }
-            
-            // Position the request to maximize coverage
-            // Start from the gap start (or coveredUntil if we partially covered it)
-            var requestStart = max(gap.start, coveredUntil)
-            var requestEnd = min(requestStart + maxEmbeddingLength, endFrame)
-            
-            // Extend backwards if possible to cover more of the segment
-            // But don't go before the segment start
-            let backwardsSlack = min(requestStart - startFrame, maxEmbeddingLength - (requestEnd - requestStart))
-            if backwardsSlack > 0 {
-                requestStart -= backwardsSlack
-            }
-            
-            // Try to extend forward to cover more gaps
-            while gapIndex + 1 < largeGaps.count {
-                let nextGap = largeGaps[gapIndex + 1]
-                if nextGap.start < requestEnd {
-                    // We can partially cover the next gap with this request
-                    gapIndex += 1
-                } else {
-                    break
-                }
-            }
-            
-            // Clamp to segment bounds
-            requestStart = max(requestStart, startFrame)
-            requestEnd = min(requestEnd, endFrame)
-            
-            // Only add if request has meaningful length
-            if requestEnd - requestStart > 0 {
-                requests.append(EmbeddingExtractionRequest(startFrame: requestStart, endFrame: requestEnd))
-                coveredUntil = requestEnd
-            }
-            
-            gapIndex += 1
+            previousEnd = covers[i].start + coverLength
         }
         
-        return requests
+        // Partial backwards pass to make the last cover align with the end frame if possible.
+        // Coverings are in reverse order, so the last cover is at index 0
+        var lastCover: (start: Int, gapStart: Int) {
+            get { covers[0] }
+            set { covers[0] = newValue }
+        }
+        
+        let lastCoverEnd = lastCover.start + coverLength
+        if lastCoverEnd > lastEmbeddingEnd {
+            var shift = endFrame - lastCoverEnd
+            if shift > 0 {
+                let currentGap = lastCover.start - nextUncovered
+                let maxShift = maxGapSize - currentGap
+                shift = min(shift, maxShift)
+            }
+            lastCover.start += shift
+            
+            // Ensure that the previous segments don't pass the end frame
+            if shift < 0 && covers.count > 1 {
+                var nextStart = covers[0].start
+                
+                for i in 1..<covers.count {
+                    let overlap = covers[i].start + coverLength - nextStart
+                    guard overlap > 0 else { break }
+                    nextStart = covers[i].start - overlap
+                    covers[i].start = max(startFrame, nextStart)
+                    guard nextStart > startFrame else { break }
+                }
+            }
+        }
+        
+        return covers.reversed().map(\.start)
+    }
+    
+    /// Get embedding gaps in reversed order
+    /// - Parameters:
+    ///   - embeddingRanges: Covered embedding ranges sorted in ascending order
+    ///   - cutoffFrame: Gaps will be ignored begining at this frame
+    ///   - maxGapSize: Maximum allowed gap size. If no gaps exceed this threshold, then nothing is returned.
+    /// - Returns: Frame intervals `[start, end)` that not covered by the embeddings
+    private func getGaps(
+        in embeddingRanges: [Range<Int>],
+        before cutoffFrame: Int,
+        ifAnyExceed maxGapSize: Int
+    ) -> [(start: Int, end: Int)] {
+        var gaps: [(start: Int, end: Int)] = []
+        var end = cutoffFrame
+        var hasLargeGap = false
+        
+        for range in embeddingRanges.reversed() {
+            if range.upperBound < end {
+                // There's a gap after this embedding
+                gaps.append((range.upperBound, end))
+                
+                if end - range.upperBound > maxGapSize {
+                    hasLargeGap = true
+                }
+            }
+            // Next gap may end at the start of this range
+            end = min(end, range.lowerBound)
+        }
+        
+        // Check for gap at the start
+        if (hasLargeGap && end > startFrame) || (end - startFrame > maxGapSize) {
+            gaps.append((startFrame, end))
+            hasLargeGap = true
+        }
+        
+        guard hasLargeGap else { return [] }
+        return gaps
     }
     
     /// Generate initial embedding requests when no embeddings exist
     /// Uses non-overlapping windows to minimize redundancy
     private func generateInitialRequests(
-        effectiveStart: Int,
-        effectiveEnd: Int,
+        minEmbeddingLength: Int,
         maxEmbeddingLength: Int,
-        minEmbeddingLength: Int
-    ) -> [EmbeddingExtractionRequest] {
-        var requests: [EmbeddingExtractionRequest] = []
-        
-        let effectiveLength = effectiveEnd - effectiveStart
-        
+        maxGapLength: Int,
+        isComplete: Bool
+    ) -> [EmbeddingRequest] {
         // Don't generate requests for segments that are too short
-        guard effectiveLength >= minEmbeddingLength else { return [] }
+        guard length >= minEmbeddingLength else { return [] }
         
         // If segment fits in one embedding
-        if effectiveLength <= maxEmbeddingLength {
-            requests.append(EmbeddingExtractionRequest(startFrame: effectiveStart, endFrame: effectiveEnd))
-            return requests
+        if length <= maxEmbeddingLength {
+            return [EmbeddingRequest(for: self)]
         }
         
-        // Use non-overlapping windows (stride = maxEmbeddingLength)
-        // This provides 1x coverage for most, and ensures no request exceeds maxEmbeddingLength
-        var currentStart = effectiveStart
+        var requests: [EmbeddingRequest] = []
+        var currentStart = startFrame
+
+        // Since start = endFrame - 1 -> gap = 0, gap = endFrame - start - 1
+        // So, endFrame - start - 1 ≤ maxGap, or start < endFrame - maxGap
+        let maxEndGap = isComplete ? maxGapLength : maxEmbeddingLength - 1
+        let firstOptionalFrame = endFrame - maxEndGap
         
-        while currentStart < effectiveEnd {
-            // Define the natural end of this window
-            let requestedEnd = currentStart + maxEmbeddingLength
+        while currentStart < firstOptionalFrame {
+            var currentEnd = currentStart + maxEmbeddingLength
+            let overflow = currentEnd - endFrame
             
-            // If this window would go past the end, clamp it
-            let currentEnd = min(requestedEnd, effectiveEnd)
+            if overflow > 0 {
+                currentStart = max(startFrame, currentStart - overflow)
+                currentEnd = endFrame
+            }
+            
+            let currentLength = currentEnd - currentStart
             
             // Only add if the chunk is at least minEmbeddingLength
-            if currentEnd - currentStart >= minEmbeddingLength {
-                requests.append(EmbeddingExtractionRequest(startFrame: currentStart, endFrame: currentEnd))
+            // This guard should always pass
+            guard currentLength >= minEmbeddingLength else {
+                print("WARNING: Found a segment with an embedding length too short (\(currentLength) < \(minEmbeddingLength)). Terminating.")
+                return requests
             }
             
-            if currentEnd >= effectiveEnd {
-                break
-            }
+            requests.append(EmbeddingRequest(
+                startFrame: currentStart,
+                endFrame: currentEnd
+            ))
             
-            // Move to next window
-            currentStart += maxEmbeddingLength
-            
-            // Check for potential tiny leftover at the end
-            // If the remaining frames are fewer than minEmbeddingLength,
-            // we create one final request that is anchored to the effectiveEnd
-            // to ensure the tail gets a good quality embedding (by overlapping previous)
-            if currentStart < effectiveEnd && (effectiveEnd - currentStart) < minEmbeddingLength {
-                let backfilledStart = max(effectiveStart, effectiveEnd - maxEmbeddingLength)
-                // Only add if backfilled chunk is valid
-                if effectiveEnd - backfilledStart >= minEmbeddingLength {
-                    requests.append(EmbeddingExtractionRequest(startFrame: backfilledStart, endFrame: effectiveEnd))
-                }
-                break
-            }
+            currentStart = currentEnd + maxGapLength
         }
         
         return requests
     }
-    
-    /// Add embeddings to this segment (thread-safe)
-    /// Automatically deduplicates by embedding ID
-    public func addEmbeddings(_ embeddings: [TitaNetEmbedding]) {
-        lock.lock()
-        defer { lock.unlock() }
-        
-        guard !embeddings.isEmpty else { return }
-        
-        _embeddings.append(contentsOf: embeddings)
-        _embeddings.sort {
-            SortformerFrameRangeHelpers.checkLessThan($0, $1)
-        }
-    }
 }
 
-public struct EmbeddingExtractionRequest: SortformerFrameRange, Hashable {
+public struct EmbeddingRequest: SortformerFrameRange, Hashable {
     public let startFrame: Int
     public let endFrame: Int
     public var frames: Range<Int> { startFrame..<endFrame }

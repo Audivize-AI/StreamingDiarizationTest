@@ -32,7 +32,7 @@ public class EmbeddingManager {
     /// Lock for thread-safe access
     private let queue = DispatchQueue(label: "FluidAudio.EmbeddingManager")
     
-    private var availibleEmbeddings: [TitaNetEmbedding] = []
+    private var availibleEmbeddings: [SpeakerEmbedding] = []
     
     /// Logger
     private static let logger = AppLogger(category: "EmbeddingManager")
@@ -62,14 +62,8 @@ public class EmbeddingManager {
     /// Add audio to the mel feature buffer
     public func addAudio(from buffer: ArraySlice<Float>, lastAudioSample: Float = 0) {
         queue.sync(flags: .barrier) {
-            let (mels, melFrameCount, _) = preprocessor.computeFlatTransposed(audio: buffer, lastAudioSample: lastAudioSample)
-            
-            // Append new mel features (un-padded length)
-            let unpaddedMelLength = buffer.count / config.melStride
-            let unpaddedFeatureCount = unpaddedMelLength * config.melFeatures
-            
-            // Only keep the unpadded portion
-            melFeatures.append(contentsOf: mels.prefix(unpaddedFeatureCount))
+            let (mels, _, _) = preprocessor.computeFlatTransposed(audio: buffer, lastAudioSample: lastAudioSample)
+            melFeatures.append(contentsOf: mels)
         }
     }
     
@@ -83,51 +77,26 @@ public class EmbeddingManager {
         firstMelFrame + availableMelFrames
     }
     
-    /// Range of Sortformer frames available in the mel buffer
-    /// Use this to clip embedding requests to available frames
-    public var availableFrameRange: Range<Int> {
-        queue.sync {
-            firstMelFrame..<lastMelFrame
-        }
-    }
-    
     // MARK: - Embedding Extraction
     
     /// Process pending embedding requests from a timeline asynchronously
-    public func processRequests(_ requests: [EmbeddingExtractionRequest]) throws -> [TitaNetEmbedding] {
-        queue.sync(flags: .barrier) {
+    public func processRequests(_ requests: [EmbeddingRequest]) throws -> [SpeakerEmbedding] {
+        try queue.sync(flags: .barrier) {
             guard let extractor else {
-                return []
+                throw EmbeddingManagerError.extractorNotInitialized
             }
             
             guard !requests.isEmpty else {
-                return []
+                return [] as [SpeakerEmbedding]
             }
             
             Self.logger.debug("Processing \(requests.count) embedding requests (mel buffer: frames \(self.firstMelFrame)-\(self.lastMelFrame))")
             
-            var embeddings: [TitaNetEmbedding] = []
+            var embeddings: [SpeakerEmbedding] = []
             
             for request in requests {
                 // Check if request length is valid
-                guard request.length <= config.maxEmbeddingFrames else {
-                    Self.logger.debug("Request [\(request.startFrame)-\(request.endFrame)] too long (\(request.length) > \(config.maxEmbeddingFrames)), skipping")
-                    continue
-                }
-                
-                guard request.length >= config.minEmbeddingFrames else {
-                    Self.logger.debug("Request [\(request.startFrame)-\(request.endFrame)] too short (\(request.length) < \(config.minEmbeddingFrames)), skipping")
-                    continue
-                }
-                
-                // Check if request is within available mel buffer range
-                guard request.startFrame >= firstMelFrame else {
-                    Self.logger.debug("Request [\(request.startFrame)-\(request.endFrame)] starts before mel buffer (first frame: \(firstMelFrame)), skipping")
-                    continue
-                }
-                
-                guard request.endFrame <= lastMelFrame else {
-                    Self.logger.debug("Request [\(request.startFrame)-\(request.endFrame)] ends after mel buffer (last frame: \(lastMelFrame)), skipping")
+                guard validateRequest(request) else {
                     continue
                 }
                 
@@ -136,9 +105,10 @@ public class EmbeddingManager {
                 let melStartIndex = relativeStartFrame * config.subsamplingFactor * config.melFeatures
                 
                 // Calculate padded mel length for the model
-                let melLength = IndexUtils.nextMultiple(
+                let melLength = request.length * config.subsamplingFactor
+                let paddedMelLength = IndexUtils.nextMultiple(
                     of: config.melPadTo,
-                    for: request.length * config.subsamplingFactor
+                    for: melLength
                 )
                 let melEndIndex = melStartIndex + melLength * config.melFeatures
                 
@@ -148,34 +118,32 @@ public class EmbeddingManager {
                     continue
                 }
                 
-                let mels = Array(melFeatures[melStartIndex..<melEndIndex])
+                let embeddingVector = try extractor.extractEmbedding(
+                    mels: melFeatures[melStartIndex..<melEndIndex],
+                    melLength: paddedMelLength
+                )
                 
-                do {
-                    let embeddingVector = try extractor.extractEmbedding(mels: mels, melLength: melLength)
-                    let embedding = TitaNetEmbedding(
-                        embedding: embeddingVector,
-                        startFrame: request.startFrame,
-                        endFrame: request.endFrame
-                    )
-                    embeddings.append(embedding)
-                    Self.logger.debug("Extracted embedding [\(request.startFrame)-\(request.endFrame)]")
-                } catch {
-                    Self.logger.error("Embedding extraction failed for [\(request.startFrame)-\(request.endFrame)]: \(error)")
-                }
+                let embedding = SpeakerEmbedding(
+                    embedding: embeddingVector,
+                    startFrame: request.startFrame,
+                    endFrame: request.endFrame
+                )
+                
+                embeddings.append(embedding)
             }
             
             return embeddings
         }
     }
     
-    public func takeMatches(for segment: EmbeddingSegment) -> [TitaNetEmbedding] {
+    public func takeMatches(for segment: EmbeddingSegment) -> [SpeakerEmbedding] {
         queue.sync(flags: .barrier) {
             guard availibleEmbeddings.count > 0 else {
                 return []
             }
             
             let count = availibleEmbeddings.count
-            var embeddings: [TitaNetEmbedding] = []
+            var embeddings: [SpeakerEmbedding] = []
             for i in (0..<count).reversed() {
                 if availibleEmbeddings[i].framesOutside(of: segment) <= config.maxOutsideFrames {
                     embeddings.append(availibleEmbeddings.remove(at: i))
@@ -186,12 +154,14 @@ public class EmbeddingManager {
         }
     }
 
+    /// Cache all embeddings from a segment
     public func returnEmbeddings(from segment: EmbeddingSegment) {
         queue.sync(flags: .barrier) {
             availibleEmbeddings.append(contentsOf: segment.embeddings)
         }
     }
     
+    /// Cache all embeddings from a bunch of segments
     public func returnEmbeddings(from segments: [EmbeddingSegment]) {
         queue.sync(flags: .barrier) {
             for segment in segments {
@@ -200,12 +170,15 @@ public class EmbeddingManager {
         }
     }
     
+    /// Clean all outdated frames and embeddings
     public func dropFrames(before firstTentativeFrame: Int) {
         queue.sync(flags: .barrier) {
             // Don't drop if the new frame is not ahead of current start
             guard firstTentativeFrame > firstMelFrame else {
                 return
             }
+            
+            availibleEmbeddings.removeAll { $0.endFrame < firstTentativeFrame }
             
             // Calculate how many Sortformer frames to drop
             let framesToDrop = firstTentativeFrame - firstMelFrame
@@ -224,6 +197,43 @@ public class EmbeddingManager {
                 Self.logger.debug("Dropped \(framesToDrop) frames, mel buffer now starts at frame \(firstMelFrame)")
             }
         }
+    }
+    
+    /// Reset the manager to initial state
+    public func reset() {
+        queue.sync(flags: .barrier) {
+            melFeatures.removeAll(keepingCapacity: true)
+            firstMelFrame = 0
+            availibleEmbeddings.removeAll(keepingCapacity: true)
+            Self.logger.debug("Reset embedding manager state")
+        }
+    }
+    
+    /// Validate an embedding extraction request with verbose feedback upon failure.
+    /// - Returns: `true` if the request is valid, `false` if not
+    private func validateRequest(_ request: EmbeddingRequest) -> Bool {
+        guard request.length <= config.maxEmbeddingFrames else {
+            Self.logger.debug("Request [\(request.startFrame)-\(request.endFrame)] too long (\(request.length) > \(config.maxEmbeddingFrames)), skipping")
+            return false
+        }
+        
+        guard request.length >= config.minEmbeddingFrames else {
+            Self.logger.debug("Request [\(request.startFrame)-\(request.endFrame)] too short (\(request.length) < \(config.minEmbeddingFrames)), skipping")
+            return false
+        }
+        
+        // Check if request is within available mel buffer range
+        guard request.startFrame >= firstMelFrame else {
+            Self.logger.debug("Request [\(request.startFrame)-\(request.endFrame)] starts before mel buffer (first frame: \(firstMelFrame)), skipping")
+            return false
+        }
+        
+        guard request.endFrame <= lastMelFrame else {
+            Self.logger.debug("Request [\(request.startFrame)-\(request.endFrame)] ends after mel buffer (last frame: \(lastMelFrame)), skipping")
+            return false
+        }
+        
+        return true
     }
 }
 
