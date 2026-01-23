@@ -171,6 +171,24 @@ struct ContentView: View {
                 }
                 .disabled(viewModel.isRecording || viewModel.timeline == nil)
                 .buttonStyle(.plain)
+                
+                // Spectral Clustering button
+                Button(action: {
+                    viewModel.performSpectralClustering()
+                }) {
+                    HStack {
+                        Image(systemName: "circle.hexagongrid.fill")
+                        Text("Cluster")
+                    }
+                    .font(.headline)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 10)
+                    .background(Color.indigo)
+                    .cornerRadius(8)
+                }
+                .disabled(viewModel.isRecording || viewModel.timeline == nil)
+                .buttonStyle(.plain)
             }
             .padding(.bottom)
         }

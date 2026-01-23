@@ -19,7 +19,7 @@ final class DiarizerViewModel: ObservableObject {
     @Published private(set) var statusMessage = "Initializing..."
     
     /// Timeline with diarization history, segments, and predictions
-    @Published private(set) var timeline: SortformerVectorClustering?
+    @Published private(set) var timeline: SortformerTimeline?
     
     /// Speaker cache predictions for visualization
     @Published private(set) var spkcachePreds: [Float]?
@@ -215,6 +215,7 @@ final class DiarizerViewModel: ObservableObject {
             
             // Process complete audio
             timeline = try diarizer.processComplete(resampledSamples)
+            timeline?.finalize()  // Finalize all tentative predictions and segments
             spkcachePreds = diarizer.state.spkcachePreds  // Update speaker cache display
             fifoPreds = diarizer.state.fifoPreds  // Update FIFO queue display
             updateTrigger += 1
@@ -448,9 +449,7 @@ final class DiarizerViewModel: ObservableObject {
         #if DEBUG
         let segCount = allEmbeddingSegments.count
         let embCount = allEmbeddingSegments.reduce(0) { $0 + $1.embeddings.count }
-        if segCount > 0 || embCount > 0 {
-            print("[Graph] Updating with \(segCount) segments (\(tl.embeddingSegments.count) finalized, \(tl.tentativeEmbeddingSegments.count) tentative), \(embCount) total embeddings")
-        }
+        print("[Graph] Updating with \(segCount) segments (\(tl.embeddingSegments.count) finalized, \(tl.tentativeEmbeddingSegments.count) tentative), \(embCount) total embeddings")
         #endif
         
         // Run on main actor (already on main actor)
@@ -521,6 +520,92 @@ final class DiarizerViewModel: ObservableObject {
             statusMessage = "Exported \(allSegments.count) segments to \(url.lastPathComponent)"
         } catch {
             statusMessage = "Export failed: \(error.localizedDescription)"
+        }
+    }
+    
+    // MARK: - Spectral Clustering
+    
+    /// Perform spectral clustering on the current embeddings and re-annotate segments
+    /// - Parameter numClusters: Number of clusters (nil = auto-detect using eigengap heuristic)
+    /// - Returns: True if clustering was successful
+    @discardableResult
+    func performSpectralClustering(numClusters: Int? = nil) -> Bool {
+        guard let tl = timeline else {
+            statusMessage = "No timeline data for clustering"
+            return false
+        }
+        
+        statusMessage = "Performing spectral clustering..."
+        
+        let success = embeddingGraphModel.performSpectralClustering(numClusters: numClusters)
+        
+        if success {
+            let clusterCount = Set(embeddingGraphModel.nodes.compactMap { $0.clusterLabel }).count
+            
+            // Re-annotate segments based on cluster labels
+            annotateSegmentsFromClusters(timeline: tl)
+            
+            statusMessage = "Clustering complete - \(clusterCount) clusters found"
+        } else {
+            statusMessage = "Clustering failed - not enough embeddings"
+        }
+        
+        return success
+    }
+    
+    /// Annotate segments based on cluster assignments from the embedding graph
+    /// Uses voting: each embedding votes for its cluster, segment gets majority label
+    private func annotateSegmentsFromClusters(timeline tl: SortformerTimeline) {
+        // Build a map from embedding ID to cluster label
+        var embeddingToCluster: [UUID: Int] = [:]
+        for node in embeddingGraphModel.nodes {
+            if let clusterLabel = node.clusterLabel {
+                embeddingToCluster[node.embeddingId] = clusterLabel
+            }
+        }
+        
+        guard !embeddingToCluster.isEmpty else { return }
+        
+        // Clear existing annotations (only cluster-generated ones)
+        // We'll use "Cluster X" format to distinguish from user-provided annotations
+        let clusterPrefix = "Cluster "
+        for key in segmentAnnotations.keys {
+            if let value = segmentAnnotations[key], value.hasPrefix(clusterPrefix) {
+                segmentAnnotations.removeValue(forKey: key)
+            }
+        }
+        
+        // For each segment, find matching embeddings and vote on cluster
+        let allSegments = tl.segments.flatMap { $0 }
+        
+        for segment in allSegments {
+            // Find embeddings that overlap with this segment
+            var clusterVotes: [Int: Int] = [:]
+            
+            for node in embeddingGraphModel.nodes {
+                // Check if this embedding overlaps with the segment
+                let nodeStart = node.startFrame
+                let nodeEnd = node.endFrame
+                
+                // Check overlap: segments overlap if one starts before other ends
+                if nodeStart < segment.endFrame && nodeEnd > segment.startFrame {
+                    // Same speaker?
+                    if node.speakerIndex == segment.speakerIndex {
+                        if let cluster = node.clusterLabel {
+                            clusterVotes[cluster, default: 0] += 1
+                        }
+                    }
+                }
+            }
+            
+            // Assign the majority cluster label
+            if let (bestCluster, _) = clusterVotes.max(by: { $0.value < $1.value }) {
+                let key = Self.segmentKey(segment)
+                // Only set if no user annotation exists
+                if segmentAnnotations[key] == nil || segmentAnnotations[key]?.hasPrefix(clusterPrefix) == true {
+                    segmentAnnotations[key] = "\(clusterPrefix)\(bestCluster)"
+                }
+            }
         }
     }
 }

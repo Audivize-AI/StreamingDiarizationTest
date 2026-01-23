@@ -13,7 +13,8 @@ import Combine
 /// Configuration for the embedding graph
 public struct EmbeddingGraphConfig {
     /// Number of nearest neighbors for kNN graph
-    public var k: Int = 100
+    public var k: Int = 30
+    public var numNeg: Int = 5
     
     /// Cosine distance threshold - edges below this are drawn
     /// Also determines attract vs repel behavior
@@ -75,6 +76,9 @@ public class EmbeddingGraphModel: ObservableObject {
     @Published public var selectedNodeIndex: Int? = nil
     @Published public var hoveredNodeIndex: Int? = nil
     @Published public var config: EmbeddingGraphConfig = EmbeddingGraphConfig()
+    
+    /// Auto-zoom scale factor calculated by simulation to fit graph in view
+    @Published public var autoScaleFactor: Float = 1.0
     
     /// Selected embedding UUID for cross-view linking (timeline ↔ graph)
     @Published public var selectedEmbeddingId: UUID? = nil
@@ -242,78 +246,94 @@ public class EmbeddingGraphModel: ObservableObject {
         guard n > 1 else { return }
         
         // Skip if already stable
-        guard !isStable else { return }
+//        guard !isStable else { return }
+        
+        // UMAP Parameters controlled by slider
+        // separation threshold -> min_dist
+        let minDist = max(0.01, config.distanceThreshold)
+        
+        // Approximate 'a' and 'b' parameters for the given min_dist
+        // (Empirically inverse to spread)
+        let a = 1.6 * (0.1 / minDist)
+        let b: Float = 1.0
         
         var forces = [SIMD2<Float>](repeating: .zero, count: n)
         
-        // Number of negative samples per node (for repulsion)
-        let numNegativeSamples = 5
-        
-        // 1. ATTRACTION: Only between kNN neighbors (from edges)
-        // O(n * k) where k is number of neighbors per node
+        // 1. ATTRACTION: Only between kNN neighbors where similarity is high
         for edge in edges {
             let i = edge.u
             let j = edge.v
             guard i < n && j < n else { continue }
             
-            let cosineD = pairwiseDistances[i * numNodes + j]
+            // Only attract if within distance threshold (semantically close)
+            if edge.distance > config.distanceThreshold { continue }
             
-            // Current plot distance
+            // Weight based on similarity
+            let similarity = 1.0 - edge.distance
+            let w = max(0.01, similarity)
+            
             let delta = nodes[j].position - nodes[i].position
-            let plotDist = simd_length(delta)
+            let distSq = simd_length_squared(delta)
             
-            guard plotDist > 0.001 else { continue }
+            guard distSq > 1e-6 else { continue }
             
-            let direction = delta / plotDist
+            // UMAP Attraction Gradient: 2ab * d^(2b-2) / (1 + a*d^2b) * w
+            // Assuming b=1 for simplicity: 2a / (1 + a*d^2) * w
             
-            // Target: neighbors should be close (proportional to similarity)
-            let targetDist = cosineD * 0.5  // Scale down for tighter clusters
+            let num = 2.0 * a * b * pow(distSq, b - 1.0)
+            let den = 1.0 + a * pow(distSq, b)
+            let mag = (num / den) * w
             
-            // Attract if too far
-            if plotDist > targetDist {
-                let diff = plotDist - targetDist
-                let forceMag = config.forceStrength * diff * diff * 2.0  // Stronger attraction (squared error)
-                let force = direction * forceMag
-                forces[i] += force
-                forces[j] -= force
+            let force = delta * mag * config.forceStrength * 5.0 // Scale up for visibility
+            
+            forces[i] += force
+            forces[j] -= force
+        }
+        
+        // 2. REPULSION: K-Nearest Euclidean Neighbors
+        let repulsionK = min(config.numNeg, n - 1) // Using numNeg as K for repulsion
+        
+        for i in 0..<n {
+            // Find K nearest Euclidean neighbors
+            var euclideanDists: [(idx: Int, distSq: Float)] = []
+            euclideanDists.reserveCapacity(n)
+            
+            let posI = nodes[i].position
+            
+            for j in 0..<n where j != i {
+                let delta = nodes[j].position - posI
+                let distSq = simd_length_squared(delta)
+                euclideanDists.append((j, distSq))
+            }
+            
+            euclideanDists.sort { $0.distSq < $1.distSq }
+            
+            for (j, plotDistSq) in euclideanDists.prefix(repulsionK) {
+                let cosineD = pairwiseDistances[i * numNodes + j]
+                
+                // Repulse if semantically distant
+                if cosineD > config.distanceThreshold {
+                    let delta = nodes[i].position - nodes[j].position // Away from J
+                    
+                    // UMAP Repulsion: 2b / ((1 + a*d^2b) * d) * (1-w)
+                    // Simplified: Strong near 0, decays
+                    
+                    let den = (0.001 + plotDistSq) * (1.0 + a * pow(plotDistSq, b))
+                    let mag = (2.0 * b) / den
+                    
+                    // Limit max repulsion
+                    let clampedMag = min(mag, 10.0)
+                    
+                    forces[i] += delta * clampedMag * config.forceStrength * 0.5
+                }
             }
         }
         
-        // 2. REPULSION: Negative sampling - push away random non-neighbors that are too close
-        // O(n * numNegativeSamples)
+        // 3. GRAVITY: Pull to center to keep graph bounded and fit on screen
+        // Low strength harmonic potential (F = -k*x)
+        let gravity = config.forceStrength * 0.1
         for i in 0..<n {
-            let neighbors = Set(adjacencyList.count > i ? adjacencyList[i] : [])
-            
-            for _ in 0..<numNegativeSamples {
-                // Pick random node that's not a neighbor
-                var j = Int.random(in: 0..<n)
-                var attempts = 0
-                while (j == i || neighbors.contains(j)) && attempts < 10 {
-                    j = Int.random(in: 0..<n)
-                    attempts += 1
-                }
-                guard j != i else { continue }
-                
-                let cosineD = pairwiseDistances[i * numNodes + j]
-                
-                // Current plot distance
-                let delta = nodes[i].position - nodes[j].position
-                let plotDist = simd_length(delta)
-                
-                guard plotDist > 0.001 else { continue }
-                
-                let direction = delta / plotDist
-                
-                // Target: non-neighbors with high cosine distance should be far apart
-                let targetDist = cosineD
-                
-                // Repel if too close (plotDist < targetDist)
-                if plotDist < targetDist {
-                    let diff = targetDist - plotDist
-                    let forceMag = config.forceStrength * diff * diff // Squared error
-                    forces[i] += direction * forceMag
-                }
-            }
+            forces[i] -= nodes[i].position * gravity
         }
         
         // Apply forces and damping, track max velocity
@@ -332,7 +352,39 @@ public class EmbeddingGraphModel: ObservableObject {
             nodes[i].position += velocities[i]
         }
         
-        // Check for stability (all velocities very low)
+        // 4. POST-STEP CENTERING: Inspect centroid and shift to origin
+        // This ensures the camera is always focused on the "mass" of the graph
+        if n > 0 {
+            var centroid: SIMD2<Float> = .zero
+            for node in nodes {
+                centroid += node.position
+            }
+            centroid /= Float(n)
+            
+            // Apply shift if significant
+            if simd_length_squared(centroid) > 1e-6 {
+                for i in 0..<n {
+                    nodes[i].position -= centroid
+                }
+            }
+            
+            // 5. UPDATE AUTO-SCALE: Calculate bounds and update scale factor
+            // This ensures the graph always fits in the view
+            var maxD: Float = 0
+            for node in nodes {
+                maxD = max(maxD, abs(node.position.x))
+                maxD = max(maxD, abs(node.position.y))
+            }
+            
+            if maxD > 1e-6 {
+                // Target: fit within 0.9 of normalized range [-1, 1]
+                let targetScale = 0.9 / maxD
+                // Smooth interpolation to prevent jitter (camera smoothing)
+                autoScaleFactor = autoScaleFactor * 0.7 + targetScale * 0.3
+            }
+        }
+        
+        // Output max speed for stability check (though often ignored in continuous mode)
         if maxSpeed < 0.001 {
             stabilityCounter += 1
             if stabilityCounter >= stabilityThreshold {
@@ -575,6 +627,412 @@ public class EmbeddingGraphModel: ObservableObject {
         edges = Array(allEdges).sorted { $0.distance < $1.distance }
     }
     
+    // MARK: - Spectral Clustering
+    
+    /// Perform spectral clustering on the embeddings using eigengap heuristic for automatic k detection
+    /// - Parameters:
+    ///   - numClusters: Number of clusters to create (if nil, uses eigengap heuristic to auto-detect)
+    ///   - affinityThreshold: Distance threshold for affinity (edges above this are weak)
+    ///   - maxClusters: Maximum number of clusters to consider when auto-detecting (default: 10)
+    /// - Returns: True if clustering was successful
+    @discardableResult
+    public func performSpectralClustering(numClusters: Int? = nil, affinityThreshold: Float? = nil, maxClusters: Int = 10) -> Bool {
+        let n = nodes.count
+        guard n > 2 else { return false }
+        
+        let threshold = affinityThreshold ?? config.distanceThreshold
+        
+        // 1. Build affinity matrix using Gaussian kernel on cosine distances
+        // A[i,j] = exp(-d[i,j]^2 / (2 * sigma^2)) for close points, 0 otherwise
+        let sigma: Float = threshold / 2.0
+        let sigmaSq2 = 2.0 * sigma * sigma
+        
+        var affinity = [Float](repeating: 0, count: n * n)
+        for i in 0..<n {
+            for j in 0..<n {
+                if i == j {
+                    affinity[i * n + j] = 1.0  // Self-affinity
+                } else {
+                    let dist = pairwiseDistances[i * numNodes + j]
+                    if dist <= threshold * 1.5 {  // Only consider relatively close points
+                        affinity[i * n + j] = exp(-dist * dist / sigmaSq2)
+                    }
+                }
+            }
+        }
+        
+        // 2. Compute degree matrix D (diagonal containing row sums)
+        var degree = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            var sum: Float = 0
+            for j in 0..<n {
+                sum += affinity[i * n + j]
+            }
+            degree[i] = sum
+        }
+        
+        // 3. Build normalized Laplacian: L_sym = D^(-1/2) * L * D^(-1/2)
+        // Where L = D - A (unnormalized Laplacian)
+        // This is equivalent to: L_sym = I - D^(-1/2) * A * D^(-1/2)
+        var normalizedAffinity = [Float](repeating: 0, count: n * n)
+        for i in 0..<n {
+            let di = degree[i] > 1e-6 ? 1.0 / sqrt(degree[i]) : 0.0
+            for j in 0..<n {
+                let dj = degree[j] > 1e-6 ? 1.0 / sqrt(degree[j]) : 0.0
+                normalizedAffinity[i * n + j] = affinity[i * n + j] * di * dj
+            }
+        }
+        
+        // 4. Determine number of clusters using eigengap heuristic (if not specified)
+        let k: Int
+        if let numClusters = numClusters {
+            k = min(numClusters, n)
+        } else {
+            // Minimum clusters = number of distinct speaker slots with embeddings
+            // This ensures we don't merge speakers that the diarizer already separated
+            let minK = Set(nodes.map { $0.speakerIndex }).count
+            
+            // Compute eigenvalues to find the eigengap
+            let maxK = min(maxClusters, n - 1)
+            let (eigenvalues, _) = computeTopKEigenvectorsWithValues(matrix: normalizedAffinity, n: n, k: maxK)
+            
+            // Find largest eigengap starting from minK
+            // (eigenvalues are sorted descending for normalized affinity)
+            // The optimal k is where the gap between consecutive eigenvalues is largest
+            var bestGap: Float = 0
+            var bestK = minK  // Start with minimum = number of active speakers
+            
+            for i in minK..<eigenvalues.count {
+                let gap = eigenvalues[i - 1] - eigenvalues[i]
+                if gap > bestGap {
+                    bestGap = gap
+                    bestK = i
+                }
+            }
+            
+            k = max(minK, min(bestK, n))
+            print("[SpectralClustering] Auto-detected \(k) clusters (minK=\(minK), eigengap=\(String(format: "%.4f", bestGap)), allEigens=\(eigenvalues))")
+        }
+        
+        guard k > 0 && k <= n else { return false }
+        
+        // 5. Find top-k eigenvectors of normalized affinity
+        let eigenvectors = computeTopKEigenvectors(matrix: normalizedAffinity, n: n, k: k)
+        
+        guard eigenvectors.count == k else { return false }
+        
+        // 6. Form matrix Y where rows are the k-dimensional embeddings for each point
+        // Normalize rows to unit length for k-means
+        var Y = [[Float]](repeating: [Float](repeating: 0, count: k), count: n)
+        for i in 0..<n {
+            var row = [Float](repeating: 0, count: k)
+            for j in 0..<k {
+                row[j] = eigenvectors[j][i]
+            }
+            // Normalize row
+            var norm: Float = 0
+            vDSP_svesq(row, 1, &norm, vDSP_Length(k))
+            norm = sqrt(norm)
+            if norm > 1e-6 {
+                for j in 0..<k {
+                    row[j] /= norm
+                }
+            }
+            Y[i] = row
+        }
+        
+        // 7. Apply k-means clustering to rows of Y
+        var labels = kMeansClustering(data: Y, k: k, maxIterations: 50)
+        
+        // 8. Permute cluster labels to align with original speaker indices
+        labels = permuteLabelsToMatchSpeakers(labels: labels, k: k)
+        
+        // 9. Assign cluster labels to nodes
+        for i in 0..<n {
+            nodes[i].clusterLabel = labels[i]
+        }
+        
+        return true
+    }
+    
+    /// Permute cluster labels to maximize alignment with original speaker indices
+    /// Uses greedy assignment: for each speaker, find the cluster with most of their embeddings
+    private func permuteLabelsToMatchSpeakers(labels: [Int], k: Int) -> [Int] {
+        let n = nodes.count
+        guard n == labels.count && k > 0 else { return labels }
+        
+        // Build confusion matrix: confusionMatrix[speaker][cluster] = count
+        let numSpeakers = Set(nodes.map { $0.speakerIndex }).count
+        var confusionMatrix = [[Int]](repeating: [Int](repeating: 0, count: k), count: numSpeakers)
+        
+        for i in 0..<n {
+            let speaker = nodes[i].speakerIndex
+            let cluster = labels[i]
+            if speaker < numSpeakers && cluster < k {
+                confusionMatrix[speaker][cluster] += 1
+            }
+        }
+        
+        // Greedy assignment: map clusters to speakers to maximize overlap
+        var clusterToNewLabel = [Int: Int]()
+        var usedNewLabels = Set<Int>()
+        
+        // Sort by total count in each speaker to prioritize speakers with more embeddings
+        let speakerOrder = (0..<numSpeakers).sorted { sp1, sp2 in
+            confusionMatrix[sp1].reduce(0, +) > confusionMatrix[sp2].reduce(0, +)
+        }
+        
+        for speaker in speakerOrder {
+            // Find the cluster that has most embeddings from this speaker and isn't assigned yet
+            var bestCluster = -1
+            var bestCount = 0
+            for cluster in 0..<k {
+                if !clusterToNewLabel.keys.contains(cluster) {
+                    if confusionMatrix[speaker][cluster] > bestCount {
+                        bestCount = confusionMatrix[speaker][cluster]
+                        bestCluster = cluster
+                    }
+                }
+            }
+            
+            if bestCluster >= 0 && !usedNewLabels.contains(speaker) {
+                clusterToNewLabel[bestCluster] = speaker
+                usedNewLabels.insert(speaker)
+            }
+        }
+        
+        // Assign remaining clusters to unused labels
+        var nextLabel = 0
+        for cluster in 0..<k {
+            if clusterToNewLabel[cluster] == nil {
+                while usedNewLabels.contains(nextLabel) {
+                    nextLabel += 1
+                }
+                clusterToNewLabel[cluster] = nextLabel
+                usedNewLabels.insert(nextLabel)
+                nextLabel += 1
+            }
+        }
+        
+        // Apply permutation
+        return labels.map { clusterToNewLabel[$0] ?? $0 }
+    }
+    
+    /// Simple k-means clustering
+    private func kMeansClustering(data: [[Float]], k: Int, maxIterations: Int) -> [Int] {
+        let n = data.count
+        guard n > 0 && k > 0 else { return [] }
+        
+        let d = data[0].count
+        
+        // Initialize centroids using k-means++ style: pick first at random, then weighted by distance
+        var centroids = [[Float]]()
+        var usedIndices = Set<Int>()
+        
+        // First centroid is random
+        let firstIdx = Int.random(in: 0..<n)
+        centroids.append(data[firstIdx])
+        usedIndices.insert(firstIdx)
+        
+        // Pick remaining centroids
+        while centroids.count < k {
+            // Calculate squared distance to nearest centroid for each unused point
+            var distances = [Float](repeating: 0, count: n)
+            for i in 0..<n {
+                if usedIndices.contains(i) {
+                    distances[i] = 0  // Already a centroid, distance = 0
+                    continue
+                }
+                var minDist: Float = .infinity
+                for c in centroids {
+                    var dist: Float = 0
+                    for j in 0..<d {
+                        let diff = data[i][j] - c[j]
+                        dist += diff * diff
+                    }
+                    minDist = min(minDist, dist)
+                }
+                // Clamp to avoid infinity in the sum
+                distances[i] = minDist.isFinite ? minDist : 0
+            }
+            
+            // Pick next centroid with probability proportional to distance squared
+            let totalDist = distances.reduce(0, +)
+            if totalDist < 1e-6 || !totalDist.isFinite {
+                // All points are on centroids or distances are degenerate, just pick any unused
+                for i in 0..<n where !usedIndices.contains(i) {
+                    centroids.append(data[i])
+                    usedIndices.insert(i)
+                    break
+                }
+            } else {
+                var threshold = Float.random(in: 0..<totalDist)
+                var found = false
+                for i in 0..<n {
+                    if usedIndices.contains(i) { continue }
+                    threshold -= distances[i]
+                    if threshold <= 0 {
+                        centroids.append(data[i])
+                        usedIndices.insert(i)
+                        found = true
+                        break
+                    }
+                }
+                // Fallback if we didn't find one (shouldn't happen, but safety)
+                if !found {
+                    for i in 0..<n where !usedIndices.contains(i) {
+                        centroids.append(data[i])
+                        usedIndices.insert(i)
+                        break
+                    }
+                }
+            }
+        }
+        
+        var labels = [Int](repeating: 0, count: n)
+        
+        for _ in 0..<maxIterations {
+            // Assignment step
+            var changed = false
+            for i in 0..<n {
+                var bestDist: Float = .infinity
+                var bestLabel = 0
+                for (c, centroid) in centroids.enumerated() {
+                    var dist: Float = 0
+                    for j in 0..<d {
+                        let diff = data[i][j] - centroid[j]
+                        dist += diff * diff
+                    }
+                    if dist < bestDist {
+                        bestDist = dist
+                        bestLabel = c
+                    }
+                }
+                if labels[i] != bestLabel {
+                    labels[i] = bestLabel
+                    changed = true
+                }
+            }
+            
+            if !changed { break }
+            
+            // Update step
+            var counts = [Int](repeating: 0, count: k)
+            var newCentroids = [[Float]](repeating: [Float](repeating: 0, count: d), count: k)
+            
+            for i in 0..<n {
+                let label = labels[i]
+                counts[label] += 1
+                for j in 0..<d {
+                    newCentroids[label][j] += data[i][j]
+                }
+            }
+            
+            for c in 0..<k {
+                if counts[c] > 0 {
+                    for j in 0..<d {
+                        newCentroids[c][j] /= Float(counts[c])
+                    }
+                    centroids[c] = newCentroids[c]
+                }
+            }
+        }
+        
+        return labels
+    }
+    
+    /// Compute top-k eigenvectors using power iteration with deflation
+    private func computeTopKEigenvectors(matrix: [Float], n: Int, k: Int) -> [[Float]] {
+        var eigenvectors: [[Float]] = []
+        var deflatedMatrix = matrix
+        
+        for _ in 0..<k {
+            // Power iteration to find dominant eigenvector
+            var v = (0..<n).map { _ in Float.random(in: -1...1) }
+            v = l2Normalize(v)
+            
+            for _ in 0..<30 {  // Power iteration steps
+                // v = M * v
+                var newV = [Float](repeating: 0, count: n)
+                for i in 0..<n {
+                    for j in 0..<n {
+                        newV[i] += deflatedMatrix[i * n + j] * v[j]
+                    }
+                }
+                v = l2Normalize(newV)
+            }
+            
+            eigenvectors.append(v)
+            
+            // Deflate: M = M - lambda * v * v^T
+            // Compute eigenvalue (Rayleigh quotient)
+            var Mv = [Float](repeating: 0, count: n)
+            for i in 0..<n {
+                for j in 0..<n {
+                    Mv[i] += deflatedMatrix[i * n + j] * v[j]
+                }
+            }
+            var lambda: Float = 0
+            vDSP_dotpr(v, 1, Mv, 1, &lambda, vDSP_Length(n))
+            
+            // Subtract outer product
+            for i in 0..<n {
+                for j in 0..<n {
+                    deflatedMatrix[i * n + j] -= lambda * v[i] * v[j]
+                }
+            }
+        }
+        
+        return eigenvectors
+    }
+    
+    /// Compute top-k eigenvectors and eigenvalues using power iteration with deflation
+    /// Returns eigenvalues sorted in descending order
+    private func computeTopKEigenvectorsWithValues(matrix: [Float], n: Int, k: Int) -> (eigenvalues: [Float], eigenvectors: [[Float]]) {
+        var eigenvectors: [[Float]] = []
+        var eigenvalues: [Float] = []
+        var deflatedMatrix = matrix
+        
+        for _ in 0..<k {
+            // Power iteration to find dominant eigenvector
+            var v = (0..<n).map { _ in Float.random(in: -1...1) }
+            v = l2Normalize(v)
+            
+            for _ in 0..<30 {  // Power iteration steps
+                // v = M * v
+                var newV = [Float](repeating: 0, count: n)
+                for i in 0..<n {
+                    for j in 0..<n {
+                        newV[i] += deflatedMatrix[i * n + j] * v[j]
+                    }
+                }
+                v = l2Normalize(newV)
+            }
+            
+            eigenvectors.append(v)
+            
+            // Compute eigenvalue (Rayleigh quotient)
+            var Mv = [Float](repeating: 0, count: n)
+            for i in 0..<n {
+                for j in 0..<n {
+                    Mv[i] += deflatedMatrix[i * n + j] * v[j]
+                }
+            }
+            var lambda: Float = 0
+            vDSP_dotpr(v, 1, Mv, 1, &lambda, vDSP_Length(n))
+            eigenvalues.append(lambda)
+            
+            // Deflate: M = M - lambda * v * v^T
+            for i in 0..<n {
+                for j in 0..<n {
+                    deflatedMatrix[i * n + j] -= lambda * v[i] * v[j]
+                }
+            }
+        }
+        
+        return (eigenvalues, eigenvectors)
+    }
+    
     // MARK: - UMAP Implementation
     
     /// Run UMAP-style optimization on the layout
@@ -627,7 +1085,7 @@ public class EmbeddingGraphModel: ObservableObject {
         }
         
         // Number of negative samples per positive edge
-        let numNegativeSamples = 5
+        let numNegativeSamples = 10
         
         // Optimization loop
         for iter in 0..<iterations {

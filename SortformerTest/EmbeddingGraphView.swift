@@ -204,7 +204,7 @@ public struct EmbeddingGraphView: View {
             edgesToDraw = model.thresholdedEdges
         }
         
-        // Draw edges with opacity and thickness based on cosine similarity
+        // Draw edges with styling based on cosine distance
         for edge in edgesToDraw {
             guard edge.u < model.nodes.count && edge.v < model.nodes.count else { continue }
             
@@ -214,28 +214,36 @@ public struct EmbeddingGraphView: View {
             let posU = nodeScreenPosition(nodeU, in: size)
             let posV = nodeScreenPosition(nodeV, in: size)
             
-            // Get cosine similarity (1 - distance) for this edge
-            let similarity = model.cosineSimilarity(u: edge.u, v: edge.v)
-            
-            // Opacity based on similarity (more similar = more opaque)
-            let opacity = Double(similarity) * 0.8
-            
-            // Thickness increases with similarity (range: 0.5 to 4.0)
-            let thickness = CGFloat(0.5 + similarity * 3.5)
+            // Get cosine distance (0 = identical, 2 = opposite)
+            let cosineDistance = edge.distance
             
             var path = Path()
             path.move(to: posU)
             path.addLine(to: posV)
             
-            // Color based on whether nodes are same speaker
             let edgeColor: Color
+            let thickness: CGFloat
+            
             if nodeU.speakerIndex == nodeV.speakerIndex {
-                edgeColor = speakerColors[nodeU.speakerIndex % speakerColors.count]
+                // INTRA-SPEAKER: Use speaker color with similarity-based opacity
+                let similarity = (1.0 - cosineDistance) / model.config.distanceThreshold
+                let opacity = Double(max(0.2, similarity)) * 0.9
+                thickness = CGFloat(0.5 + max(0, similarity) * 3.5)
+                edgeColor = speakerColors[nodeU.speakerIndex % speakerColors.count].opacity(opacity)
             } else {
-                edgeColor = .gray
+                // INTER-SPEAKER: Grayscale based on cosine distance
+                // Distance 0 = white (1.0), Distance 2 = black (0.0)
+                let normalizedDist = min(max(cosineDistance, 0), 2.0) / 2.0  // [0, 1]
+                let grayValue = 1.0 - Double(normalizedDist)  // 1.0 = white, 0.0 = black
+                
+                // Thickness inversely proportional to distance (thinner = higher distance)
+                // Range: 0.5 (dist=2) to 4.0 (dist=0)
+                thickness = CGFloat(0.5 + (1.0 - normalizedDist) * 3.5)
+                
+                edgeColor = Color(white: grayValue)
             }
             
-            context.stroke(path, with: .color(edgeColor.opacity(opacity)),
+            context.stroke(path, with: .color(edgeColor),
                           style: StrokeStyle(lineWidth: thickness))
         }
     }
@@ -284,8 +292,8 @@ public struct EmbeddingGraphView: View {
     private func nodeScreenPosition(_ node: GraphNode, in size: CGSize) -> CGPoint {
         let centerX = size.width / 2
         let centerY = size.height / 2
-        // Increased base scale (0.4 -> 0.8) and apply config's positionScale
-        let graphScale = min(size.width, size.height) * 0.8 * scale * CGFloat(model.config.positionScale)
+        // Base scale 0.42 ensures [-1,1] range fits within screen (0.42 * 2 = 0.84 width)
+        let graphScale = min(size.width, size.height) * 0.42 * scale * CGFloat(model.config.positionScale) * CGFloat(model.autoScaleFactor)
         
         let totalOffset = CGSize(
             width: offset.width + dragOffset.width,
@@ -301,7 +309,7 @@ public struct EmbeddingGraphView: View {
     private func screenToGraph(_ point: CGPoint, in size: CGSize) -> SIMD2<Float> {
         let centerX = size.width / 2
         let centerY = size.height / 2
-        let graphScale = min(size.width, size.height) * 0.8 * scale * CGFloat(model.config.positionScale)
+        let graphScale = min(size.width, size.height) * 0.42 * scale * CGFloat(model.config.positionScale) * CGFloat(model.autoScaleFactor)
         
         let totalOffset = CGSize(
             width: offset.width + dragOffset.width,
@@ -429,7 +437,7 @@ public struct EmbeddingGraphView: View {
     private func graphToScreen(_ pos: SIMD2<Float>, in size: CGSize) -> CGPoint {
         let centerX = size.width / 2
         let centerY = size.height / 2
-        let graphScale = min(size.width, size.height) * 0.8 * scale * CGFloat(model.config.positionScale)
+        let graphScale = min(size.width, size.height) * 0.8 * scale * CGFloat(model.config.positionScale) * CGFloat(model.autoScaleFactor)
         
         let totalOffset = CGSize(
             width: offset.width + dragOffset.width,

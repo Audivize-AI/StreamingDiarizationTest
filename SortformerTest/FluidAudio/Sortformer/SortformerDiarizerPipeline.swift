@@ -28,13 +28,13 @@ public final class SortformerDiarizer {
     private let lock = NSLock()
 
     /// Accumulated results
-    public var timeline: SortformerVectorClustering {
+    public var timeline: SortformerTimeline {
         lock.lock()
         defer { lock.unlock() }
         return _timeline
     }
     
-    private var _timeline: SortformerVectorClustering
+    private var _timeline: SortformerTimeline
 
     /// Check if diarizer is ready for processing.
     public var isAvailable: Bool {
@@ -91,7 +91,7 @@ public final class SortformerDiarizer {
         self._state = SortformerStreamingState(config: config)
         self.embeddingManager = EmbeddingManager(config: .default)
         try? self.embeddingManager.initialize()
-        self._timeline = SortformerVectorClustering(
+        self._timeline = SortformerTimeline(
             config: postProcessingConfig ?? .default(for: config),
             embeddingManager: embeddingManager
         )
@@ -223,7 +223,7 @@ public final class SortformerDiarizer {
         var ran = false
 
         // Step 1: Run preprocessor on available audio
-        while let (chunkFeatures, chunkLengths) = getNextChunkFeaturesLocked() {
+        while let (chunkFeatures, chunkLengths) = getNextChunkFeatures() {
             ran = true
             let output = try models.runMainModel(
                 chunk: chunkFeatures,
@@ -278,7 +278,7 @@ public final class SortformerDiarizer {
     public func processComplete(
         _ samples: [Float],
         progressCallback: ProgressCallback? = nil
-    ) throws -> SortformerVectorClustering {
+    ) throws -> SortformerTimeline {
         lock.lock()
         defer { lock.unlock() }
 
@@ -295,6 +295,9 @@ public final class SortformerDiarizer {
         var featureProvider = SortformerFeatureLoader(config: self.config, audio: samples)
         var chunksProcessed = 0
         let coreFrames = config.chunkLen * config.subsamplingFactor
+        
+        // Feed audio to embedding manager for speaker embedding extraction
+        embeddingManager.addAudio(from: samples[0..<samples.count], lastAudioSample: 0)
         
         while let (chunkFeatures, chunkLength, leftOffset, rightOffset) = featureProvider.next() {
             // Run main model
@@ -355,9 +358,9 @@ public final class SortformerDiarizer {
     // MARK: - Helpers
 
     /// Preprocess audio into mel features - caller must hold lock
-    private func preprocessAudioToFeaturesLocked() {
+    private func preprocessAudioToFeatures() -> Bool {
         guard audioBuffer.count >= config.melWindow else {
-            return
+            return false
         }
 
         // Demand-Driven Optimization:
@@ -378,7 +381,7 @@ public final class SortformerDiarizer {
         // However, to keep the pipeline moving smoothly, we can process if we have a full chunk buffered.
         // But to strictly prioritize efficiency/latency balance as requested:
         if framesNeeded <= 0 {
-            return
+            return false
         }
 
         // Calculate audio samples needed to produce 'framesNeeded'
@@ -394,7 +397,7 @@ public final class SortformerDiarizer {
 
         // Wait until we have enough audio to satisfy the demand
         guard audioBuffer.count >= samplesNeeded else {
-            return
+            return false
         }
 
         let audioSlice = audioBuffer.prefix(samplesNeeded)
@@ -409,7 +412,7 @@ public final class SortformerDiarizer {
         )
         
         guard melFrames > 0 else {
-            return
+            return false
         }
 
         featureBuffer.append(contentsOf: mel)
@@ -418,18 +421,12 @@ public final class SortformerDiarizer {
         let samplesConsumed = melFrames * config.melStride
         lastAudioSample = audioBuffer[samplesConsumed - 1] // For preemph filter
         audioBuffer.removeFirst(samplesConsumed)
-    }
-
-    /// Get next chunk features (for testing)
-    internal func getNextChunkFeatures() -> (mel: [Float], melLength: Int)? {
-        lock.lock()
-        defer { lock.unlock() }
-        return getNextChunkFeaturesLocked()
+        return true
     }
 
     /// Get next chunk features - caller must hold lock
-    private func getNextChunkFeaturesLocked() -> (mel: [Float], melLength: Int)? {
-        preprocessAudioToFeaturesLocked()
+    private func getNextChunkFeatures() -> (mel: [Float], melLength: Int)? {
+        let hasNewChunk = preprocessAudioToFeatures()
         let featLength = featureBuffer.count / config.melFeatures
         let coreFrames = config.chunkLen * config.subsamplingFactor
         let leftContextFrames = config.chunkLeftContext * config.subsamplingFactor
@@ -439,8 +436,22 @@ public final class SortformerDiarizer {
         let endFeat = min(startFeat + coreFrames, featLength)
 
         // Need at least one core frame
-        guard endFeat > startFeat else { return nil }
-        guard endFeat + rightContextFrames <= featLength else { return nil }
+        guard endFeat > startFeat else {
+            if hasNewChunk {
+                print("Audio and mels out of sync!")
+            }
+            return nil
+        }
+        guard endFeat + rightContextFrames <= featLength else {
+            if hasNewChunk {
+                print("Audio and mels out of sync!")
+            }
+            return nil
+        }
+        
+        if !hasNewChunk {
+            print("Audio and mels out of sync (it's suddenly full????)!")
+        }
 
         // Calculate offsets
         let leftOffset = min(leftContextFrames, startFeat)
