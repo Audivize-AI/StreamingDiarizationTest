@@ -90,8 +90,6 @@ public class EmbeddingManager {
                 return [] as [SpeakerEmbedding]
             }
             
-            Self.logger.debug("Processing \(requests.count) embedding requests (mel buffer: frames \(self.firstMelFrame)-\(self.lastMelFrame))")
-            
             var embeddings: [SpeakerEmbedding] = []
             
             for request in requests {
@@ -178,7 +176,9 @@ public class EmbeddingManager {
                 return
             }
             
-            availibleEmbeddings.removeAll { $0.endFrame < firstTentativeFrame }
+            availibleEmbeddings.removeAll {
+                $0.endFrame < firstTentativeFrame
+            }
             
             // Calculate how many Sortformer frames to drop
             let framesToDrop = firstTentativeFrame - firstMelFrame

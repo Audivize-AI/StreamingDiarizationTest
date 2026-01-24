@@ -15,7 +15,7 @@ public struct TitaNetEmbeddingExtractor {
         configuration.computeUnits = .all
         
         self.config = config
-        self.model = try TitaNet_small_2_48s_16(configuration: configuration).model
+        self.model = try TitaNet_small_2_48s(configuration: configuration).model
         self.memoryOptimizer = ANEMemoryOptimizer()
         self.processedSignalArray = try memoryOptimizer.createAlignedArray(
             shape: [

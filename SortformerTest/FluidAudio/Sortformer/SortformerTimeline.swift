@@ -381,8 +381,7 @@ public class SortformerTimeline {
                endFrame > startFrame,
                let activeSpeaker = activeIds.first
             {
-                let isFinalized = endFrame < firstTentativeFrame
-                let newSegment: EmbeddingSegment
+                let isFinalized = endFrame <= firstTentativeFrame
                 
                 if currentSegment.isValid,
                    activeSpeaker == currentSegment.speakerIndex,
@@ -438,7 +437,8 @@ public class SortformerTimeline {
         }
         
         // Clean up spare embeddings
-        embeddingManager.dropFrames(before: firstTentativeFrame)
+        embeddingManager.dropFrames(
+            before: firstTentativeFrame - embeddingConfig.maxEmbeddingFrames)
     }
     
     /// Reset the timeline to initial state

@@ -250,7 +250,6 @@ public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
         withCoverLength coverLength: Int,
         lastEmbeddingEnd: Int,
     ) -> [Int] {
-        print ("\tGENERATING COVERS")
         guard gaps.count > 0 else { return [] }
         
         var covers: [(start: Int, gapStart: Int)] = []
