@@ -299,15 +299,16 @@ public class SortformerTimeline {
                     speaking = true
 
                     if start - lastSegment.end <= minFramesOff {
-                        // Merge with last segment to avoid overlap
+                        // Extend last segment to avoid overlap, effectively merging it with the new one
                         start = lastSegment.start
+                        
+                        let removedItem = wasLastSegmentFinal
+                            ? segments[speakerIndex].popLast()
+                            : tentativeSegments[speakerIndex].popLast()
 
-                        if wasLastSegmentFinal {
-                            _ = segments[speakerIndex].popLast()
-                        } else {
-                            _ = tentativeSegments[speakerIndex].popLast()
+                        if removedItem != nil {
+                            accumulator.removeLast()
                         }
-                        _ = accumulator.popLast()
                     }
                 }
             }
@@ -340,7 +341,7 @@ public class SortformerTimeline {
     
     /// Note: call this AFTER `self.numFrames` has been updated
     private func updateEmbeddingSegments(from segments: [SortformerSegment]) throws {
-        guard segments.count > 0 else {
+        guard !segments.isEmpty else {
             return
         }
         
