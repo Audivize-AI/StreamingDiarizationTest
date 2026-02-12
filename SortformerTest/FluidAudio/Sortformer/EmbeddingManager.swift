@@ -116,15 +116,24 @@ public class EmbeddingManager {
                     continue
                 }
                 
-                let embeddingVector = try extractor.extractEmbedding(
+                var embeddingVector = try extractor.extractEmbedding(
                     mels: melFeatures[melStartIndex..<melEndIndex],
                     melLength: paddedMelLength
                 )
                 
+                // Normalize embedding vector
+                var normalizer = 1 / sqrt(vDSP.sumOfSquares(embeddingVector))
+                vDSP_vsmul(
+                    embeddingVector, 1,
+                    &normalizer,
+                    &embeddingVector, 1,
+                    vDSP_Length(embeddingVector.count)
+                )
+                
                 let embedding = SpeakerEmbedding(
-                    embedding: embeddingVector,
+                    unitEmbedding: embeddingVector,
                     startFrame: request.startFrame,
-                    endFrame: request.endFrame
+                    endFrame: request.endFrame,
                 )
                 
                 embeddings.append(embedding)
@@ -134,14 +143,14 @@ public class EmbeddingManager {
         }
     }
     
-    public func takeMatches(for segment: EmbeddingSegment) -> [SpeakerEmbedding] {
+    public func takeMatches(for segment: EmbeddingSegment) -> ContiguousArray<SpeakerEmbedding> {
         queue.sync(flags: .barrier) {
-            guard availibleEmbeddings.count > 0 else {
+            guard !availibleEmbeddings.isEmpty else {
                 return []
             }
             
             let count = availibleEmbeddings.count
-            var embeddings: [SpeakerEmbedding] = []
+            var embeddings: ContiguousArray<SpeakerEmbedding> = []
             for i in (0..<count).reversed() {
                 if availibleEmbeddings[i].framesOutside(of: segment) <= config.maxOutsideFrames {
                     embeddings.append(availibleEmbeddings.remove(at: i))

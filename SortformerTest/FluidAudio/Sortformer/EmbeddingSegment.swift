@@ -30,21 +30,35 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
     /// Length in frames
     public var length: Int { frames.count }
     
-    public init(embedding: [Float], startFrame: Int, endFrame: Int) {
+    public init(unitEmbedding: [Float], startFrame: Int, endFrame: Int) {
         self.id = UUID()
+        self.embedding = unitEmbedding
+        self.frames = startFrame..<endFrame
+    }
+    
+    public init(embedding: inout [Float], startFrame: Int, endFrame: Int) {
+        self.id = UUID()
+        var normalizer = 1 / sqrt(vDSP.sumOfSquares(embedding))
+        vDSP_vsmul(
+            embedding, 1,
+            &normalizer,
+            &embedding, 1,
+            vDSP_Length(embedding.count)
+        )
         self.embedding = embedding
         self.frames = startFrame..<endFrame
     }
     
     /// Get the cosine distance to another embedding
-    /// - Warning: Does not check if any of the vectors have a magnitude of 0.
     public func cosineDistance(to other: SpeakerEmbedding) -> Float {
-        let a = self.embedding
-        let b = other.embedding
+        let length = vDSP_Length(self.embedding.count)
         var dot: Float = 0
-        vDSP_dotpr(a, 1, b, 1, &dot, vDSP_Length(a.count))
-        let denom = sqrt(vDSP.sumOfSquares(a) * vDSP.sumOfSquares(b))
-        return 1.0 - dot / denom
+        vDSP_dotpr(
+            self.embedding, 1,
+            other.embedding, 1,
+            &dot, length
+        )
+        return 1.0 - dot
     }
     
     /// Check if this region contains a frame
@@ -90,11 +104,10 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
     }
 }
 
-
 /// Tracks embeddings for a disjoint segment
-public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
+public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// Segment ID
-    public let id: UUID
+    public private(set) var id: UUID = UUID(uuid: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0))
 
     /// Speaker index in Sortformer output
     public let speakerIndex: Int
@@ -115,10 +128,7 @@ public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
     public var isFinalized: Bool
     
     /// Extracted embedding regions for this segment
-    public private(set) var embeddings: [SpeakerEmbedding]
-    
-    /// Intra-cluster distances
-    public private(set) var distances: [Float] = []
+    public private(set) var embeddings: ContiguousArray<SpeakerEmbedding>
     
     public var isNone: Bool { speakerIndex < 0 }
     public var isValid: Bool { speakerIndex >= 0 }
@@ -132,7 +142,6 @@ public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
         endFrame: Int,
         finalized: Bool = true
     ) {
-        self.id = UUID()
         self.speakerIndex = speakerIndex
         self.startFrame = startFrame
         self.endFrame = endFrame
@@ -176,13 +185,17 @@ public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// - Parameters:
     ///   - extractor: Embedding Manager
     ///   - streamingHorizonFrame: If the segment ends before this frame, then its end frame is probably finalized.
-    public mutating func initializeEmbeddings(
+    public func initializeEmbeddings(
         with extractor: EmbeddingManager,
         streamingHorizonFrame: Int
     ) throws {
-        embeddings = extractor.takeMatches(for: self)
+        if embeddings.isEmpty {
+            embeddings = extractor.takeMatches(for: self)
+        } else {
+            embeddings.append(contentsOf: extractor.takeMatches(for: self))
+        }
         
-        let isComplete = endFrame < streamingHorizonFrame
+        let isComplete = endFrame < streamingHorizonFrame || isFinalized
         let requests: [EmbeddingRequest]
         let minEmbeddingLength = extractor.config.minEmbeddingFrames
         let maxEmbeddingLength = extractor.config.maxEmbeddingFrames
@@ -196,21 +209,24 @@ public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
                 isComplete: isComplete
             )
         } else {
+            // Sort in decending order by end frame
             let embeddingFrames = embeddings.map(\.frames).sorted {
-                ($0.lowerBound, $0.upperBound) < ($1.lowerBound, $1.upperBound)
+                ($0.upperBound, $0.lowerBound) > ($1.upperBound, $1.lowerBound)
             }
             var cutoff = endFrame
             if !isComplete {
                 cutoff -= maxEmbeddingLength
             }
             
+            // Gets gaps in descending order
             let gaps = getGaps(
                 in: embeddingFrames,
                 before: cutoff,
                 ifAnyExceed: extractor.config.maxEmbeddingGap
             )
             
-            guard let lastEmbeddingEnd = embeddingFrames.last?.upperBound else {
+            // Since frames are in descending order, the first range is the last one chronologically
+            guard let lastEmbeddingEnd = embeddingFrames.first?.upperBound else {
                 preconditionFailure("Last embedding has no upper bound")
             }
             
@@ -231,6 +247,8 @@ public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
         
         let newEmbeddings = try extractor.processRequests(requests)
         embeddings.append(contentsOf: newEmbeddings)
+        
+        initId()
     }
     
     /// - Parameters:
@@ -329,7 +347,7 @@ public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
     
     /// Get embedding gaps in reversed order
     /// - Parameters:
-    ///   - embeddingRanges: Covered embedding ranges sorted in ascending order
+    ///   - embeddingRanges: Covered embedding ranges sorted in descending order by end frame
     ///   - cutoffFrame: Gaps will be ignored begining at this frame
     ///   - maxGapSize: Maximum allowed gap size. If no gaps exceed this threshold, then nothing is returned.
     /// - Returns: Frame intervals `[start, end)` that not covered by the embeddings
@@ -342,7 +360,7 @@ public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
         var end = cutoffFrame
         var hasLargeGap = false
         
-        for range in embeddingRanges.reversed() {
+        for range in embeddingRanges {
             if range.upperBound < end {
                 // There's a gap after this embedding
                 gaps.append((range.upperBound, end))
@@ -416,6 +434,28 @@ public struct EmbeddingSegment: SpeakerFrameRange, Identifiable {
         }
         
         return requests
+    }
+    
+    private func initId() {
+        guard !embeddings.isEmpty else { return }
+        self.id = embeddings[0].id
+        guard embeddings.count > 1 else { return }
+
+        // 2. Access the memory as two UInt64 values
+        withUnsafeMutableBytes(of: &self.id) { resultPtr in
+            let result64 = resultPtr.assumingMemoryBound(to: UInt64.self)
+            
+            for i in 1..<embeddings.count {
+                var next = embeddings[i].id.uuid
+                withUnsafeBytes(of: &next) { nextPtr in
+                    let next64 = nextPtr.assumingMemoryBound(to: UInt64.self)
+                    
+                    // 3. Perform the XOR on each 64-bit half
+                    result64[0] &+= next64[0]
+                    result64[1] &+= next64[1]
+                }
+            }
+        }
     }
 }
 
