@@ -134,8 +134,6 @@ public final class SortformerDiarizer {
         defer { lock.unlock() }
 
         self._models = models
-        self._state = SortformerStreamingState(config: config)
-        self.lastAudioSample = 0
         resetBuffersLocked()
         logger.info("Sortformer initialized with pre-loaded models")
     }
@@ -145,8 +143,6 @@ public final class SortformerDiarizer {
         lock.lock()
         defer { lock.unlock() }
 
-        _state = SortformerStreamingState(config: config)
-        lastAudioSample = 0
         resetBuffersLocked()
         logger.debug("Sortformer state reset")
     }
@@ -159,6 +155,7 @@ public final class SortformerDiarizer {
         startFeat = 0
         diarizerChunkIndex = 0
         _timeline.reset()
+        _state = SortformerStreamingState(config: config)
         
         audioBuffer.reserveCapacity(config.chunkMelFrames * config.melStride)
         featureBuffer.reserveCapacity((config.chunkMelFrames + config.coreFrames) * config.melFeatures)
@@ -287,8 +284,6 @@ public final class SortformerDiarizer {
         }
 
         // Reset for fresh processing
-        _state = SortformerStreamingState(config: config)
-        lastAudioSample = 0
         resetBuffersLocked()
 
         var difference = SortformerTimelineDifference()
