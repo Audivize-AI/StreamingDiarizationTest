@@ -30,6 +30,7 @@ public struct EmbeddingConfig {
     public let melStride: Int = 160
     public let melWindow: Int = 400
     public let melPadTo: Int = 16
+    public let embeddingFeatures: Int = 192
 
     // Computed properties
     var minMelLength: Int { minEmbeddingFrames * subsamplingFactor }

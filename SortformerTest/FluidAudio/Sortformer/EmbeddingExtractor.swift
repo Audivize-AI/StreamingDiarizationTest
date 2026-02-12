@@ -15,7 +15,7 @@ public struct TitaNetEmbeddingExtractor {
         configuration.computeUnits = .all
         
         self.config = config
-        self.model = try TitaNet_small_2_48s(configuration: configuration).model
+        self.model = try TitaNet_large_2_48s(configuration: configuration).model
         self.memoryOptimizer = ANEMemoryOptimizer()
         self.processedSignalArray = try memoryOptimizer.createAlignedArray(
             shape: [
@@ -71,10 +71,10 @@ public struct TitaNetEmbeddingExtractor {
         // Get prediction
         let output: MLFeatureProvider
         do {
-            let start = Date()
+//            let start = Date()
             output = try model.prediction(from: input)
-            let end = Date()
-            print("embeddings extracted in \(end.timeIntervalSince(start))s")
+//            let end = Date()
+//            print("embeddings extracted in \(end.timeIntervalSince(start))s")
         } catch {
             throw TitaNetError.predictionFailed("CoreML prediction failed (melLength=\(melLength), shape=\(processedSignalArray.shape)): \(error)")
         }
