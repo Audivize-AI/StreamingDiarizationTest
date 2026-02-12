@@ -1,0 +1,12 @@
+//
+//  clustering.modulemap
+//  SortformerTest
+//
+//  Created by Benjamin Lee on 2/10/26.
+//
+
+module AHCClustering {
+    header "AHCSpeakerForestBridge.h"
+
+    export *
+}

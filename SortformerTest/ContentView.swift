@@ -13,6 +13,12 @@ struct ContentView: View {
     @State private var selectedSegment: SortformerSegment?
     @State private var annotationText = ""
     
+    // Cluster slider state
+    @State private var clusterSliderValue: Double = 2
+    
+    // Clustering method selection
+    @State private var selectedClusteringMethod: ClusteringMethod = .constrainedAHC
+    
     var body: some View {
         VStack(spacing: 16) {
             // Header with status
@@ -27,20 +33,47 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                // Status indicator
-                HStack(spacing: 6) {
-                    Circle()
-                        .fill(statusColor)
-                        .frame(width: 8, height: 8)
-                    Text(viewModel.statusMessage)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                // Progress indicators
+                if let fileProgress = viewModel.fileProcessingProgress {
+                    HStack(spacing: 8) {
+                        Text("Processing:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        ProgressView(value: fileProgress)
+                            .frame(width: 100)
+                        Text("\(Int(fileProgress * 100))%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundColor(.secondary)
+                            .frame(width: 35)
+                    }
+                } else if let clusterProgress = viewModel.clusteringProgress {
+                    HStack(spacing: 8) {
+                        Text("Clustering:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        ProgressView(value: clusterProgress)
+                            .frame(width: 100)
+                        Text("\(Int(clusterProgress * 100))%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundColor(.secondary)
+                            .frame(width: 35)
+                    }
+                } else {
+                    // Status indicator
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 8, height: 8)
+                        Text(viewModel.statusMessage)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
             .padding(.horizontal)
             
-            // Speech plot and Embedding Graph
-            HSplitView {
+            // Speech plot and Cluster Plot (only shown after clustering)
+            HStack(spacing: 0) {
                 // Left side: Speech Plot (Heatmaps)
                 ZStack {
                     SpeechPlotView(
@@ -84,15 +117,86 @@ struct ContentView: View {
                 }
                 .layoutPriority(1)
                 .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
+
+                AHCDendrogramView(model: viewModel.dendrogramModel)
+                    .frame(minWidth: 320, maxWidth: 440, maxHeight: .infinity)
+                    .padding(.leading, 12)
                 
-                // Right side: Embedding Graph
-                EmbeddingGraphView(model: viewModel.embeddingGraphModel)
-                    .frame(minWidth: 350, maxWidth: 600, maxHeight: .infinity)
+                // Right side: Cluster Plot (only shown after clustering)
+                if viewModel.embeddingGraphModel.isClusterPlotVisible {
+                    VStack(spacing: 8) {
+                        ClusterPlotView(
+                            model: viewModel.embeddingGraphModel,
+                            onSelectNode: { startFrame, endFrame, speakerIndex in
+                                // Navigate to the corresponding streak on the timeline
+                                let startTime = Float(startFrame) * 0.08
+                                let endTime = Float(endFrame) * 0.08
+                                viewModel.playSegment(startTime: startTime, endTime: endTime)
+                            },
+                            onClose: {
+                                viewModel.embeddingGraphModel.isClusterPlotVisible = false
+                            }
+                        )
+                        
+                        // Cluster count slider
+                        VStack(spacing: 4) {
+                            HStack {
+                                Text("Clusters:")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                
+                                Slider(
+                                    value: $clusterSliderValue,
+                                    in: 2...Double(viewModel.embeddingGraphModel.maxClusterCount),
+                                    step: 1
+                                )
+                                .frame(maxWidth: 150)
+                                
+                                Text("\(Int(clusterSliderValue))")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 24)
+                                
+                                Button("Apply") {
+                                    Task {
+                                        await viewModel.performClustering(method: selectedClusteringMethod, numClusters: Int(clusterSliderValue))
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                                
+                                Button("Auto") {
+                                    clusterSliderValue = Double(viewModel.embeddingGraphModel.eigengapOptimalK)
+                                    Task {
+                                        await viewModel.performClustering(method: selectedClusteringMethod)
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                                .help("Use eigengap heuristic for optimal cluster count")
+                            }
+                            
+                            // Method picker
+                            Picker("Method:", selection: $selectedClusteringMethod) {
+                                ForEach(ClusteringMethod.allCases, id: \.self) { method in
+                                    Text(method.rawValue).tag(method)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 250)
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.bottom, 4)
+                    }
+                    .frame(minWidth: 350, maxWidth: 500, maxHeight: .infinity)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
             }
             .padding(.horizontal)
             .onDrop(of: [.audio, .fileURL], isTargeted: $isDragOver) { providers in
                 handleDrop(providers: providers)
             }
+            .animation(.easeInOut(duration: 0.3), value: viewModel.embeddingGraphModel.isClusterPlotVisible)
             
             // Control buttons
             HStack(spacing: 16) {
@@ -174,7 +278,13 @@ struct ContentView: View {
                 
                 // Spectral Clustering button
                 Button(action: {
-                    viewModel.performSpectralClustering()
+                    Task {
+                        let success = await viewModel.performClustering(method: selectedClusteringMethod)
+                        if success {
+                            clusterSliderValue = Double(viewModel.embeddingGraphModel.eigengapOptimalK)
+                            viewModel.embeddingGraphModel.isClusterPlotVisible = true
+                        }
+                    }
                 }) {
                     HStack {
                         Image(systemName: "circle.hexagongrid.fill")
@@ -193,7 +303,7 @@ struct ContentView: View {
             .padding(.bottom)
         }
         .padding(.top)
-        .frame(minWidth: 900, minHeight: 650)
+        .frame(minWidth: 1150, minHeight: 650)
         .fileImporter(
             isPresented: $showingFilePicker,
             allowedContentTypes: [

@@ -30,6 +30,12 @@ final class DiarizerViewModel: ObservableObject {
     /// Trigger for UI updates (incremented when timeline changes)
     @Published private(set) var updateTrigger = 0
     
+    /// Progress for file processing (0.0 to 1.0), nil when not processing
+    @Published private(set) var fileProcessingProgress: Double? = nil
+    
+    /// Progress for clustering (0.0 to 1.0), nil when not clustering
+    @Published private(set) var clusteringProgress: Double? = nil
+    
     /// Embedding graph model for visualization
     let embeddingGraphModel = EmbeddingGraphModel()
     
@@ -45,6 +51,9 @@ final class DiarizerViewModel: ObservableObject {
     
     /// Segment annotations - maps "startFrame-endFrame-speaker" to custom label
     @Published var segmentAnnotations: [String: String] = [:]
+
+    /// Latest live AHC dendrogram snapshot from C++ clustering
+    @Published private(set) var dendrogramModel: AHCDendrogramModel = .empty
     
     /// All recorded audio samples for playback (16kHz mono)
     private(set) var recordedAudio: [Float] = []
@@ -56,6 +65,13 @@ final class DiarizerViewModel: ObservableObject {
     private var processingTask: Task<Void, Never>?
     private var audioPlayer: AVAudioPlayer?
     private var audioConverter: AudioConverter
+    private let ahcBridge = AHCSpeakerForestBridge(
+        numRepresentatives: 24,
+        minEmbeddings: 600,
+        maxEmbeddings: 1500
+    )
+    private var streamedFinalizedEmbeddingSegmentCount = 0
+    private let clusteringEmbeddingDimensions = 192
     
     private let sampleRate: Double = 16000.0
     
@@ -83,6 +99,7 @@ final class DiarizerViewModel: ObservableObject {
         recordedAudio = []
         diarizer?.reset()
         timeline = diarizer?.timeline
+        resetDendrogramState()
         
         // Start audio capture
         do {
@@ -125,8 +142,10 @@ final class DiarizerViewModel: ObservableObject {
         }
         
         // Finalize timeline
-        timeline?.finalize()
+        try? timeline?.finalize()
         updateTrigger += 1
+
+        updateDendrogram()
         
         updateGraph()
         
@@ -158,8 +177,14 @@ final class DiarizerViewModel: ObservableObject {
     func loadAudioFile(from url: URL) async {
         guard isReady, !isRecording else { return }
         guard let diarizer = diarizer else { return }
+
+        resetDendrogramState()
         
+        fileProcessingProgress = 0.0
         statusMessage = "Loading audio file..."
+        
+        // Allow UI to update
+        try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
         
         // Start security-scoped access for sandboxed apps
         let didStartAccessing = url.startAccessingSecurityScopedResource()
@@ -167,10 +192,16 @@ final class DiarizerViewModel: ObservableObject {
             if didStartAccessing {
                 url.stopAccessingSecurityScopedResource()
             }
+            fileProcessingProgress = nil
         }
         
         do {
             // Load audio file
+            fileProcessingProgress = 0.1
+            
+            // Allow UI to update
+            try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+            
             let audioFile = try AVAudioFile(forReading: url)
             let format = audioFile.processingFormat
             let frameCount = AVAudioFrameCount(audioFile.length)
@@ -180,6 +211,12 @@ final class DiarizerViewModel: ObservableObject {
                 return
             }
             
+            fileProcessingProgress = 0.2
+            statusMessage = "Reading audio data..."
+            
+            // Allow UI to update
+            try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+            
             try audioFile.read(into: buffer)
             
             guard let channelData = buffer.floatChannelData else {
@@ -188,6 +225,12 @@ final class DiarizerViewModel: ObservableObject {
             }
             
             // Convert to mono
+            fileProcessingProgress = 0.3
+            statusMessage = "Converting to mono..."
+            
+            // Allow UI to update
+            try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+            
             let samples: [Float]
             if format.channelCount > 1 {
                 samples = (0..<Int(frameCount)).map { i in
@@ -202,6 +245,12 @@ final class DiarizerViewModel: ObservableObject {
             }
             
             // Resample to 16kHz if needed
+            fileProcessingProgress = 0.4
+            statusMessage = "Resampling audio..."
+            
+            // Allow UI to update
+            try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+            
             let resampledSamples: [Float]
             if abs(format.sampleRate - sampleRate) > 1.0 {
                 resampledSamples = try audioConverter.resample(samples, from: format.sampleRate)
@@ -211,15 +260,28 @@ final class DiarizerViewModel: ObservableObject {
             
             // Store for playback
             recordedAudio = resampledSamples
+            fileProcessingProgress = 0.5
             statusMessage = "Processing \(url.lastPathComponent)..."
+            
+            // Allow UI to update before heavy processing
+            try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
             
             // Process complete audio
             timeline = try diarizer.processComplete(resampledSamples)
-            timeline?.finalize()  // Finalize all tentative predictions and segments
+            fileProcessingProgress = 0.9
+            statusMessage = "Finalizing..."
+            
+            // Allow UI to update
+            try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+            
+            try? timeline?.finalize()  // Finalize all tentative predictions and segments
             spkcachePreds = diarizer.state.spkcachePreds  // Update speaker cache display
             fifoPreds = diarizer.state.fifoPreds  // Update FIFO queue display
             updateTrigger += 1
+
+            updateDendrogram()
             
+            fileProcessingProgress = 1.0
             updateGraph()
             
             let duration = Float(resampledSamples.count) / Float(sampleRate)
@@ -338,6 +400,7 @@ final class DiarizerViewModel: ObservableObject {
             
             self.diarizer = newDiarizer
             self.timeline = newDiarizer.timeline
+            resetDendrogramState()
             self.isReady = true
             self.statusMessage = "Ready"
         } catch {
@@ -428,14 +491,116 @@ final class DiarizerViewModel: ObservableObject {
             updateTrigger += 1
             spkcachePreds = diarizer.state.spkcachePreds
             fifoPreds = diarizer.state.fifoPreds
+            updateDendrogram()
             
-            // Update graph occasionally (every 5 updates or if small) to save perf
-            if updateTrigger % 5 == 0 || (timeline?.embeddingSegments.count ?? 0) < 50 {
-               updateGraph()
-            }
+            // Don't update graph during streaming - it causes lag and isn't visible anyway
+            // Graph will be updated when clustering is triggered
         } catch {
             statusMessage = "Processing error: \(error.localizedDescription)"
             print("Diarizer processing error: \(error)")
+        }
+    }
+
+    private func resetDendrogramState() {
+        ahcBridge.reset()
+        streamedFinalizedEmbeddingSegmentCount = 0
+        dendrogramModel = .empty
+    }
+
+    private func makeBridgeSegments(from segments: [EmbeddingSegment]) -> [AHCEmbeddingSegmentInput] {
+        var converted: [AHCEmbeddingSegmentInput] = []
+        converted.reserveCapacity(segments.count)
+
+        for segment in segments {
+            var embeddings: [AHCEmbeddingSample] = []
+            embeddings.reserveCapacity(segment.embeddings.count)
+
+            for embedding in segment.embeddings where embedding.embedding.count == clusteringEmbeddingDimensions {
+                let vectorData = embedding.embedding.withUnsafeBufferPointer { ptr -> Data in
+                    guard let base = ptr.baseAddress else { return Data() }
+                    return Data(bytes: base, count: ptr.count * MemoryLayout<Float>.size)
+                }
+                guard !vectorData.isEmpty else { continue }
+
+                embeddings.append(
+                    AHCEmbeddingSample(
+                        identifier: embedding.id,
+                        speakerIndex: segment.speakerIndex,
+                        weight: Float(embedding.length),
+                        vectorData: vectorData
+                    )
+                )
+            }
+
+            guard !embeddings.isEmpty else { continue }
+            converted.append(
+                AHCEmbeddingSegmentInput(
+                    speakerIndex: segment.speakerIndex,
+                    embeddings: embeddings
+                )
+            )
+        }
+
+        return converted
+    }
+
+    private func updateDendrogram() {
+        guard let tl = timeline else {
+            dendrogramModel = .empty
+            streamedFinalizedEmbeddingSegmentCount = 0
+            return
+        }
+
+        if tl.embeddingSegments.count < streamedFinalizedEmbeddingSegmentCount {
+            _ = replayFullDendrogramState(from: tl)
+        }
+
+        let newFinalized = Array(tl.embeddingSegments.dropFirst(streamedFinalizedEmbeddingSegmentCount))
+
+        let finalizedSegments = makeBridgeSegments(from: newFinalized)
+        let tentativeSegments = makeBridgeSegments(from: tl.tentativeEmbeddingSegments)
+        let streamedIncremental = ahcBridge.stream(
+            withFinalizedSegments: finalizedSegments,
+            tentativeSegments: tentativeSegments
+        )
+        if streamedIncremental {
+            streamedFinalizedEmbeddingSegmentCount = tl.embeddingSegments.count
+        } else {
+            print("[Dendrogram] Incremental stream failed; replaying full clustering state")
+            _ = replayFullDendrogramState(from: tl)
+        }
+
+        var snapshot = ahcBridge.dendrogramSnapshot()
+        if snapshotHasOutOfRangeMergeDistance(snapshot) {
+            print("[Dendrogram] Out-of-range merge distance detected; replaying full clustering state")
+            _ = replayFullDendrogramState(from: tl)
+            snapshot = ahcBridge.dendrogramSnapshot()
+        }
+        dendrogramModel = AHCDendrogramModel(snapshot: snapshot)
+    }
+
+    @discardableResult
+    private func replayFullDendrogramState(from timeline: SortformerTimeline) -> Bool {
+        ahcBridge.reset()
+        let finalizedSegments = makeBridgeSegments(from: timeline.embeddingSegments)
+        let tentativeSegments = makeBridgeSegments(from: timeline.tentativeEmbeddingSegments)
+        let success = ahcBridge.stream(
+            withFinalizedSegments: finalizedSegments,
+            tentativeSegments: tentativeSegments
+        )
+        if success {
+            print("[Dendrogram] Full replay succeeded (\(timeline.embeddingSegments.count) finalized segments)")
+        } else {
+            print("[Dendrogram] Full replay failed")
+        }
+        streamedFinalizedEmbeddingSegmentCount = success ? timeline.embeddingSegments.count : 0
+        return success
+    }
+
+    private func snapshotHasOutOfRangeMergeDistance(_ snapshot: AHCDendrogramSnapshot) -> Bool {
+        let epsilon: Float = 1e-3
+        return snapshot.nodes.contains { node in
+            node.mergeDistance.isFinite && (node.mergeDistance < -epsilon || node.mergeDistance > 2 + epsilon)
         }
     }
     
@@ -525,19 +690,47 @@ final class DiarizerViewModel: ObservableObject {
     
     // MARK: - Spectral Clustering
     
-    /// Perform spectral clustering on the current embeddings and re-annotate segments
-    /// - Parameter numClusters: Number of clusters (nil = auto-detect using eigengap heuristic)
+    /// Perform clustering on the current embeddings and re-annotate segments
+    /// - Parameters:
+    ///   - method: Clustering method to use
+    ///   - numClusters: Number of clusters (nil = auto-detect using eigengap heuristic)
     /// - Returns: True if clustering was successful
     @discardableResult
-    func performSpectralClustering(numClusters: Int? = nil) -> Bool {
+    func performClustering(method: ClusteringMethod = .constrainedAHC, numClusters: Int? = nil) async -> Bool {
         guard let tl = timeline else {
             statusMessage = "No timeline data for clustering"
             return false
         }
         
-        statusMessage = "Performing spectral clustering..."
+        clusteringProgress = 0.0
+        statusMessage = "Building affinity matrix..."
         
-        let success = embeddingGraphModel.performSpectralClustering(numClusters: numClusters)
+        // Allow UI to update
+        try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+        
+        // First update the graph model with latest embeddings
+        clusteringProgress = 0.2
+        statusMessage = "Updating embeddings..."
+        
+        // Allow UI to update
+        try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+        
+        updateGraph()
+        
+        clusteringProgress = 0.4
+        statusMessage = "Computing \(method.rawValue) clustering..."
+        
+        // Allow UI to update before heavy computation
+        try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+        
+        // Run clustering (both this and graphModel are @MainActor, uses Task.yield internally)
+        let success = await embeddingGraphModel.performClustering(method: method, numClusters: numClusters)
+        
+        clusteringProgress = 0.8
+        statusMessage = "Annotating segments..."
+        
+        // Allow UI to update
+        try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
         
         if success {
             let clusterCount = Set(embeddingGraphModel.nodes.compactMap { $0.clusterLabel }).count
@@ -545,11 +738,13 @@ final class DiarizerViewModel: ObservableObject {
             // Re-annotate segments based on cluster labels
             annotateSegmentsFromClusters(timeline: tl)
             
+            clusteringProgress = 1.0
             statusMessage = "Clustering complete - \(clusterCount) clusters found"
         } else {
             statusMessage = "Clustering failed - not enough embeddings"
         }
         
+        clusteringProgress = nil
         return success
     }
     
