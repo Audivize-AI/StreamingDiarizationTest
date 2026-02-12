@@ -125,7 +125,7 @@ public class SortformerTimeline {
 
         if isComplete {
             // Finalize everything immediately
-            finalize()
+            try finalize()
         }
     }
 
@@ -161,6 +161,7 @@ public class SortformerTimeline {
             // This ensures segments that span the boundary are properly extracted
             let predsToFinalize = chunk.finalizedFrameCount * config.numSpeakers
             var newSegments: [SortformerSegment] = []
+            let oldTentative = tentativeSegments
             
             // Add finalized preds if there are new ones
             if predsToFinalize > 0 {
@@ -180,7 +181,6 @@ public class SortformerTimeline {
             }
             
             tentativePredictions.append(contentsOf: chunk.newPredictions)
-            let oldTentative = tentativeSegments
             
             updateSegments(
                 predictions: tentativePredictions,
@@ -205,7 +205,6 @@ public class SortformerTimeline {
                 old: oldTentative.flatMap(\.self),
                 new: newSegments
             )
-            
             return diff
         }
     }
@@ -424,7 +423,7 @@ public class SortformerTimeline {
             }
         }
         
-        // Use the remaining active segment
+        // Initialize embeddings for the remaining active segment
         if currentSegment.isValid {
             try currentSegment.initializeEmbeddings(
                 with: embeddingManager,
@@ -457,7 +456,7 @@ public class SortformerTimeline {
 
     /// Finalize all tentative data at end of recording
     /// Call this when no more chunks will be added to convert all tentative predictions and segments to finalized
-    public func finalize() {
+    public func finalize() throws {
         framePredictions.append(contentsOf: self.tentativePredictions)
         cursorFrame += numTentative
         tentativePredictions.removeAll()
@@ -477,6 +476,7 @@ public class SortformerTimeline {
         // Finalize tentative embedding segments
         for i in 0..<tentativeEmbeddingSegments.count {
             tentativeEmbeddingSegments[i].isFinalized = true
+            try tentativeEmbeddingSegments[i].initializeEmbeddings(with: embeddingManager, streamingHorizonFrame: cursorFrame)
         }
         embeddingSegments.append(contentsOf: tentativeEmbeddingSegments)
         tentativeEmbeddingSegments.removeAll()
