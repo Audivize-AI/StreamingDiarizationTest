@@ -71,6 +71,9 @@ public struct SortformerConfig: Sendable {
 
     /// Threshold for silence detection (sum of speaker probs)
     public var silenceThreshold: Float = 0.2
+    
+    /// Threshold for speech detection
+    public var speechThreshold: Float = 0.5
 
     /// Threshold for speech prediction
     public var predScoreThreshold: Float = 0.25

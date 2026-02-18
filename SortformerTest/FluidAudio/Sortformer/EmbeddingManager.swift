@@ -116,22 +116,13 @@ public class EmbeddingManager {
                     continue
                 }
                 
-                var embeddingVector = try extractor.extractEmbedding(
+                let embeddingVector = try extractor.extractEmbedding(
                     mels: melFeatures[melStartIndex..<melEndIndex],
                     melLength: paddedMelLength
                 )
                 
-                // Normalize embedding vector
-                var normalizer = 1 / sqrt(vDSP.sumOfSquares(embeddingVector))
-                vDSP_vsmul(
-                    embeddingVector, 1,
-                    &normalizer,
-                    &embeddingVector, 1,
-                    vDSP_Length(embeddingVector.count)
-                )
-                
                 let embedding = SpeakerEmbedding(
-                    unitEmbedding: embeddingVector,
+                    embedding: embeddingVector,
                     startFrame: request.startFrame,
                     endFrame: request.endFrame,
                 )
@@ -173,6 +164,7 @@ public class EmbeddingManager {
         queue.sync(flags: .barrier) {
             for segment in segments {
                 availibleEmbeddings.append(contentsOf: segment.embeddings)
+                segment.clearEmbeddings()
             }
         }
     }

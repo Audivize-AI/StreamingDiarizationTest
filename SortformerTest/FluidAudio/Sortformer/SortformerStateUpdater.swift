@@ -161,6 +161,172 @@ public struct SortformerStateUpdater {
         )
     }
 
+    // MARK: - Remove Speaker
+
+    /// Remove a speaker from the FIFO and speaker cache.
+    ///
+    /// This erases all trace of a speaker slot from the streaming state:
+    /// - **Solo frames** (speaker is the only one active above `silenceThreshold`):
+    ///   The embedding is replaced with `meanSilenceEmbedding` and all speaker
+    ///   predictions for that frame are zeroed, effectively converting it to silence.
+    /// - **Overlap frames** (speaker is active alongside one other speaker):
+    ///   The target speaker's prediction is zeroed, and the embedding is
+    ///   replaced by cycling through the other speaker's solo-frame embeddings,
+    ///   preserving the acoustic temporal structure. Falls back to leaving the
+    ///   embedding unchanged if the other speaker has no solo frames.
+    /// - **Multi-overlap frames** (speaker is active alongside 2+ others):
+    ///   Only the target prediction is zeroed. No clean substitute embedding
+    ///   exists for this case; the entangled embedding still serves the others.
+    /// - **Inactive frames**: The target speaker's prediction column is zeroed everywhere
+    ///   to ensure full suppression even for sub-threshold activations.
+    ///
+    /// - Parameters:
+    ///   - speakerIndex: The speaker slot to remove (0..<numSpeakers)
+    ///   - state: Streaming state (mutated in place)
+    public func removeSpeaker(
+        at speakerIndex: Int,
+        from state: inout SortformerStreamingState
+    ) {
+        let D = config.preEncoderDims
+        let S = config.numSpeakers
+        let threshold = config.speechThreshold
+
+        guard speakerIndex >= 0, speakerIndex < S else { return }
+
+        // Concatenate spkcache + fifo into a single buffer so solo frames in
+        // either region can serve as sources for overlap frames in the other.
+        let spkLen = state.spkcacheLength
+        let fifoLen = state.fifoLength
+        let hasSpkcachePreds = !state.spkcachePreds.isEmpty && spkLen > 0
+
+        let totalFrames: Int
+        var embs: [Float]
+        var preds: [Float]
+
+        if hasSpkcachePreds {
+            totalFrames = spkLen + fifoLen
+            embs = state.spkcache + state.fifo
+            preds = state.spkcachePreds + state.fifoPreds
+        } else {
+            totalFrames = fifoLen
+            embs = state.fifo
+            preds = state.fifoPreds
+        }
+
+        guard totalFrames > 0, !preds.isEmpty else { return }
+
+        // --- Pass 1: Collect solo frame indices per speaker ---
+        var soloFrames = [[Int]](repeating: [], count: S)
+
+        preds.withUnsafeBufferPointer { predsBuf in
+            let p = predsBuf.baseAddress!
+            for frame in 0..<totalFrames {
+                let base = frame &* S
+                var activeCount = 0
+                var activeSpeaker = -1
+                for spk in 0..<S {
+                    if p[base &+ spk] >= threshold {
+                        activeCount &+= 1
+                        activeSpeaker = spk
+                    }
+                }
+                if activeCount == 1 {
+                    soloFrames[activeSpeaker].append(frame)
+                }
+            }
+        }
+
+        var loopPos = [Int](repeating: 0, count: S)
+
+        // --- Pass 2: Scrub frames ---
+        // Solo frames of other speakers only have their target pred zeroed
+        // (embedding untouched), so reading from them for overlap copy is safe.
+        embs.withUnsafeMutableBufferPointer { embsBuf in
+            preds.withUnsafeMutableBufferPointer { predsBuf in
+                state.meanSilenceEmbedding.withUnsafeBufferPointer { silBuf in
+                    let e = embsBuf.baseAddress!
+                    let p = predsBuf.baseAddress!
+                    let sil = silBuf.baseAddress!
+
+                    for frame in 0..<totalFrames {
+                        let predBase = frame &* S
+                        let embBase = frame &* D
+                        let targetActive = p[predBase &+ speakerIndex] >= threshold
+
+                        // Count other active speakers without heap allocation
+                        var otherCount = 0
+                        var firstOtherSpk = 0
+                        if targetActive {
+                            for spk in 0..<S where spk != speakerIndex {
+                                if p[predBase &+ spk] >= threshold {
+                                    otherCount &+= 1
+                                    if otherCount == 1 { firstOtherSpk = spk }
+                                }
+                            }
+                        }
+
+                        if targetActive && otherCount == 0 {
+                            // Solo target → bulk-copy silence embedding, zero preds
+                            (e + embBase).update(from: sil, count: D)
+                            vDSP_vclr(p + predBase, 1, vDSP_Length(S))
+
+                        } else if targetActive && otherCount == 1 {
+                            // Overlap with one speaker → cycle their solo frames
+                            let soloCount = soloFrames[firstOtherSpk].count
+                            if soloCount > 0 {
+                                let srcFrame = soloFrames[firstOtherSpk][loopPos[firstOtherSpk] % soloCount]
+                                loopPos[firstOtherSpk] &+= 1
+                                let srcBase = srcFrame &* D
+                                (e + embBase).update(from: e + srcBase, count: D)
+                            }
+                            p[predBase &+ speakerIndex] = 0
+
+                        } else {
+                            // Multi-overlap or inactive → zero target pred only
+                            p[predBase &+ speakerIndex] = 0
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Pass 3: Compact prediction columns (vectorized) ---
+        // Each speaker slot is a strided column (stride = S).  Use cblas_scopy
+        // to shift entire columns in one BLAS call, then vDSP_vclr with stride
+        // to zero the vacated last column.
+        // e.g. remove slot 1 → [spk0, spk2, spk3, 0]
+        let slotsToMove = S - speakerIndex - 1
+        if slotsToMove > 0 {
+            preds.withUnsafeMutableBufferPointer { predsBuf in
+                let p = predsBuf.baseAddress!
+                let n = Int32(totalFrames)
+                let stride = Int32(S)
+
+                // Shift each column left by one (process in ascending order so
+                // column k-1 is already saved before column k overwrites it).
+                for k in speakerIndex + 1..<S {
+                    cblas_scopy(n, p + k, stride, p + k - 1, stride)
+                }
+
+                // Zero the vacated last column
+                vDSP_vclr(p + (S - 1), vDSP_Stride(S), vDSP_Length(totalFrames))
+            }
+        }
+
+        // --- Split back into spkcache + fifo ---
+        if hasSpkcachePreds {
+            let spkEmbEnd = spkLen &* D
+            let spkPredEnd = spkLen &* S
+            state.spkcache = Array(embs[..<spkEmbEnd])
+            state.spkcachePreds = Array(preds[..<spkPredEnd])
+            state.fifo = Array(embs[spkEmbEnd...])
+            state.fifoPreds = Array(preds[spkPredEnd...])
+        } else {
+            state.fifo = embs
+            state.fifoPreds = preds
+        }
+    }
+
     // MARK: - Silence Profile
 
     /// Update running mean of silence embeddings.

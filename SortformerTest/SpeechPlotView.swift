@@ -28,14 +28,15 @@ struct SpeechPlotView: View {
     /// Segment annotations dictionary
     let segmentAnnotations: [String: String]
     
-    /// Embedding graph model for cross-view selection
-    @ObservedObject var embeddingGraphModel: EmbeddingGraphModel
     
     /// Callback when a segment is clicked (start, end)
     let onPlaySegment: ((Float, Float) -> Void)?
     
     /// Callback when a segment is clicked for annotation
     let onAnnotateSegment: ((SortformerSegment) -> Void)?
+    
+    /// Callback when purge button is tapped for a speaker
+    let onPurgeSpeaker: ((Int) -> Void)?
     
     /// Visible frames in the viewport (determines cell width relative to window)
     private let visibleFrames = max(
@@ -61,6 +62,7 @@ struct SpeechPlotView: View {
     
     /// Hovered segment info for tooltip
     @State private var hoveredSegment: SortformerSegment?
+    @State private var hoveredEmbeddingSegment: EmbeddingSegment?
     @State private var hoverLocation: CGPoint = .zero
     
     // Segment outline colors per speaker
@@ -72,8 +74,8 @@ struct SpeechPlotView: View {
         GeometryReader { geometry in
             let availableHeight = geometry.size.height - 90  // Reserved for title/labels/padding
             let plotHeight = availableHeight / 3.0  // Equal height for all 4 plots
-            // Subtract 49 for Y-axis labels (45) + spacing (4) to get actual plot width
-            let plotWidth = geometry.size.width - 49
+            // Subtract 66 for Y-axis labels (62) + spacing (4) to get actual plot width
+            let plotWidth = geometry.size.width - 66
             
             VStack(alignment: .leading, spacing: 4) {
                 // Title with stats
@@ -88,7 +90,7 @@ struct SpeechPlotView: View {
                 Text("Time (frames, 80ms each) - \(totalFrameCount) total frames")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                    .padding(.leading, 49)
+                    .padding(.leading, 66)
                 
                 // FIFO queue visualization (aligned with main timeline)
                 fifoSection(width: plotWidth, height: plotHeight)
@@ -106,16 +108,28 @@ struct SpeechPlotView: View {
     
     private func mainHeatmapSection(width: CGFloat, height: CGFloat) -> some View {
         HStack(alignment: .top, spacing: 4) {
-            // Y-axis labels
+            // Y-axis labels with purge buttons
             VStack(spacing: 0) {
                 ForEach(0..<numSpeakers, id: \.self) { speaker in
-                    Text("Spk \(speaker)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(maxHeight: .infinity)
+                    HStack(spacing: 2) {
+                        Button(action: {
+                            onPurgeSpeaker?(speaker)
+                        }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 10))
+                                .foregroundColor(speakerColors[speaker % speakerColors.count].opacity(0.7))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Purge speaker \(speaker)")
+
+                        Text("Spk \(speaker)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxHeight: .infinity)
                 }
             }
-            .frame(width: 45, height: max(0, height))
+            .frame(width: 62, height: max(0, height))
             
             // Scrollable heatmap - virtualized chunks
             ScrollViewReader { scrollProxy in
@@ -163,6 +177,7 @@ struct SpeechPlotView: View {
                             // Find segment at hover location
                             guard let tl = timeline else {
                                 hoveredSegment = nil
+                                hoveredEmbeddingSegment = nil
                                 return
                             }
                             let cellHeight = height / CGFloat(numSpeakers)
@@ -170,19 +185,46 @@ struct SpeechPlotView: View {
                             let hoverSpeaker = Int(location.y / cellHeight)
                             
                             // Check finalized segments
+                            var foundSortformerSegment = false
                             if let segment = tl.segments.flatMap(\.self).first(where: {
                                 hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
                             }) {
                                 hoveredSegment = segment
+                                foundSortformerSegment = true
                             } else if let segment = tl.tentativeSegments.flatMap(\.self).first(where: {
                                 hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
                             }) {
                                 hoveredSegment = segment
+                                foundSortformerSegment = true
                             } else {
                                 hoveredSegment = nil
                             }
+                            
+                            // Check embedding segments for IDs (Only if no Sortformer segment covers it)
+                            if !foundSortformerSegment {
+                                // Check finalized (prioritize same speaker, fallback to any)
+                                var embSeg = tl.embeddingSegments.first(where: {
+                                    hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
+                                }) ?? tl.embeddingSegments.first(where: {
+                                    hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame
+                                })
+                                
+                                // Check tentative if not found (prioritize same speaker, fallback to any)
+                                if embSeg == nil {
+                                    embSeg = tl.tentativeEmbeddingSegments.first(where: {
+                                        hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
+                                    }) ?? tl.tentativeEmbeddingSegments.first(where: {
+                                        hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame
+                                    })
+                                }
+                                
+                                hoveredEmbeddingSegment = embSeg
+                            } else {
+                                hoveredEmbeddingSegment = nil
+                            }
                         case .ended:
                             hoveredSegment = nil
+                            hoveredEmbeddingSegment = nil
                         }
                     }
                     .overlay(alignment: .topLeading) {
@@ -191,15 +233,41 @@ struct SpeechPlotView: View {
                             let startStr = String(format: "%.2f", segment.startTime)
                             let endStr = String(format: "%.2f", segment.endTime)
                             let durationStr = String(format: "%.2f", segment.endTime - segment.startTime)
+                            let idStr = segment.id.uuidString.prefix(4)
                             
-                            Text("Spk \(segment.speakerIndex): \(startStr)s - \(endStr)s (\(durationStr)s)")
-                                .font(.caption)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.black.opacity(0.8))
-                                .foregroundColor(.white)
-                                .cornerRadius(4)
-                                .offset(x: hoverLocation.x + 10, y: hoverLocation.y - 30)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Spk \(segment.speakerIndex): \(startStr)s - \(endStr)s (\(durationStr)s)")
+                                Text("ID: \(idStr)")
+                                    .font(.caption2)
+                                    .foregroundColor(.gray)
+                            }
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.black.opacity(0.8))
+                            .foregroundColor(.white)
+                            .cornerRadius(4)
+                            .offset(x: hoverLocation.x + 10, y: hoverLocation.y - 30)
+                        } else if let embSegment = hoveredEmbeddingSegment {
+                            let startStr = String(format: "%.2f", Float(embSegment.startFrame) * 0.08)
+                            let endStr = String(format: "%.2f", Float(embSegment.endFrame) * 0.08)
+                            
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Spk \(embSegment.speakerIndex): \(startStr)s - \(endStr)s")
+                                if !embSegment.segmentIds.isEmpty {
+                                    let ids = embSegment.segmentIds.map { $0.uuidString.prefix(4) }.joined(separator: ", ")
+                                    Text("Speaker: \(embSegment.speakerIndex), IDs: [\(ids)]")
+                                        .font(.caption2)
+                                        .foregroundColor(.gray)
+                                }
+                            }
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.black.opacity(0.8))
+                            .foregroundColor(.white)
+                            .cornerRadius(4)
+                            .offset(x: hoverLocation.x + 10, y: hoverLocation.y - 30)
                         }
                     }
                     .onTapGesture(count: 2) { location in
@@ -224,16 +292,7 @@ struct SpeechPlotView: View {
                         let clickedFrame = Int(location.x / cellWidth)
                         let clickedSpeaker = Int(location.y / cellHeight)
                         
-                        // Check if clicked on an embedding stroke
-                        if let embeddingId = findEmbeddingAtLocation(location, cellWidth: cellWidth, cellHeight: cellHeight, height: height) {
-                            // Toggle selection
-                            if embeddingGraphModel.selectedEmbeddingId == embeddingId {
-                                embeddingGraphModel.selectByEmbeddingId(nil)
-                            } else {
-                                embeddingGraphModel.selectByEmbeddingId(embeddingId)
-                            }
-                            return
-                        }
+
                         
                         // Otherwise, play the segment
                         if let segment = tl.segments.flatMap(\.self).first(where: { 
@@ -582,21 +641,10 @@ struct SpeechPlotView: View {
                 
                 let strokeRect = CGRect(x: x, y: y, width: max(width, 4), height: strokeHeight)
                 
-                // Check if this embedding is selected
-                let isSelected = embeddingGraphModel.selectedEmbeddingId == emb.id
-                
                 // Draw the stroke
                 let path = Path(roundedRect: strokeRect, cornerRadius: 2)
                 
-                if isSelected {
-                    // Highlight selected embedding
-                    context.fill(path, with: .color(speakerColor))
-                    context.stroke(path, with: .color(.white), style: StrokeStyle(lineWidth: 2))
-                    
-                    // Add glow effect
-                    let glowRect = strokeRect.insetBy(dx: -2, dy: -2)
-                    context.fill(Path(roundedRect: glowRect, cornerRadius: 4), with: .color(.white.opacity(0.3)))
-                } else if isTentative {
+                if isTentative {
                     // Tentative embeddings: dashed border, lighter fill
                     context.fill(path, with: .color(speakerColor.opacity(0.4)))
                     context.stroke(path, with: .color(speakerColor), style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))
@@ -1010,9 +1058,9 @@ struct SpeechPlotView: View {
         isRecording: false,
         updateTrigger: 0,
         segmentAnnotations: [:],
-        embeddingGraphModel: EmbeddingGraphModel(),
         onPlaySegment: nil,
-        onAnnotateSegment: nil
+        onAnnotateSegment: nil,
+        onPurgeSpeaker: nil
     )
     .frame(height: 500)
     .padding()

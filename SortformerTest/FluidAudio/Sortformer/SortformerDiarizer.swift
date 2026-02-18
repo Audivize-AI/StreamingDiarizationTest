@@ -161,6 +161,19 @@ public final class SortformerDiarizer {
         featureBuffer.reserveCapacity((config.chunkMelFrames + config.coreFrames) * config.melFeatures)
     }
 
+    /// Remove a speaker from the streaming state (FIFO + speaker cache).
+    ///
+    /// Scrubs all trace of the speaker from the internal buffers so future
+    /// model calls no longer see that speaker's activity.
+    ///
+    /// - Parameter speakerIndex: The speaker slot to remove (0..<numSpeakers)
+    public func removeSpeaker(at speakerIndex: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        stateUpdater.removeSpeaker(at: speakerIndex, from: &_state)
+        _timeline.removeSpeaker(speakerIndex)
+    }
+
     /// Cleanup resources.
     public func cleanup() {
         lock.lock()

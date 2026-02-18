@@ -18,4 +18,12 @@ final class SortformerTimelineTests: XCTestCase {
         // Placeholder test - needs major refactor
         XCTAssertTrue(true)
     }
+    
+    
+    // Scenario: There is a finalized segment for speaker 0 from 0..<T-1 and a tentative segment for speaker 0 from T..<(T+12)
+    // where T is the first tentative frame for Sortformer segments.
+    func testEmbeddingSegmentsWhenSpeakerSegmentFinalized() {
+        
+        
+    }
 }

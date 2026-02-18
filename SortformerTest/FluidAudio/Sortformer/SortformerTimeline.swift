@@ -15,6 +15,18 @@ public class SortformerTimeline {
             self.isSpeaking = Array(repeating: false, count: numSpeakers)
             self.lastSegments = Array(repeating: (0, 0), count: numSpeakers)
         }
+        
+        mutating func resetSlot(at index: Int) {
+            starts[index] = 0
+            isSpeaking[index] = false
+            lastSegments[index] = (0, 0)
+        }
+        
+        mutating func shiftBackSlot(at index: Int) {
+            starts[index-1] = starts[index]
+            isSpeaking[index-1] = isSpeaking[index]
+            lastSegments[index-1] = lastSegments[index]
+        }
     }
     
     /// Post-processing configuration
@@ -163,6 +175,8 @@ public class SortformerTimeline {
             var newSegments: [SortformerSegment] = []
             let oldTentative = tentativeSegments
             
+            let oldFinalizedSegmentCounts = segments.map(\.count)
+            
             // Add finalized preds if there are new ones
             if predsToFinalize > 0 {
                 let finalizedPreds = tentativePredictions.prefix(predsToFinalize)
@@ -193,9 +207,7 @@ public class SortformerTimeline {
             // Clear garbage segment IDs
             segmentIDs.removeAll(keepingCapacity: true)
             
-            // Update disjoint segments - get ALL segments for complete recomputation
-            // We pass 0 to get all segments, then fully replace embeddingSegments
-            try updateEmbeddingSegments(from: newSegments)
+            try updateEmbeddingSegments(from: newSegments, finalizedCutoffs: oldFinalizedSegmentCounts)
             
             // Trim predictions
             trimPredictions()
@@ -206,6 +218,77 @@ public class SortformerTimeline {
                 new: newSegments
             )
             return diff
+        }
+    }
+    
+    /// Remove the speaker at a given index
+    public func removeSpeaker(_ speakerIndex: Int) {
+        queue.sync(flags: .barrier) {
+            let slotsToMove = config.numSpeakers - speakerIndex - 1
+            guard slotsToMove > 0 else {
+                func clearPreds(preds: inout [Float], totalFrames: Int, speakerIndex: Int) {
+                    preds.withUnsafeMutableBufferPointer { predsBuf in
+                        guard let p = predsBuf.baseAddress else { return }
+                        vDSP_vclr(p + speakerIndex, vDSP_Stride(config.numSpeakers), vDSP_Length(totalFrames))
+                    }
+                }
+                
+                clearPreds(preds: &framePredictions, totalFrames: numFinalized, speakerIndex: speakerIndex)
+                clearPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: speakerIndex)
+                segments[speakerIndex].removeAll()
+                tentativeSegments[speakerIndex].removeAll()
+                embeddingSegments.removeAll(where: { $0.speakerIndex == speakerIndex })
+                tentativeEmbeddingSegments.removeAll(where: { $0.speakerIndex == speakerIndex })
+                state.resetSlot(at: speakerIndex)
+                return
+            }
+            
+            func shiftPreds(preds: inout [Float], totalFrames: Int, speakerIndex: Int) {
+                let S = config.numSpeakers
+                preds.withUnsafeMutableBufferPointer { predsBuf in
+                    guard let p = predsBuf.baseAddress else { return }
+                    let n = Int32(totalFrames)
+                    let stride = Int32(S)
+                    
+                    // Shift each column left by one (process in ascending order so
+                    // column k-1 is already saved before column k overwrites it).
+                    for k in speakerIndex + 1..<S {
+                        cblas_scopy(n, p + k, stride, p + k - 1, stride)
+                    }
+                    
+                    // Zero the vacated last column
+                    vDSP_vclr(p + (S - 1), vDSP_Stride(S), vDSP_Length(totalFrames))
+                }
+            }
+            
+            func shiftSegments(segments: inout [[SortformerSegment]], after index: Int) {
+                for speakerIndex in index+1..<config.numSpeakers {
+                    for i in 0..<segments[speakerIndex].count {
+                        segments[speakerIndex][i].speakerIndex -= 1
+                    }
+                    segments[speakerIndex - 1] = segments[speakerIndex]
+                }
+                segments[config.numSpeakers - 1].removeAll()
+            }
+            
+            func shiftEmbeddingSegments(segments: inout [EmbeddingSegment], after index: Int) {
+                segments.removeAll(where: { $0.speakerIndex == index })
+                for i in 0..<segments.count where segments[i].speakerIndex > index {
+                    segments[i].speakerIndex -= 1
+                }
+            }
+            
+            shiftPreds(preds: &framePredictions, totalFrames: numFinalized, speakerIndex: speakerIndex)
+            shiftPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: speakerIndex)
+            shiftSegments(segments: &segments, after: speakerIndex)
+            shiftSegments(segments: &tentativeSegments, after: speakerIndex)
+            shiftEmbeddingSegments(segments: &embeddingSegments, after: speakerIndex)
+            shiftEmbeddingSegments(segments: &tentativeEmbeddingSegments, after: speakerIndex)
+            
+            for i in speakerIndex + 1..<config.numSpeakers {
+                state.shiftBackSlot(at: i)
+            }
+            state.resetSlot(at: config.numSpeakers - 1)
         }
     }
 
@@ -273,7 +356,7 @@ public class SortformerTimeline {
 
                     // Segment is only finalized if it ends BEFORE the tentative boundary
                     // This ensures gap-closer can still merge it with future segments
-                    wasLastSegmentFinal = isFinalized && (end < tentativeStartFrame)
+                    wasLastSegmentFinal = isFinalized && (end <= tentativeStartFrame)
 
                     let newSegment = SortformerSegment(
                         id: segmentIDs.removeValue(forKey: SegmentKey(speakerIndex: speakerIndex, start: start, end: end)),
@@ -306,7 +389,7 @@ public class SortformerTimeline {
                             : tentativeSegments[speakerIndex].popLast()
 
                         if removedItem != nil {
-                            accumulator.removeLast()
+                            _ = accumulator.popLast()
                         }
                     }
                 }
@@ -339,76 +422,118 @@ public class SortformerTimeline {
     }
     
     /// Note: call this AFTER `self.numFrames` has been updated
-    private func updateEmbeddingSegments(from segments: [SortformerSegment]) throws {
+    private func updateEmbeddingSegments(
+        from segments: [SortformerSegment],
+        finalizedCutoffs oldFinalizedSegmentCounts: [Int]
+    ) throws {
         guard !segments.isEmpty else {
             return
         }
         
+        // Recycle old embeddings
+        embeddingManager.returnEmbeddings(from: tentativeEmbeddingSegments)
+        
+        // Compute tentative boundaries
+        let minSegmentGap = embeddingConfig.minSegmentGap
+        
+        let endGap = max(config.minUnpaddedGap, minSegmentGap)
+        let firstTentativeFrame = cursorFrame - endGap
+        let streamingHorizonFrame = cursorFrame + numTentative - endGap
+        
+        var currentSegment: EmbeddingSegment = .none
+        
+        // Add additional finalized segments
+        var segments = segments
+        if let firstTentativeSegment = tentativeEmbeddingSegments.first,
+           firstTentativeSegment.isValid,
+           firstTentativeSegment.startFrame < firstTentativeFrame {
+            
+            let finalizedEnd = oldFinalizedSegmentCounts[firstTentativeSegment.speakerIndex]
+            if let finalizedStart = self.segments[firstTentativeSegment.speakerIndex].prefix(finalizedEnd)
+                    .lastIndex(where: { firstTentativeSegment.startFrame > $0.endFrame })?
+                    .advanced(by: 1),
+               finalizedStart < finalizedEnd
+            {
+                segments.append(contentsOf: self.segments[firstTentativeSegment.speakerIndex][finalizedStart..<finalizedEnd])
+            }
+        }
+        tentativeEmbeddingSegments.removeAll(keepingCapacity: true)
+            
         // Get ordered boundary frames
-        var boundaryFrames: [(frame: Int, speaker: Int, isStart: Bool)] = []
+        var boundaryFrames: [(frame: Int, speakerIndex: Int, isStart: Bool, id: UUID, isFinalized: Bool)] = []
         boundaryFrames.reserveCapacity(segments.count * 2)
         
         for segment in segments {
-            boundaryFrames.append((segment.startFrame, segment.speakerIndex, true))
-            boundaryFrames.append((segment.endFrame, segment.speakerIndex, false))
+            boundaryFrames.append((segment.startFrame, segment.speakerIndex, true, segment.id, segment.isFinalized))
+            boundaryFrames.append((segment.endFrame, segment.speakerIndex, false, segment.id, segment.isFinalized))
         }
         
         // Sort by frame, with ends before starts at the same frame
         // This ensures adjacent segments (one ends where another starts) are handled correctly
         boundaryFrames.sort {
             ($0.frame < $1.frame) ||
-            ($0.frame == $1.frame && $0.isStart)
+            ($0.frame == $1.frame && !$0.isStart)
         }
         
-        // Recycle old embeddings
-        embeddingManager.returnEmbeddings(from: tentativeEmbeddingSegments)
-        tentativeEmbeddingSegments.removeAll(keepingCapacity: true)
+        func appendSegment(_ segment: EmbeddingSegment) throws {
+            guard segment.isValid else {
+                return
+            }
+            
+            // Add embeddings to the segment. It can't be updated anymore.
+            try currentSegment.initializeEmbeddings(
+                with: embeddingManager,
+                streamingHorizonFrame: streamingHorizonFrame
+            )
+            
+            guard !segment.embeddings.isEmpty else {
+                return
+            }
+            
+            // Append the embedding segment
+            if segment.isFinalized {
+                if embeddingSegments.last?.successfullyAbsorbed(segment) != true {
+                    embeddingSegments.append(segment)
+                }
+            } else if tentativeEmbeddingSegments.last?.successfullyAbsorbed(segment) != true {
+                tentativeEmbeddingSegments.append(segment)
+            }
+        }
         
-        // Build the disjoint intervals
-        let minSegmentGap = embeddingConfig.minSegmentGap
+        // Extract non-overlapping segments
+        let firstBoundaryFrame = boundaryFrames.removeFirst()
         
-        let endGap = max(config.minUnpaddedGap, minSegmentGap)
-        let firstTentativeFrame = cursorFrame - endGap
-        let streamingHorizonFrame = cursorFrame + numTentative - endGap
-
-        var currentSegment: EmbeddingSegment = .none
-        var startFrame = boundaryFrames[0].frame
-        var activeIds: Set<Int> = []
+        var activeSpeakerIds: [Int : (id: UUID, finalized: Bool)] = [firstBoundaryFrame.speakerIndex : (firstBoundaryFrame.id, firstBoundaryFrame.isFinalized) ]
+        var startFrame: Int = firstBoundaryFrame.frame
         
-        for (endFrame, speakerIndex, isStart) in boundaryFrames {
+        for (endFrame, speakerIndex, isStart, id, finalized) in boundaryFrames {
             // If exactly one speaker was active, this interval is a single-speaker segment
-            if activeIds.count == 1,
+            if activeSpeakerIds.count == 1,
                endFrame > startFrame,
-               let activeSpeaker = activeIds.first
+               let (activeSpeaker, (activeSegment, isActiveFinalized)) = activeSpeakerIds.first
             {
-                let isFinalized = endFrame <= firstTentativeFrame
+                let isFinalized = isActiveFinalized && endFrame <= firstTentativeFrame
                 
                 if currentSegment.isValid,
                    activeSpeaker == currentSegment.speakerIndex,
-                   startFrame - currentSegment.endFrame < minSegmentGap {
+                   startFrame - currentSegment.endFrame < minSegmentGap
+                {
                     // Merge with the previous segment
                     currentSegment.endFrame = endFrame
-                    currentSegment.isFinalized = isFinalized
-                } else {
-                    // Add embeddings to the last segment. It can't be updated anymore.
-                    if currentSegment.isValid {
-                        try currentSegment.initializeEmbeddings(
-                            with: embeddingManager,
-                            streamingHorizonFrame: streamingHorizonFrame
-                        )
-                        if currentSegment.isFinalized {
-                            embeddingSegments.append(currentSegment)
-                        } else {
-                            tentativeEmbeddingSegments.append(currentSegment)
-                        }
+                    currentSegment.isFinalized = currentSegment.isFinalized && isFinalized
+                    if currentSegment.segmentIds.last != activeSegment {
+                        currentSegment.segmentIds.append(activeSegment)
                     }
+                } else {
+                    try appendSegment(currentSegment)
                     
                     // Make a new segment
                     currentSegment = EmbeddingSegment(
                         speakerIndex: activeSpeaker,
                         startFrame: startFrame,
                         endFrame: endFrame,
-                        finalized: isFinalized
+                        finalized: isFinalized,
+                        segmentId: activeSegment
                     )
                 }
             }
@@ -417,24 +542,14 @@ public class SortformerTimeline {
             startFrame = endFrame
             
             if isStart {
-                activeIds.insert(speakerIndex)
+                activeSpeakerIds[speakerIndex] = (id, finalized)
             } else {
-                activeIds.remove(speakerIndex)
+                activeSpeakerIds.removeValue(forKey: speakerIndex)
             }
         }
         
         // Initialize embeddings for the remaining active segment
-        if currentSegment.isValid {
-            try currentSegment.initializeEmbeddings(
-                with: embeddingManager,
-                streamingHorizonFrame: streamingHorizonFrame
-            )
-            if currentSegment.isFinalized {
-                embeddingSegments.append(currentSegment)
-            } else {
-                tentativeEmbeddingSegments.append(currentSegment)
-            }
-        }
+        try appendSegment(currentSegment)
         
         // Clean up spare embeddings
         embeddingManager.dropFrames(
@@ -512,7 +627,7 @@ public class SortformerTimeline {
 
 /// A single speaker segment from Sortformer
 /// Can be mutated during streaming processing
-public struct SortformerSegment: Sendable, Identifiable, Hashable, Comparable, SpeakerFrameRange {
+public class SortformerSegment: Sendable, Identifiable, Hashable, Comparable, SpeakerFrameRange {
     /// Segment ID
     public var id: UUID
 
@@ -627,14 +742,14 @@ public struct SortformerSegment: Sendable, Identifiable, Hashable, Comparable, S
     }
 
     /// Merge another segment into this one
-    public mutating func absorb<T>(_ other: T)
+    public func absorb<T>(_ other: T)
     where T: SortformerFrameRange {
         self.startFrame = min(self.startFrame, other.startFrame)
         self.endFrame = max(self.endFrame, other.endFrame)
     }
     
     /// Merge another segment into this one
-    public func absorbing<T>(_ other: T) -> Self
+    public func absorbing<T>(_ other: T) -> SortformerSegment
     where T: SortformerFrameRange {
         let startFrame = min(self.startFrame, other.startFrame)
         let endFrame = max(self.endFrame, other.endFrame)
@@ -650,12 +765,12 @@ public struct SortformerSegment: Sendable, Identifiable, Hashable, Comparable, S
     }
 
     /// Extend the end of this segment
-    public mutating func extendEnd(toFrame endFrame: Int) {
+    public func extendEnd(toFrame endFrame: Int) {
         self.endFrame = max(self.endFrame, endFrame)
     }
 
     /// Extend the start of this segment
-    public mutating func extendStart(toFrame startFrame: Int) {
+    public func extendStart(toFrame startFrame: Int) {
         self.startFrame = min(self.startFrame, startFrame)
     }
     

@@ -33,12 +33,6 @@ final class DiarizerViewModel: ObservableObject {
     /// Progress for file processing (0.0 to 1.0), nil when not processing
     @Published private(set) var fileProcessingProgress: Double? = nil
     
-    /// Progress for clustering (0.0 to 1.0), nil when not clustering
-    @Published private(set) var clusteringProgress: Double? = nil
-    
-    /// Embedding graph model for visualization
-    let embeddingGraphModel = EmbeddingGraphModel()
-    
     /// Right context frames for FIFO alignment
     var chunkRightContext: Int {
         globalConfig.chunkRightContext
@@ -72,6 +66,9 @@ final class DiarizerViewModel: ObservableObject {
     )
     private var streamedFinalizedEmbeddingSegmentCount = 0
     private let clusteringEmbeddingDimensions = 192
+    // Keep bridge traffic bounded so replay/incremental catch-up cannot explode memory.
+    private let dendrogramMaxFinalizedReplaySegments = 3000
+    private let dendrogramMaxTentativeReplaySegments = 1500
     
     private let sampleRate: Double = 16000.0
     
@@ -146,8 +143,6 @@ final class DiarizerViewModel: ObservableObject {
         updateTrigger += 1
 
         updateDendrogram()
-        
-        updateGraph()
         
         isRecording = false
         statusMessage = "Ready - Click segments to play"
@@ -282,7 +277,6 @@ final class DiarizerViewModel: ObservableObject {
             updateDendrogram()
             
             fileProcessingProgress = 1.0
-            updateGraph()
             
             let duration = Float(resampledSamples.count) / Float(sampleRate)
             statusMessage = String(format: "Processed %.1fs - Click segments to play", duration)
@@ -516,25 +510,14 @@ final class DiarizerViewModel: ObservableObject {
             embeddings.reserveCapacity(segment.embeddings.count)
 
             for embedding in segment.embeddings where embedding.embedding.count == clusteringEmbeddingDimensions {
-                let vectorData = embedding.embedding.withUnsafeBufferPointer { ptr -> Data in
-                    guard let base = ptr.baseAddress else { return Data() }
-                    return Data(bytes: base, count: ptr.count * MemoryLayout<Float>.size)
-                }
-                guard !vectorData.isEmpty else { continue }
-
-                embeddings.append(
-                    AHCEmbeddingSample(
-                        identifier: embedding.id,
-                        speakerIndex: segment.speakerIndex,
-                        weight: Float(embedding.length),
-                        vectorData: vectorData
-                    )
-                )
+                let swiftPointer = UnsafeRawPointer(Unmanaged.passUnretained(embedding).toOpaque())
+                embeddings.append(AHCEmbeddingSample(swiftEmbeddingPointer: swiftPointer))
             }
 
             guard !embeddings.isEmpty else { continue }
             converted.append(
                 AHCEmbeddingSegmentInput(
+                    segmentIdentifier: segment.id,
                     speakerIndex: segment.speakerIndex,
                     embeddings: embeddings
                 )
@@ -555,6 +538,12 @@ final class DiarizerViewModel: ObservableObject {
             _ = replayFullDendrogramState(from: tl)
         }
 
+        let pendingFinalizedCount = tl.embeddingSegments.count - streamedFinalizedEmbeddingSegmentCount
+        if pendingFinalizedCount > dendrogramMaxFinalizedReplaySegments {
+            print("[Dendrogram] Backlog too large (\(pendingFinalizedCount)); replaying capped window")
+            _ = replayFullDendrogramState(from: tl)
+        }
+
         let newFinalized = Array(tl.embeddingSegments.dropFirst(streamedFinalizedEmbeddingSegmentCount))
 
         let finalizedSegments = makeBridgeSegments(from: newFinalized)
@@ -571,8 +560,8 @@ final class DiarizerViewModel: ObservableObject {
         }
 
         var snapshot = ahcBridge.dendrogramSnapshot()
-        if snapshotHasOutOfRangeMergeDistance(snapshot) {
-            print("[Dendrogram] Out-of-range merge distance detected; replaying full clustering state")
+        if snapshotHasInvalidMergeDistance(snapshot) {
+            print("[Dendrogram] Invalid merge distance detected; replaying full clustering state")
             _ = replayFullDendrogramState(from: tl)
             snapshot = ahcBridge.dendrogramSnapshot()
         }
@@ -582,8 +571,10 @@ final class DiarizerViewModel: ObservableObject {
     @discardableResult
     private func replayFullDendrogramState(from timeline: SortformerTimeline) -> Bool {
         ahcBridge.reset()
-        let finalizedSegments = makeBridgeSegments(from: timeline.embeddingSegments)
-        let tentativeSegments = makeBridgeSegments(from: timeline.tentativeEmbeddingSegments)
+        let finalizedWindow = Array(timeline.embeddingSegments.suffix(dendrogramMaxFinalizedReplaySegments))
+        let tentativeWindow = Array(timeline.tentativeEmbeddingSegments.suffix(dendrogramMaxTentativeReplaySegments))
+        let finalizedSegments = makeBridgeSegments(from: finalizedWindow)
+        let tentativeSegments = makeBridgeSegments(from: tentativeWindow)
         let success = ahcBridge.stream(
             withFinalizedSegments: finalizedSegments,
             tentativeSegments: tentativeSegments
@@ -597,28 +588,10 @@ final class DiarizerViewModel: ObservableObject {
         return success
     }
 
-    private func snapshotHasOutOfRangeMergeDistance(_ snapshot: AHCDendrogramSnapshot) -> Bool {
-        let epsilon: Float = 1e-3
+    private func snapshotHasInvalidMergeDistance(_ snapshot: AHCDendrogramSnapshot) -> Bool {
         return snapshot.nodes.contains { node in
-            node.mergeDistance.isFinite && (node.mergeDistance < -epsilon || node.mergeDistance > 2 + epsilon)
+            !node.mergeDistance.isFinite
         }
-    }
-    
-    /// Update the embedding graph model from the current timeline
-    private func updateGraph() {
-        guard let tl = timeline else { return }
-        
-        // Combine finalized and tentative embedding segments
-        let allEmbeddingSegments = tl.embeddingSegments + tl.tentativeEmbeddingSegments
-        
-        #if DEBUG
-        let segCount = allEmbeddingSegments.count
-        let embCount = allEmbeddingSegments.reduce(0) { $0 + $1.embeddings.count }
-        print("[Graph] Updating with \(segCount) segments (\(tl.embeddingSegments.count) finalized, \(tl.tentativeEmbeddingSegments.count) tentative), \(embCount) total embeddings")
-        #endif
-        
-        // Run on main actor (already on main actor)
-        embeddingGraphModel.update(from: allEmbeddingSegments)
     }
     
     /// Print all segments in CSV format: speaker_id,start_time,end_time
@@ -640,6 +613,25 @@ final class DiarizerViewModel: ObservableObject {
         print("--- End Segments (\(allSegments.count) total) ---\n")
     }
     
+    // MARK: - Speaker Purge
+
+    /// Remove a speaker from the streaming state and refresh the UI.
+    ///
+    /// This scrubs the speaker's activity from the FIFO and speaker cache so
+    /// future model passes no longer see that speaker.
+    func purgeSpeaker(at speakerIndex: Int) {
+        guard let diarizer = diarizer else { return }
+
+        diarizer.removeSpeaker(at: speakerIndex)
+
+        // Refresh cached predictions for UI
+        spkcachePreds = diarizer.state.spkcachePreds
+        fifoPreds = diarizer.state.fifoPreds
+        updateTrigger += 1
+
+        statusMessage = "Purged speaker \(speakerIndex) from streaming state"
+    }
+
     // MARK: - Segment Annotation
     
     /// Generate a unique key for a segment
@@ -685,122 +677,6 @@ final class DiarizerViewModel: ObservableObject {
             statusMessage = "Exported \(allSegments.count) segments to \(url.lastPathComponent)"
         } catch {
             statusMessage = "Export failed: \(error.localizedDescription)"
-        }
-    }
-    
-    // MARK: - Spectral Clustering
-    
-    /// Perform clustering on the current embeddings and re-annotate segments
-    /// - Parameters:
-    ///   - method: Clustering method to use
-    ///   - numClusters: Number of clusters (nil = auto-detect using eigengap heuristic)
-    /// - Returns: True if clustering was successful
-    @discardableResult
-    func performClustering(method: ClusteringMethod = .constrainedAHC, numClusters: Int? = nil) async -> Bool {
-        guard let tl = timeline else {
-            statusMessage = "No timeline data for clustering"
-            return false
-        }
-        
-        clusteringProgress = 0.0
-        statusMessage = "Building affinity matrix..."
-        
-        // Allow UI to update
-        try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
-        
-        // First update the graph model with latest embeddings
-        clusteringProgress = 0.2
-        statusMessage = "Updating embeddings..."
-        
-        // Allow UI to update
-        try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
-        
-        updateGraph()
-        
-        clusteringProgress = 0.4
-        statusMessage = "Computing \(method.rawValue) clustering..."
-        
-        // Allow UI to update before heavy computation
-        try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
-        
-        // Run clustering (both this and graphModel are @MainActor, uses Task.yield internally)
-        let success = await embeddingGraphModel.performClustering(method: method, numClusters: numClusters)
-        
-        clusteringProgress = 0.8
-        statusMessage = "Annotating segments..."
-        
-        // Allow UI to update
-        try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
-        
-        if success {
-            let clusterCount = Set(embeddingGraphModel.nodes.compactMap { $0.clusterLabel }).count
-            
-            // Re-annotate segments based on cluster labels
-            annotateSegmentsFromClusters(timeline: tl)
-            
-            clusteringProgress = 1.0
-            statusMessage = "Clustering complete - \(clusterCount) clusters found"
-        } else {
-            statusMessage = "Clustering failed - not enough embeddings"
-        }
-        
-        clusteringProgress = nil
-        return success
-    }
-    
-    /// Annotate segments based on cluster assignments from the embedding graph
-    /// Uses voting: each embedding votes for its cluster, segment gets majority label
-    private func annotateSegmentsFromClusters(timeline tl: SortformerTimeline) {
-        // Build a map from embedding ID to cluster label
-        var embeddingToCluster: [UUID: Int] = [:]
-        for node in embeddingGraphModel.nodes {
-            if let clusterLabel = node.clusterLabel {
-                embeddingToCluster[node.embeddingId] = clusterLabel
-            }
-        }
-        
-        guard !embeddingToCluster.isEmpty else { return }
-        
-        // Clear existing annotations (only cluster-generated ones)
-        // We'll use "Cluster X" format to distinguish from user-provided annotations
-        let clusterPrefix = "Cluster "
-        for key in segmentAnnotations.keys {
-            if let value = segmentAnnotations[key], value.hasPrefix(clusterPrefix) {
-                segmentAnnotations.removeValue(forKey: key)
-            }
-        }
-        
-        // For each segment, find matching embeddings and vote on cluster
-        let allSegments = tl.segments.flatMap { $0 }
-        
-        for segment in allSegments {
-            // Find embeddings that overlap with this segment
-            var clusterVotes: [Int: Int] = [:]
-            
-            for node in embeddingGraphModel.nodes {
-                // Check if this embedding overlaps with the segment
-                let nodeStart = node.startFrame
-                let nodeEnd = node.endFrame
-                
-                // Check overlap: segments overlap if one starts before other ends
-                if nodeStart < segment.endFrame && nodeEnd > segment.startFrame {
-                    // Same speaker?
-                    if node.speakerIndex == segment.speakerIndex {
-                        if let cluster = node.clusterLabel {
-                            clusterVotes[cluster, default: 0] += 1
-                        }
-                    }
-                }
-            }
-            
-            // Assign the majority cluster label
-            if let (bestCluster, _) = clusterVotes.max(by: { $0.value < $1.value }) {
-                let key = Self.segmentKey(segment)
-                // Only set if no user annotation exists
-                if segmentAnnotations[key] == nil || segmentAnnotations[key]?.hasPrefix(clusterPrefix) == true {
-                    segmentAnnotations[key] = "\(clusterPrefix)\(bestCluster)"
-                }
-            }
         }
     }
 }

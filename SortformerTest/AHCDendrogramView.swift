@@ -11,6 +11,7 @@ private enum DendrogramPalette {
     static let grid = Color(red: 0.29, green: 0.43, blue: 0.57)
     static let threshold = Color(red: 0.84, green: 0.23, blue: 0.16)
     static let thresholdText = Color(red: 0.50, green: 0.17, blue: 0.13)
+    static let thresholdExceeded = Color(red: 0.52, green: 0.55, blue: 0.60)
     static let rootHalo = Color(red: 0.08, green: 0.64, blue: 0.77)
     static let unknownSpeaker = Color(red: 0.42, green: 0.46, blue: 0.54)
     static let speakerSwatches: [Color] = [
@@ -252,7 +253,7 @@ struct AHCDendrogramView: View {
                 lineWidth: step == 0 ? 1.0 : 0.7
             )
 
-            let distance = layout.maxDistance * Float(ratio)
+            let distance = layout.minDistance + (layout.maxDistance - layout.minDistance) * Float(ratio)
             let tickLabel = Text(String(format: "%.2f", distance))
                 .font(.system(size: 9, weight: .medium, design: .monospaced))
                 .foregroundColor(DendrogramPalette.subtitle.opacity(0.95))
@@ -267,6 +268,9 @@ struct AHCDendrogramView: View {
         var regularPathsBySpeaker: [Int: Path] = [:]
         var mustLinkPathsBySpeaker: [Int: Path] = [:]
         var mergeDotsBySpeaker: [Int: Path] = [:]
+        var thresholdExceededRegularPath = Path()
+        var thresholdExceededMustLinkPath = Path()
+        var thresholdExceededMergeDots = Path()
 
         for branch in layout.branches {
             guard
@@ -278,19 +282,41 @@ struct AHCDendrogramView: View {
             }
 
             let speakerIndex = layout.dominantSpeakerByNodeId[branch.parent] ?? -1
-            if layout.mustLinkNodeIds.contains(branch.parent) {
-                var path = mustLinkPathsBySpeaker[speakerIndex] ?? Path()
-                appendBranch(to: &path, parentPoint: parentPoint, leftPoint: leftPoint, rightPoint: rightPoint)
-                mustLinkPathsBySpeaker[speakerIndex] = path
+            let exceedsLinkageThreshold = layout.thresholdExceededNodeIds.contains(branch.parent)
+            if exceedsLinkageThreshold {
+                if layout.mustLinkNodeIds.contains(branch.parent) {
+                    appendBranch(
+                        to: &thresholdExceededMustLinkPath,
+                        parentPoint: parentPoint,
+                        leftPoint: leftPoint,
+                        rightPoint: rightPoint
+                    )
+                } else {
+                    appendBranch(
+                        to: &thresholdExceededRegularPath,
+                        parentPoint: parentPoint,
+                        leftPoint: leftPoint,
+                        rightPoint: rightPoint
+                    )
+                }
+                thresholdExceededMergeDots.addEllipse(
+                    in: CGRect(x: parentPoint.x - 2.0, y: parentPoint.y - 2.0, width: 4.0, height: 4.0)
+                )
             } else {
-                var path = regularPathsBySpeaker[speakerIndex] ?? Path()
-                appendBranch(to: &path, parentPoint: parentPoint, leftPoint: leftPoint, rightPoint: rightPoint)
-                regularPathsBySpeaker[speakerIndex] = path
-            }
+                if layout.mustLinkNodeIds.contains(branch.parent) {
+                    var path = mustLinkPathsBySpeaker[speakerIndex] ?? Path()
+                    appendBranch(to: &path, parentPoint: parentPoint, leftPoint: leftPoint, rightPoint: rightPoint)
+                    mustLinkPathsBySpeaker[speakerIndex] = path
+                } else {
+                    var path = regularPathsBySpeaker[speakerIndex] ?? Path()
+                    appendBranch(to: &path, parentPoint: parentPoint, leftPoint: leftPoint, rightPoint: rightPoint)
+                    regularPathsBySpeaker[speakerIndex] = path
+                }
 
-            var dotPath = mergeDotsBySpeaker[speakerIndex] ?? Path()
-            dotPath.addEllipse(in: CGRect(x: parentPoint.x - 2.0, y: parentPoint.y - 2.0, width: 4.0, height: 4.0))
-            mergeDotsBySpeaker[speakerIndex] = dotPath
+                var dotPath = mergeDotsBySpeaker[speakerIndex] ?? Path()
+                dotPath.addEllipse(in: CGRect(x: parentPoint.x - 2.0, y: parentPoint.y - 2.0, width: 4.0, height: 4.0))
+                mergeDotsBySpeaker[speakerIndex] = dotPath
+            }
         }
 
         for speakerIndex in regularPathsBySpeaker.keys.sorted() {
@@ -311,10 +337,22 @@ struct AHCDendrogramView: View {
             )
         }
 
+        context.stroke(
+            thresholdExceededRegularPath,
+            with: .color(DendrogramPalette.thresholdExceeded.opacity(0.95)),
+            style: StrokeStyle(lineWidth: 1.9, lineCap: .round, lineJoin: .round)
+        )
+        context.stroke(
+            thresholdExceededMustLinkPath,
+            with: .color(DendrogramPalette.thresholdExceeded),
+            style: StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round, dash: [6, 4])
+        )
+
         for speakerIndex in mergeDotsBySpeaker.keys.sorted() {
             guard let dotPath = mergeDotsBySpeaker[speakerIndex] else { continue }
             context.fill(dotPath, with: .color(DendrogramPalette.speakerColor(index: speakerIndex).opacity(0.92)))
         }
+        context.fill(thresholdExceededMergeDots, with: .color(DendrogramPalette.thresholdExceeded))
 
         var leafDotsBySpeaker: [Int: Path] = [:]
         for nodeId in layout.leafNodeIds {
@@ -332,7 +370,12 @@ struct AHCDendrogramView: View {
 
         if let rootPoint = layout.points[model.rootIndex] {
             let rootSpeakerIndex = layout.dominantSpeakerByNodeId[model.rootIndex] ?? -1
-            let rootColor = DendrogramPalette.speakerColor(index: rootSpeakerIndex)
+            let rootColor: Color
+            if layout.thresholdExceededNodeIds.contains(model.rootIndex) {
+                rootColor = DendrogramPalette.thresholdExceeded
+            } else {
+                rootColor = DendrogramPalette.speakerColor(index: rootSpeakerIndex)
+            }
             let haloRect = CGRect(x: rootPoint.x - 6.0, y: rootPoint.y - 6.0, width: 12.0, height: 12.0)
             context.fill(Path(ellipseIn: haloRect), with: .color(rootColor.opacity(0.20)))
             let markerRect = CGRect(x: rootPoint.x - 2.7, y: rootPoint.y - 2.7, width: 5.4, height: 5.4)
@@ -382,11 +425,13 @@ private struct DendrogramLayout {
     let points: [Int: CGPoint]
     let branches: [DendrogramBranch]
     let mustLinkNodeIds: Set<Int>
+    let minDistance: Float
     let maxDistance: Float
     let plotRect: CGRect
     let leafNodeIds: [Int]
     let dominantSpeakerByNodeId: [Int: Int]
     let leafSpeakerByNodeId: [Int: Int]
+    let thresholdExceededNodeIds: Set<Int>
 
     init?(model: AHCDendrogramModel, size: CGSize) {
         guard !model.isEmpty else {
@@ -418,11 +463,14 @@ private struct DendrogramLayout {
             return nil
         }
 
-        let maxInternalDistance = reachable.compactMap { id -> Float? in
-            guard let node = nodesById[id], !node.isLeaf else { return nil }
-            return max(0, node.mergeDistance)
-        }.max() ?? 0
-        let normalizedMaxDistance = max(maxInternalDistance, 1e-6)
+        let internalMergeDistances = reachable.compactMap { id -> Float? in
+            guard let node = nodesById[id], !node.isLeaf, node.mergeDistance.isFinite else { return nil }
+            return node.mergeDistance
+        }
+        let minInternalDistance = internalMergeDistances.min() ?? 0
+        let maxInternalDistance = internalMergeDistances.max() ?? minInternalDistance
+        let distanceSpan = max(maxInternalDistance - minInternalDistance, 1e-6)
+        let hasDistanceVariance = (maxInternalDistance - minInternalDistance) > 1e-6
 
         var logicalX: [Int: CGFloat] = [:]
         var normalizedY: [Int: CGFloat] = [:]
@@ -458,8 +506,15 @@ private struct DendrogramLayout {
             let leftX = assignCoordinates(nodeId: node.leftChild, path: &path)
             let rightX = assignCoordinates(nodeId: node.rightChild, path: &path)
             let x = (leftX + rightX) * 0.5
+            let finiteDistance = node.mergeDistance.isFinite ? node.mergeDistance : minInternalDistance
+            let normalizedDistance: Float
+            if hasDistanceVariance {
+                normalizedDistance = (finiteDistance - minInternalDistance) / distanceSpan
+            } else {
+                normalizedDistance = 1
+            }
             logicalX[nodeId] = x
-            normalizedY[nodeId] = CGFloat(max(0, node.mergeDistance) / normalizedMaxDistance)
+            normalizedY[nodeId] = CGFloat(min(max(normalizedDistance, 0), 1))
             branches.append(DendrogramBranch(parent: nodeId, left: node.leftChild, right: node.rightChild))
             return x
         }
@@ -588,17 +643,23 @@ private struct DendrogramLayout {
         self.points = points
         self.branches = branches
         self.mustLinkNodeIds = Set(model.nodes.filter(\AHCDendrogramNodeModel.mustLink).map(\AHCDendrogramNodeModel.id))
+        self.minDistance = minInternalDistance
         self.maxDistance = maxInternalDistance
         self.plotRect = plotRect
         self.leafNodeIds = uniqueLeafNodeIds
         self.dominantSpeakerByNodeId = dominantSpeakerByNodeId
         self.leafSpeakerByNodeId = leafSpeakerByNodeId
+        self.thresholdExceededNodeIds = Set(
+            model.nodes
+                .filter(\.exceedsLinkageThreshold)
+                .map(\.id)
+        )
     }
 
     func distance(atY y: CGFloat) -> Float {
         let clampedY = min(max(y, plotRect.minY), plotRect.maxY)
         let normalized = 1 - ((clampedY - plotRect.minY) / max(plotRect.height, 1))
         let ratio = max(0, min(1, normalized))
-        return maxDistance * Float(ratio)
+        return minDistance + (maxDistance - minDistance) * Float(ratio)
     }
 }

@@ -50,11 +50,6 @@
 			path = SortformerTestUITests;
 			sourceTree = "<group>";
 		};
-		D868BE152F281F9900E2C7D3 /* Clustering */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = Clustering;
-			sourceTree = "<group>";
-		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -86,7 +81,6 @@
 		D831B4992F0239600089CDFA = {
 			isa = PBXGroup;
 			children = (
-				D868BE152F281F9900E2C7D3 /* Clustering */,
 				D831B4A42F0239600089CDFA /* SortformerTest */,
 				D831B4B42F0239610089CDFA /* SortformerTestTests */,
 				D831B4BE2F0239610089CDFA /* SortformerTestUITests */,
@@ -130,7 +124,6 @@
 			);
 			fileSystemSynchronizedGroups = (
 				D831B4A42F0239600089CDFA /* SortformerTest */,
-				D868BE152F281F9900E2C7D3 /* Clustering */,
 			);
 			name = SortformerTest;
 			packageProductDependencies = (
@@ -445,6 +438,14 @@
 				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
 				ENABLE_RESOURCE_ACCESS_USB = NO;
 				ENABLE_USER_SELECTED_FILES = readwrite;
+				EXCLUDED_SOURCE_FILE_NAMES = (
+					"$(inherited)",
+					SortformerTest/FluidAudio/Clustering/Old/Dendrogram.cpp,
+					SortformerTest/FluidAudio/Clustering/Old/Embedding.cpp,
+					SortformerTest/FluidAudio/Clustering/Old/EmbeddingDistanceMatrix.cpp,
+					SortformerTest/FluidAudio/Clustering/Old/SpeakerForest.cpp,
+					SortformerTest/FluidAudio/Clustering/Old/Uuid.mm,
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/SortformerTest/UMAP/include";
 				INFOPLIST_KEY_CFBundleDisplayName = "Diarization Test";
@@ -493,6 +494,14 @@
 				ENABLE_RESOURCE_ACCESS_PRINTING = NO;
 				ENABLE_RESOURCE_ACCESS_USB = NO;
 				ENABLE_USER_SELECTED_FILES = readwrite;
+				EXCLUDED_SOURCE_FILE_NAMES = (
+					"$(inherited)",
+					SortformerTest/FluidAudio/Clustering/Old/Dendrogram.cpp,
+					SortformerTest/FluidAudio/Clustering/Old/Embedding.cpp,
+					SortformerTest/FluidAudio/Clustering/Old/EmbeddingDistanceMatrix.cpp,
+					SortformerTest/FluidAudio/Clustering/Old/SpeakerForest.cpp,
+					SortformerTest/FluidAudio/Clustering/Old/Uuid.mm,
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/SortformerTest/UMAP/include";
 				INFOPLIST_KEY_CFBundleDisplayName = "Diarization Test";

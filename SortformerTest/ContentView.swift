@@ -13,11 +13,6 @@ struct ContentView: View {
     @State private var selectedSegment: SortformerSegment?
     @State private var annotationText = ""
     
-    // Cluster slider state
-    @State private var clusterSliderValue: Double = 2
-    
-    // Clustering method selection
-    @State private var selectedClusteringMethod: ClusteringMethod = .constrainedAHC
     
     var body: some View {
         VStack(spacing: 16) {
@@ -42,18 +37,6 @@ struct ContentView: View {
                         ProgressView(value: fileProgress)
                             .frame(width: 100)
                         Text("\(Int(fileProgress * 100))%")
-                            .font(.caption.monospacedDigit())
-                            .foregroundColor(.secondary)
-                            .frame(width: 35)
-                    }
-                } else if let clusterProgress = viewModel.clusteringProgress {
-                    HStack(spacing: 8) {
-                        Text("Clustering:")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        ProgressView(value: clusterProgress)
-                            .frame(width: 100)
-                        Text("\(Int(clusterProgress * 100))%")
                             .font(.caption.monospacedDigit())
                             .foregroundColor(.secondary)
                             .frame(width: 35)
@@ -85,7 +68,6 @@ struct ContentView: View {
                         isRecording: viewModel.isRecording,
                         updateTrigger: viewModel.updateTrigger,
                         segmentAnnotations: viewModel.segmentAnnotations,
-                        embeddingGraphModel: viewModel.embeddingGraphModel,
                         onPlaySegment: { start, end in
                             viewModel.playSegment(startTime: start, endTime: end)
                         },
@@ -94,6 +76,9 @@ struct ContentView: View {
                             selectedSegment = segment
                             annotationText = viewModel.getAnnotation(for: segment) ?? ""
                             showingAnnotationDialog = true
+                        },
+                        onPurgeSpeaker: { speakerIndex in
+                            viewModel.purgeSpeaker(at: speakerIndex)
                         }
                     )
                     
@@ -121,82 +106,11 @@ struct ContentView: View {
                 AHCDendrogramView(model: viewModel.dendrogramModel)
                     .frame(minWidth: 320, maxWidth: 440, maxHeight: .infinity)
                     .padding(.leading, 12)
-                
-                // Right side: Cluster Plot (only shown after clustering)
-                if viewModel.embeddingGraphModel.isClusterPlotVisible {
-                    VStack(spacing: 8) {
-                        ClusterPlotView(
-                            model: viewModel.embeddingGraphModel,
-                            onSelectNode: { startFrame, endFrame, speakerIndex in
-                                // Navigate to the corresponding streak on the timeline
-                                let startTime = Float(startFrame) * 0.08
-                                let endTime = Float(endFrame) * 0.08
-                                viewModel.playSegment(startTime: startTime, endTime: endTime)
-                            },
-                            onClose: {
-                                viewModel.embeddingGraphModel.isClusterPlotVisible = false
-                            }
-                        )
-                        
-                        // Cluster count slider
-                        VStack(spacing: 4) {
-                            HStack {
-                                Text("Clusters:")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                
-                                Slider(
-                                    value: $clusterSliderValue,
-                                    in: 2...Double(viewModel.embeddingGraphModel.maxClusterCount),
-                                    step: 1
-                                )
-                                .frame(maxWidth: 150)
-                                
-                                Text("\(Int(clusterSliderValue))")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundColor(.secondary)
-                                    .frame(width: 24)
-                                
-                                Button("Apply") {
-                                    Task {
-                                        await viewModel.performClustering(method: selectedClusteringMethod, numClusters: Int(clusterSliderValue))
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .font(.caption)
-                                
-                                Button("Auto") {
-                                    clusterSliderValue = Double(viewModel.embeddingGraphModel.eigengapOptimalK)
-                                    Task {
-                                        await viewModel.performClustering(method: selectedClusteringMethod)
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .font(.caption)
-                                .help("Use eigengap heuristic for optimal cluster count")
-                            }
-                            
-                            // Method picker
-                            Picker("Method:", selection: $selectedClusteringMethod) {
-                                ForEach(ClusteringMethod.allCases, id: \.self) { method in
-                                    Text(method.rawValue).tag(method)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .frame(maxWidth: 250)
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.bottom, 4)
-                    }
-                    .frame(minWidth: 350, maxWidth: 500, maxHeight: .infinity)
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-                }
             }
             .padding(.horizontal)
             .onDrop(of: [.audio, .fileURL], isTargeted: $isDragOver) { providers in
                 handleDrop(providers: providers)
             }
-            .animation(.easeInOut(duration: 0.3), value: viewModel.embeddingGraphModel.isClusterPlotVisible)
             
             // Control buttons
             HStack(spacing: 16) {
@@ -276,29 +190,7 @@ struct ContentView: View {
                 .disabled(viewModel.isRecording || viewModel.timeline == nil)
                 .buttonStyle(.plain)
                 
-                // Spectral Clustering button
-                Button(action: {
-                    Task {
-                        let success = await viewModel.performClustering(method: selectedClusteringMethod)
-                        if success {
-                            clusterSliderValue = Double(viewModel.embeddingGraphModel.eigengapOptimalK)
-                            viewModel.embeddingGraphModel.isClusterPlotVisible = true
-                        }
-                    }
-                }) {
-                    HStack {
-                        Image(systemName: "circle.hexagongrid.fill")
-                        Text("Cluster")
-                    }
-                    .font(.headline)
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 10)
-                    .background(Color.indigo)
-                    .cornerRadius(8)
-                }
-                .disabled(viewModel.isRecording || viewModel.timeline == nil)
-                .buttonStyle(.plain)
+
             }
             .padding(.bottom)
         }

@@ -10,6 +10,7 @@ struct AHCDendrogramNodeModel: Identifiable, Hashable {
     let weight: Float
     let mergeDistance: Float
     let mustLink: Bool
+    let exceedsLinkageThreshold: Bool
 
     var isLeaf: Bool {
         leftChild < 0 || rightChild < 0
@@ -42,7 +43,8 @@ struct AHCDendrogramModel: Equatable {
                 count: node.count,
                 weight: node.weight,
                 mergeDistance: node.mergeDistance,
-                mustLink: node.mustLink
+                mustLink: node.mustLink,
+                exceedsLinkageThreshold: node.exceedsLinkageThreshold
             )
         }
         self.updatedAt = Date()
@@ -55,7 +57,10 @@ struct AHCDendrogramModel: Equatable {
     }
 
     var maxMergeDistance: Float {
-        nodes.reduce(0) { max($0, $1.mergeDistance) }
+        nodes
+            .filter { !$0.isLeaf && $0.mergeDistance.isFinite }
+            .map(\.mergeDistance)
+            .max() ?? 0
     }
 
     var nodesById: [Int: AHCDendrogramNodeModel] {

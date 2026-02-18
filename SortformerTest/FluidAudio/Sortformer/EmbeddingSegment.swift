@@ -2,8 +2,6 @@
 //  SortformerSegmentEmbeddings.swift
 //  SortformerTest
 //
-//  Created by Benjamin Lee on 1/15/26.
-//
 
 import Foundation
 import Accelerate
@@ -25,37 +23,44 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
     public let frames: Range<Int>
     
     /// The actual embedding vector
-    public let embedding: [Float]
+    public let embedding: UnsafeMutableBufferPointer<Float>
+    
+    /// Number of features in the embedding vector
+    public var count: Int { embedding.count }
     
     /// Length in frames
     public var length: Int { frames.count }
     
-    public init(unitEmbedding: [Float], startFrame: Int, endFrame: Int) {
-        self.id = UUID()
-        self.embedding = unitEmbedding
+    public init(id: UUID = UUID(), unitEmbedding: [Float], startFrame: Int, endFrame: Int) {
+        self.id = id
         self.frames = startFrame..<endFrame
+        self.embedding = UnsafeMutableBufferPointer<Float>.allocate(capacity: unitEmbedding.count)
+        _ = self.embedding.initialize(from: unitEmbedding)
     }
     
-    public init(embedding: inout [Float], startFrame: Int, endFrame: Int) {
-        self.id = UUID()
-        var normalizer = 1 / sqrt(vDSP.sumOfSquares(embedding))
-        vDSP_vsmul(
-            embedding, 1,
-            &normalizer,
-            &embedding, 1,
-            vDSP_Length(embedding.count)
-        )
-        self.embedding = embedding
+    public init(id: UUID = UUID(), embedding: [Float], startFrame: Int, endFrame: Int) {
+        self.id = id
         self.frames = startFrame..<endFrame
+        self.embedding = UnsafeMutableBufferPointer<Float>.allocate(capacity: embedding.count)
+        
+        // Normalize the embedding vector
+        var normalizer = 1 / sqrt(vDSP.sumOfSquares(embedding))
+        vDSP_vsmul(embedding, 1, &normalizer,
+                   self.embedding.baseAddress!, 1,
+                   vDSP_Length(embedding.count))
+    }
+    
+    deinit {
+        self.embedding.deallocate()
     }
     
     /// Get the cosine distance to another embedding
     public func cosineDistance(to other: SpeakerEmbedding) -> Float {
-        let length = vDSP_Length(self.embedding.count)
+        let length = vDSP_Length(embedding.count)
         var dot: Float = 0
         vDSP_dotpr(
-            self.embedding, 1,
-            other.embedding, 1,
+            self.embedding.baseAddress!, 1,
+            other.embedding.baseAddress!, 1,
             &dot, length
         )
         return 1.0 - dot
@@ -107,10 +112,10 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
 /// Tracks embeddings for a disjoint segment
 public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// Segment ID
-    public private(set) var id: UUID = UUID(uuid: (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0))
+    public private(set) var id: UUID = .zero
 
     /// Speaker index in Sortformer output
-    public let speakerIndex: Int
+    public var speakerIndex: Int
 
     /// Index of segment start frame
     public var startFrame: Int
@@ -130,23 +135,43 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// Extracted embedding regions for this segment
     public private(set) var embeddings: ContiguousArray<SpeakerEmbedding>
     
+    /// IDs of the corresponding `SortformerSegments`
+    public var segmentIds: ContiguousArray<UUID>
+    
     public var isNone: Bool { speakerIndex < 0 }
     public var isValid: Bool { speakerIndex >= 0 }
     
-    public static let none: EmbeddingSegment = .init(speakerIndex: -1, startFrame: 0, endFrame: 0)
+    public static let none: EmbeddingSegment = .init(speakerIndex: -1, startFrame: 0, endFrame: 0, segmentIds: [])
     
     // MARK: - Init
     public init(
         speakerIndex: Int,
         startFrame: Int,
         endFrame: Int,
-        finalized: Bool = true
+        finalized: Bool = true,
+        segmentIds: ContiguousArray<UUID> = []
     ) {
         self.speakerIndex = speakerIndex
         self.startFrame = startFrame
         self.endFrame = endFrame
         self.isFinalized = finalized
         self.embeddings = []
+        self.segmentIds = segmentIds
+    }
+    
+    public init(
+        speakerIndex: Int,
+        startFrame: Int,
+        endFrame: Int,
+        finalized: Bool = true,
+        segmentId: UUID
+    ) {
+        self.speakerIndex = speakerIndex
+        self.startFrame = startFrame
+        self.endFrame = endFrame
+        self.isFinalized = finalized
+        self.embeddings = []
+        self.segmentIds = [segmentId]
     }
     
     // MARK: - Speaker Frame Range
@@ -179,6 +204,10 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     }
     
     // MARK: - Embedding extraction
+    
+    public func clearEmbeddings() {
+        embeddings.removeAll()
+    }
     
     /// Determine the required embeddings needed to close all gaps
     /// Uses a greedy interval covering algorithm to minimize the number of requests
@@ -442,20 +471,59 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         guard embeddings.count > 1 else { return }
 
         // 2. Access the memory as two UInt64 values
-        withUnsafeMutableBytes(of: &self.id) { resultPtr in
-            let result64 = resultPtr.assumingMemoryBound(to: UInt64.self)
+        withUnsafeMutableBytes(of: &self.id) { idPtr in
+            let s = idPtr.assumingMemoryBound(to: UInt64.self)
             
             for i in 1..<embeddings.count {
                 var next = embeddings[i].id.uuid
                 withUnsafeBytes(of: &next) { nextPtr in
-                    let next64 = nextPtr.assumingMemoryBound(to: UInt64.self)
-                    
-                    // 3. Perform the XOR on each 64-bit half
-                    result64[0] &+= next64[0]
-                    result64[1] &+= next64[1]
+                    let o = nextPtr.assumingMemoryBound(to: UInt64.self)
+                    let (newLow, overflow) = s[0].addingReportingOverflow(o[0])
+                    s[0] = newLow
+                    s[1] &+= o[1] &+ (overflow ? 1 : 0)
                 }
             }
         }
+    }
+    
+    // MARK: - Concatenating two embedding segments
+    
+    /// Check whether this embedding segment must link with another segment.
+    /// This requires that the last segment ID in this segment is the first segment ID in `other`.
+    /// - Note: Segments can only absorb segments built after itself.
+    internal func mustLink(with other: EmbeddingSegment) -> Bool {
+        return (self.speakerIndex == other.speakerIndex &&
+                self.segmentIds.last == other.segmentIds.first)
+    }
+    
+    /// Check if this segment must link with another segment and absorb it if so.
+    /// - Parameter other: Another embedding segment
+    /// - Returns: `true` if the segment was absorbed, `false` if not.
+    internal func successfullyAbsorbed(_ other: EmbeddingSegment) -> Bool {
+        guard self.mustLink(with: other) else {
+            return false
+        }
+        
+        self.startFrame = min(self.startFrame, other.startFrame)
+        self.endFrame = max(self.endFrame, other.endFrame)
+        self.isFinalized = self.isFinalized && other.isFinalized
+        
+        self.embeddings.append(contentsOf: other.embeddings)
+        self.segmentIds.append(contentsOf: other.segmentIds.dropFirst())
+        
+        // Combine IDs
+        withUnsafeMutableBytes(of: &self.id) { idPtr in
+            withUnsafeBytes(of: &other.id) { otherIdPtr in
+                let s = idPtr.assumingMemoryBound(to: UInt64.self)
+                let o = otherIdPtr.assumingMemoryBound(to: UInt64.self)
+                let (newLow, overflow) = s[0].addingReportingOverflow(o[0])
+                
+                s[0] = newLow
+                s[1] &+= o[1] &+ (overflow ? 1 : 0)
+            }
+        }
+        
+        return true
     }
 }
 
@@ -496,5 +564,13 @@ public struct EmbeddingRequest: SortformerFrameRange, Hashable {
     
     public func overlapLength<T>(with other: T) -> Int where T : SortformerFrameRange {
         return SortformerFrameRangeHelpers.overlapLength(self, other)
+    }
+}
+
+
+extension UUID {
+    static var zero: UUID {
+        UUID(uuid: (0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
     }
 }
