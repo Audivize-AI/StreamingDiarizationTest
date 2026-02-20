@@ -373,7 +373,7 @@ public struct SortformerStreamingState: Sendable {
     /// Frame index of the next new frame
     public var nextNewFrame: Int
     
-    /// Previous right context frames
+    /// Number of right context frames in the last chunk
     public var lastRightContext: Int
 
     /// Initialize empty streaming state
@@ -427,6 +427,8 @@ public struct SortformerFeatureLoader: Sendable {
 
     private var startFeat: Int
     private var endFeat: Int
+    
+    private var chunkIndex: Int = 0
 
     public init(config: SortformerConfig, audio: [Float]) {
         self.lc = config.chunkLeftContext * config.subsamplingFactor
@@ -437,34 +439,31 @@ public struct SortformerFeatureLoader: Sendable {
         self.startFeat = 0
         self.endFeat = 0
         (self.featSeq, self.featLength, self.featSeqLength) = NeMoMelSpectrogram().computeFlatTransposed(audio: audio)
-        // numChunks accounts for right context requirement: need endFeat + rc <= featLength
-        // Chunk n has endFeat = (n+1) * chunkLen, so valid when (n+1) * chunkLen + rc <= featLength
-        // numChunks = floor((featLength - rc) / chunkLen)
-        self.numChunks = max(0, (self.featLength - self.rc) / self.chunkLen)
+        self.numChunks = IndexUtils.ceilDiv(self.featLength, self.chunkLen)
     }
 
-    public mutating func next() -> (chunkFeatures: [Float], chunkLength: Int, leftOffset: Int, rightOffset: Int)? {
-        // Calculate end of core chunk
-        endFeat = min(startFeat + chunkLen, featLength)
-
-        // Need at least one core frame
-        guard endFeat > startFeat else { return nil }
-
-        // Require full right context (same as streaming getNextChunkFeatures)
-        guard endFeat + rc <= featLength else { return nil }
+    public mutating func next() -> (chunkIndex: Int, chunkFeatures: [Float], chunkLength: Int, leftOffset: Int, rightOffset: Int)? {
+        guard endFeat < featLength else { return nil }
 
         let leftOffset = min(lc, startFeat)
-        let rightOffset = rc
+        endFeat = min(startFeat + chunkLen, featLength)
+        let rightOffset = min(rc, featLength - endFeat)
 
         let chunkStartFrame = startFeat - leftOffset
         let chunkEndFrame = endFeat + rightOffset
+        
         let chunkStartIndex = chunkStartFrame * melFeatures
         let chunkEndIndex = chunkEndFrame * melFeatures
+        
         let chunkFeatures = Array(featSeq[chunkStartIndex..<chunkEndIndex])
-        let chunkLength = max(min(featSeqLength - startFeat + leftOffset, chunkEndFrame - chunkStartFrame), 0)
+        let chunkLength = max(min(featSeqLength - chunkStartFrame, chunkEndFrame - chunkStartFrame), 0)
 
-        startFeat = endFeat
-        return (chunkFeatures, chunkLength, leftOffset, rightOffset)
+        defer {
+            startFeat = endFeat
+            chunkIndex += 1
+        }
+        
+        return (chunkIndex, chunkFeatures, chunkLength, leftOffset, rightOffset)
     }
 }
 

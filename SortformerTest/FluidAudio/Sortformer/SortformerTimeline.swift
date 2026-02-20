@@ -133,7 +133,7 @@ public class SortformerTimeline {
             finalizedFrameCount: 0
         )
         
-        _ = try self.addChunk(updateResult)
+        _ = try self.addChunk(updateResult, dropOldEmbeddingFrames: true)
 
         if isComplete {
             // Finalize everything immediately
@@ -142,7 +142,7 @@ public class SortformerTimeline {
     }
 
     /// Add a new chunk of predictions from the diarizer
-    public func addChunk(_ chunk: SortformerStateUpdateResult) throws -> SortformerTimelineDifference {
+    public func addChunk(_ chunk: SortformerStateUpdateResult, dropOldEmbeddingFrames: Bool = true) throws -> SortformerTimelineDifference {
         try queue.sync(flags: .barrier) {
             // Apply EMA filter to existing predictions using FIFO as reference
             // This smooths the tail of framePredictions before appending new data
@@ -178,6 +178,8 @@ public class SortformerTimeline {
             let oldFinalizedSegmentCounts = segments.map(\.count)
             
             // Add finalized preds if there are new ones
+            tentativePredictions.append(contentsOf: chunk.newPredictions)
+            
             if predsToFinalize > 0 {
                 let finalizedPreds = tentativePredictions.prefix(predsToFinalize)
                 framePredictions.append(contentsOf: finalizedPreds)
@@ -193,9 +195,7 @@ public class SortformerTimeline {
                 
                 cursorFrame += chunk.finalizedFrameCount
             }
-            
-            tentativePredictions.append(contentsOf: chunk.newPredictions)
-            
+            print("Predictions: \(chunk.finalizedFrameCount) / \(chunk.oldFrameCount+chunk.newFrameCount) finalized")
             updateSegments(
                 predictions: tentativePredictions,
                 numFrames: numTentative,
@@ -207,7 +207,7 @@ public class SortformerTimeline {
             // Clear garbage segment IDs
             segmentIDs.removeAll(keepingCapacity: true)
             
-            try updateEmbeddingSegments(from: newSegments, finalizedCutoffs: oldFinalizedSegmentCounts)
+            try updateEmbeddingSegments(from: newSegments, finalizedCutoffs: oldFinalizedSegmentCounts, dropEmbeddingFrames: dropOldEmbeddingFrames)
             
             // Trim predictions
             trimPredictions()
@@ -308,10 +308,6 @@ public class SortformerTimeline {
         addTrailingTentative: Bool,
         accumulator: inout [SortformerSegment],
     ) where T: Sequence & Collection, T.Element == Float, T.Index == Int {
-        guard numFrames > 0 else {
-            return
-        }
-        
         let numSpeakers = config.numSpeakers
         let onset = config.onsetThreshold
         let offset = config.offsetThreshold
@@ -338,10 +334,10 @@ public class SortformerTimeline {
             var wasLastSegmentFinal = isFinalized
 
             for i in 0..<numFrames {
-                let index = speakerIndex + i * numSpeakers
+                let index = i * numSpeakers + speakerIndex
 
                 if speaking {
-                    if predictions[index] >= offset {
+                    guard predictions[index] < offset else {
                         continue
                     }
 
@@ -389,7 +385,7 @@ public class SortformerTimeline {
                             : tentativeSegments[speakerIndex].popLast()
 
                         if removedItem != nil {
-                            _ = accumulator.popLast()
+                            accumulator.removeLast()
                         }
                     }
                 }
@@ -416,15 +412,19 @@ public class SortformerTimeline {
                     )
                     tentativeSegments[speakerIndex].append(newSegment)
                     accumulator.append(newSegment)
+                } else {
+                    print ("Speaking: \(speaking), start: \(start), end: \(end)")
                 }
             }
+            
         }
     }
     
     /// Note: call this AFTER `self.numFrames` has been updated
     private func updateEmbeddingSegments(
         from segments: [SortformerSegment],
-        finalizedCutoffs oldFinalizedSegmentCounts: [Int]
+        finalizedCutoffs oldFinalizedSegmentCounts: [Int],
+        dropEmbeddingFrames: Bool
     ) throws {
         guard !segments.isEmpty else {
             return
@@ -552,8 +552,10 @@ public class SortformerTimeline {
         try appendSegment(currentSegment)
         
         // Clean up spare embeddings
-        embeddingManager.dropFrames(
-            before: firstTentativeFrame - embeddingConfig.maxEmbeddingFrames)
+        if dropEmbeddingFrames {
+            embeddingManager.dropFrames(
+                before: firstTentativeFrame - embeddingConfig.maxEmbeddingFrames)
+        }
     }
     
     /// Reset the timeline to initial state
@@ -572,6 +574,7 @@ public class SortformerTimeline {
     /// Finalize all tentative data at end of recording
     /// Call this when no more chunks will be added to convert all tentative predictions and segments to finalized
     public func finalize() throws {
+        Self.logger.info("Finalizing timeline...")
         framePredictions.append(contentsOf: self.tentativePredictions)
         cursorFrame += numTentative
         tentativePredictions.removeAll()
@@ -587,16 +590,18 @@ public class SortformerTimeline {
                 segments[i].removeLast()
             }
         }
-        
+
         // Finalize tentative embedding segments
         for i in 0..<tentativeEmbeddingSegments.count {
             tentativeEmbeddingSegments[i].isFinalized = true
             try tentativeEmbeddingSegments[i].initializeEmbeddings(with: embeddingManager, streamingHorizonFrame: cursorFrame)
         }
+
         embeddingSegments.append(contentsOf: tentativeEmbeddingSegments)
         tentativeEmbeddingSegments.removeAll()
-        
+
         trimPredictions()
+        Self.logger.info("Finished finalizing timeline")
     }
 
     /// Get probability for a specific speaker at a specific finalized frame
@@ -627,9 +632,9 @@ public class SortformerTimeline {
 
 /// A single speaker segment from Sortformer
 /// Can be mutated during streaming processing
-public class SortformerSegment: Sendable, Identifiable, Hashable, Comparable, SpeakerFrameRange {
+public final class SortformerSegment: @unchecked Sendable, Identifiable, Hashable, Comparable, SpeakerFrameRange {
     /// Segment ID
-    public var id: UUID
+    public let id: UUID
 
     /// Speaker index in Sortformer output
     public var speakerIndex: Int
