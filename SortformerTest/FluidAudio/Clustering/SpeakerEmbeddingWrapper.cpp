@@ -3,6 +3,7 @@
 //
 
 #include "SpeakerEmbeddingWrapper.hpp"
+//#include "FluidAudio/Sortformer/SpeakerEmbeddingCppBridge.h"
 
 #include <utility>
 #include "Accelerate/Accelerate.h"
@@ -32,8 +33,9 @@ SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(UUIDWrapper id, float weight, s
 }
 
 SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(const void* swiftPtr): swiftPtr(swiftPtr) {
-    if (swiftPtr)
+    if (swiftPtr) {
         swiftSpeakerEmbeddingLoad(swiftPtr, _id.data, &_vector, &_weight);
+    }
 }
 
 SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(const SpeakerEmbeddingWrapper& other):
@@ -42,9 +44,7 @@ SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(const SpeakerEmbeddingWrapper& 
         _weight(other._weight),
         swiftPtr(other.swiftPtr) 
 {
-    if (swiftPtr) {
-        swiftSpeakerEmbeddingRetain(swiftPtr);
-    }
+    swiftSpeakerEmbeddingRetain(swiftPtr);
 }
 
 SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(SpeakerEmbeddingWrapper&& other) noexcept: 
@@ -55,6 +55,7 @@ SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(SpeakerEmbeddingWrapper&& other
 {
     other.swiftPtr = nullptr;
     other._vector = nullptr;
+    other._id = {0, 0};
 }
 
 SpeakerEmbeddingWrapper::~SpeakerEmbeddingWrapper() {
@@ -168,86 +169,51 @@ bool SpeakerEmbeddingWrapper::operator==(const SpeakerEmbeddingWrapper& other) c
 SpeakerEmbeddingWrapper& SpeakerEmbeddingWrapper::operator=(SpeakerEmbeddingWrapper&& other) noexcept {
     if (this->_id == other._id)
         return *this;
-    if (this->swiftPtr) {
-        swiftSpeakerEmbeddingRelease(this->swiftPtr);
-    }
+    if (this->swiftPtr) swiftSpeakerEmbeddingRelease(this->swiftPtr);
     this->swiftPtr = other.swiftPtr;
     this->_id = other._id;
     this->_vector = other._vector;
     this->_weight = other._weight;
+    this->_segmentIds = std::move(other._segmentIds);
     other.swiftPtr = nullptr;
     other._vector = nullptr;
+    other._id = {0, 0};
     return *this;
 }
 
 SpeakerEmbeddingWrapper& SpeakerEmbeddingWrapper::operator=(const SpeakerEmbeddingWrapper& other) {
     if (this == &other) return *this;
     if (this->_id == other._id) return *this;
-    if (this->swiftPtr) {
-        swiftSpeakerEmbeddingRelease(this->swiftPtr);
-    }
+    if (this->swiftPtr) swiftSpeakerEmbeddingRelease(this->swiftPtr);
     this->swiftPtr = other.swiftPtr;
     this->_id = other._id;
     this->_vector = other._vector;
     this->_weight = other._weight;
-    if (this->swiftPtr) {
-        swiftSpeakerEmbeddingRetain(this->swiftPtr);
-    }
+    this->_segmentIds = other._segmentIds;
+    if (this->swiftPtr) swiftSpeakerEmbeddingRetain(this->swiftPtr);
     return *this;
-}
-
-SpeakerEmbeddingWrapper SpeakerEmbeddingWrapper::operator+(const SpeakerEmbeddingWrapper& other) const {
-    auto result = SpeakerEmbeddingWrapper(this->_weight + other._weight);
-    vDSP_vadd(
-            this->_vector, 1,
-            other._vector, 1,
-            result._vector, 1,
-            SpeakerEmbeddingWrapper::dims
-    );
-    return result;
-}
-
-SpeakerEmbeddingWrapper SpeakerEmbeddingWrapper::operator-(const SpeakerEmbeddingWrapper& other) const {
-    auto result = SpeakerEmbeddingWrapper(this->_weight - other._weight);
-    vDSP_vsub(
-            other._vector, 1,
-            this->_vector, 1,
-            result._vector, 1,
-            SpeakerEmbeddingWrapper::dims
-    );
-    return result;
 }
 
 SpeakerEmbeddingWrapper SpeakerEmbeddingWrapper::operator*(float scalar) const {
-    auto result = *this;
-    return result *= scalar;
+    auto result = SpeakerEmbeddingWrapper(this->_weight, this->_segmentIds);
+    vDSP_vsmul(
+            _vector, 1,
+            &scalar,
+            result._vector, 1,
+            SpeakerEmbeddingWrapper::dims
+    );
+    return result;
 }
 
 SpeakerEmbeddingWrapper SpeakerEmbeddingWrapper::operator/(float scalar) const {
-    auto result = *this;
-    return result /= scalar;
-}
-
-SpeakerEmbeddingWrapper& SpeakerEmbeddingWrapper::operator+=(const SpeakerEmbeddingWrapper& other) {
-    vDSP_vadd(
-            this->_vector, 1,
-            other._vector, 1,
-            this->_vector, 1,
+    auto result = SpeakerEmbeddingWrapper(this->_weight, this->_segmentIds);
+    vDSP_vsdiv(
+            _vector, 1,
+            &scalar,
+            result._vector, 1,
             SpeakerEmbeddingWrapper::dims
     );
-    this->_weight += other._weight;
-    return *this;
-}
-
-SpeakerEmbeddingWrapper& SpeakerEmbeddingWrapper::operator-=(const SpeakerEmbeddingWrapper& other) {
-    vDSP_vsub(
-            other._vector, 1,
-            this->_vector, 1,
-            this->_vector, 1,
-            SpeakerEmbeddingWrapper::dims
-    );
-    this->_weight -= other._weight;
-    return *this;
+    return result;
 }
 
 SpeakerEmbeddingWrapper& SpeakerEmbeddingWrapper::operator*=(float scalar) {

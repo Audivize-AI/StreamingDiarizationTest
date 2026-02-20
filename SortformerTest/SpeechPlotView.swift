@@ -174,57 +174,62 @@ struct SpeechPlotView: View {
                         switch phase {
                         case .active(let location):
                             hoverLocation = location
-                            // Find segment at hover location
                             guard let tl = timeline else {
                                 hoveredSegment = nil
                                 hoveredEmbeddingSegment = nil
                                 return
                             }
+
+                            guard cellWidth > 0 else {
+                                hoveredSegment = nil
+                                hoveredEmbeddingSegment = nil
+                                return
+                            }
+
                             let cellHeight = height / CGFloat(numSpeakers)
+                            guard cellHeight > 0 else {
+                                hoveredSegment = nil
+                                hoveredEmbeddingSegment = nil
+                                return
+                            }
+
+                            let totalFrames = max(totalFrameCount, visibleFrames)
                             let hoverFrame = Int(location.x / cellWidth)
                             let hoverSpeaker = Int(location.y / cellHeight)
-                            
-                            // Check finalized segments
-                            var foundSortformerSegment = false
-                            if let segment = tl.segments.flatMap(\.self).first(where: {
-                                hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
-                            }) {
-                                hoveredSegment = segment
-                                foundSortformerSegment = true
-                            } else if let segment = tl.tentativeSegments.flatMap(\.self).first(where: {
-                                hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
-                            }) {
-                                hoveredSegment = segment
-                                foundSortformerSegment = true
-                            } else {
+
+                            guard hoverFrame >= 0, hoverFrame < totalFrames,
+                                  hoverSpeaker >= 0, hoverSpeaker < numSpeakers else {
                                 hoveredSegment = nil
-                            }
-                            
-                            // Check embedding segments for IDs (Only if no Sortformer segment covers it)
-                            if !foundSortformerSegment {
-                                // Check finalized (prioritize same speaker, fallback to any)
-                                var embSeg = tl.embeddingSegments.first(where: {
-                                    hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
-                                }) ?? tl.embeddingSegments.first(where: {
-                                    hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame
-                                })
-                                
-                                // Check tentative if not found (prioritize same speaker, fallback to any)
-                                if embSeg == nil {
-                                    embSeg = tl.tentativeEmbeddingSegments.first(where: {
-                                        hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame && $0.speakerIndex == hoverSpeaker
-                                    }) ?? tl.tentativeEmbeddingSegments.first(where: {
-                                        hoverFrame >= $0.startFrame && hoverFrame < $0.endFrame
-                                    })
-                                }
-                                
-                                hoveredEmbeddingSegment = embSeg
-                            } else {
                                 hoveredEmbeddingSegment = nil
+                                return
+                            }
+
+                            let resolvedSegment = sortformerSegmentAt(
+                                frame: hoverFrame,
+                                speakerIndex: hoverSpeaker,
+                                timeline: tl
+                            )
+                            let resolvedEmbedding = resolvedSegment == nil
+                                ? embeddingSegmentAt(
+                                    frame: hoverFrame,
+                                    preferredSpeaker: hoverSpeaker,
+                                    timeline: tl
+                                )
+                                : nil
+
+                            if hoveredSegment?.id != resolvedSegment?.id {
+                                hoveredSegment = resolvedSegment
+                            }
+                            if hoveredEmbeddingSegment?.id != resolvedEmbedding?.id {
+                                hoveredEmbeddingSegment = resolvedEmbedding
                             }
                         case .ended:
-                            hoveredSegment = nil
-                            hoveredEmbeddingSegment = nil
+                            if hoveredSegment != nil {
+                                hoveredSegment = nil
+                            }
+                            if hoveredEmbeddingSegment != nil {
+                                hoveredEmbeddingSegment = nil
+                            }
                         }
                     }
                     .overlay(alignment: .topLeading) {
@@ -275,12 +280,20 @@ struct SpeechPlotView: View {
                         guard !isRecording, let tl = timeline else { return }
                         
                         let cellHeight = height / CGFloat(numSpeakers)
+                        guard cellHeight > 0, cellWidth > 0 else { return }
+
+                        let totalFrames = max(totalFrameCount, visibleFrames)
                         let clickedFrame = Int(location.x / cellWidth)
                         let clickedSpeaker = Int(location.y / cellHeight)
+
+                        guard clickedFrame >= 0, clickedFrame < totalFrames,
+                              clickedSpeaker >= 0, clickedSpeaker < numSpeakers else { return }
                         
-                        if let segment = tl.segments.flatMap(\.self).first(where: {
-                            clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
-                        }) {
+                        if let segment = sortformerSegmentAt(
+                            frame: clickedFrame,
+                            speakerIndex: clickedSpeaker,
+                            timeline: tl
+                        ) {
                             onAnnotateSegment?(segment)
                         }
                     }
@@ -289,15 +302,21 @@ struct SpeechPlotView: View {
                         guard !isRecording, let tl = timeline else { return }
                         
                         let cellHeight = height / CGFloat(numSpeakers)
+                        guard cellHeight > 0, cellWidth > 0 else { return }
+
+                        let totalFrames = max(totalFrameCount, visibleFrames)
                         let clickedFrame = Int(location.x / cellWidth)
                         let clickedSpeaker = Int(location.y / cellHeight)
-                        
 
+                        guard clickedFrame >= 0, clickedFrame < totalFrames,
+                              clickedSpeaker >= 0, clickedSpeaker < numSpeakers else { return }
                         
                         // Otherwise, play the segment
-                        if let segment = tl.segments.flatMap(\.self).first(where: { 
-                            clickedFrame >= $0.startFrame && clickedFrame < $0.endFrame && $0.speakerIndex == clickedSpeaker
-                        }) {
+                        if let segment = sortformerSegmentAt(
+                            frame: clickedFrame,
+                            speakerIndex: clickedSpeaker,
+                            timeline: tl
+                        ) {
                             onPlaySegment?(segment.startTime, segment.endTime)
                         }
                     }
@@ -655,6 +674,103 @@ struct SpeechPlotView: View {
                 }
             }
         }
+    }
+
+    /// Returns the visible frame range in content coordinates, with a small guard band.
+    private func currentVisibleFrameRange(totalFrames: Int, cellWidth: CGFloat, viewportWidth: CGFloat) -> Range<Int> {
+        guard cellWidth > 0, totalFrames > 0 else { return 0..<0 }
+        let visibleMinX = max(0, -scrollOffset)
+        let visibleMaxX = min(CGFloat(totalFrames) * cellWidth, visibleMinX + viewportWidth)
+        let bufferFrames = 4
+        let start = max(0, Int(floor(visibleMinX / cellWidth)) - bufferFrames)
+        let end = min(totalFrames, Int(ceil(visibleMaxX / cellWidth)) + bufferFrames)
+        return start..<max(start, end)
+    }
+
+    @inline(__always)
+    private func segmentIntersectsVisibleRange(_ startFrame: Int, _ endFrame: Int, _ visibleFrameRange: Range<Int>) -> Bool {
+        endFrame > visibleFrameRange.lowerBound && startFrame < visibleFrameRange.upperBound
+    }
+
+    @inline(__always)
+    private func sortformerSegmentAt(frame: Int, speakerIndex: Int, timeline: SortformerTimeline) -> SortformerSegment? {
+        guard speakerIndex >= 0,
+              speakerIndex < timeline.segments.count,
+              speakerIndex < timeline.tentativeSegments.count else {
+            return nil
+        }
+
+        if let segment = segmentContaining(frame: frame, in: timeline.segments[speakerIndex]) {
+            return segment
+        }
+        return segmentContaining(frame: frame, in: timeline.tentativeSegments[speakerIndex])
+    }
+
+    @inline(__always)
+    private func embeddingSegmentAt(frame: Int, preferredSpeaker: Int, timeline: SortformerTimeline) -> EmbeddingSegment? {
+        let finalized = segmentContaining(frame: frame, in: timeline.embeddingSegments)
+        if let finalized, finalized.speakerIndex == preferredSpeaker {
+            return finalized
+        }
+
+        let tentative = segmentContaining(frame: frame, in: timeline.tentativeEmbeddingSegments)
+        if let tentative, tentative.speakerIndex == preferredSpeaker {
+            return tentative
+        }
+
+        return finalized ?? tentative
+    }
+
+    @inline(__always)
+    private func segmentContaining(frame: Int, in segments: [SortformerSegment]) -> SortformerSegment? {
+        guard !segments.isEmpty else { return nil }
+
+        var low = 0
+        var high = segments.count
+        while low < high {
+            let mid = (low + high) / 2
+            if segments[mid].startFrame <= frame {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+
+        if low > 0 {
+            let candidate = segments[low - 1]
+            if frame >= candidate.startFrame && frame < candidate.endFrame {
+                return candidate
+            }
+        }
+
+        // Fallback for any out-of-order edge cases.
+        return segments.first { frame >= $0.startFrame && frame < $0.endFrame }
+    }
+
+    @inline(__always)
+    private func segmentContaining(frame: Int, in segments: [EmbeddingSegment]) -> EmbeddingSegment? {
+        guard !segments.isEmpty else { return nil }
+
+        var low = 0
+        var high = segments.count
+        while low < high {
+            let mid = (low + high) / 2
+            if segments[mid].startFrame <= frame {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+
+        if low > 0 {
+            let candidate = segments[low - 1]
+            if frame >= candidate.startFrame && frame < candidate.endFrame {
+                return candidate
+            }
+        }
+
+        // Fallback for any out-of-order edge cases.
+        return segments.first { frame >= $0.startFrame && frame < $0.endFrame }
     }
     
     /// Find embedding at a click location

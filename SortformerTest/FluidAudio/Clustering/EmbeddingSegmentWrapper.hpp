@@ -4,68 +4,62 @@
 #include <memory>
 #include "LinkagePolicy.hpp"
 
-template<LinkagePolicy LP>
+#define MUST_LINK true
+
 class EmbeddingSegmentWrapper {
 private:
-    std::unique_ptr<SpeakerEmbeddingWrapper[]> embeddings;
-    std::vector<UUIDWrapper> _speakerSegmentIds;
-    const UUIDWrapper _id;
-    const long _speakerId;
-    const long _embeddingCount;
+    std::vector<SpeakerEmbeddingWrapper> _embeddings{};
+    std::vector<UUIDWrapper> speakerSegmentIds{};
+    UUIDWrapper _id = UUIDWrapper::zero;
     
 public:
     /**
      * @param id Embedding Segment ID. Sum of all the embedding IDs
-     * @param speakerId Embedding segment speaker ID
-     * @param swiftEmbeddingsPtr Pointer to the array of SpeakerEmbeddings
      * @param embeddingCount Number of speaker embeddings
-     * @param sortformerSegmentIdsPtr Pointer to the array of sortformer segment IDs
-     * @param sortformerSegmentCount Number of sortformer segment IDs
+     * @param speakerSegmentCount Number of speaker segment IDs
      */
-    explicit EmbeddingSegmentWrapper(
-            uuid_t id, 
-            long speakerId,
-            const void** swiftEmbeddingsPtr, 
-            long embeddingCount,
-            uuid_t* sortformerSegmentIdsPtr,
-            long speakerSegmentCount
-    ):
-            embeddings(std::make_unique<SpeakerEmbeddingWrapper[]>(embeddingCount)),
-            _speakerSegmentIds(),
-            _id(id),
-            _speakerId(speakerId),
-            _embeddingCount(embeddingCount)
-    {
-        for (int i = 0; i < embeddingCount; ++i)
-            embeddings[i] = SpeakerEmbeddingWrapper(swiftEmbeddingsPtr[i]);
-            _speakerSegmentIds.reserve(speakerSegmentCount);
-        for (int i = 0; i < speakerSegmentCount; ++i)
-            _speakerSegmentIds.emplace_back(sortformerSegmentIdsPtr[i]);
-    }
-
-    EmbeddingSegmentWrapper(const EmbeddingSegmentWrapper&) = delete;
-    EmbeddingSegmentWrapper& operator=(const EmbeddingSegmentWrapper&) = delete;
-    EmbeddingSegmentWrapper(EmbeddingSegmentWrapper&&) noexcept = default;
-    EmbeddingSegmentWrapper& operator=(EmbeddingSegmentWrapper&&) noexcept = delete;
+    explicit EmbeddingSegmentWrapper(const uuid_t id, long embeddingCount, long speakerSegmentCount);
     
-    // Segment speaker ID
-    [[nodiscard]] inline long speakerId() const { return _speakerId; }
+    EmbeddingSegmentWrapper() = default;
+    EmbeddingSegmentWrapper(const EmbeddingSegmentWrapper&) = default;
+    EmbeddingSegmentWrapper(EmbeddingSegmentWrapper&&) noexcept;
+    EmbeddingSegmentWrapper& operator=(const EmbeddingSegmentWrapper&) = default;
+    EmbeddingSegmentWrapper& operator=(EmbeddingSegmentWrapper&&) noexcept;
     
     // Number of embeddings
-    [[nodiscard]] inline long embeddingCount() const { return _embeddingCount; }
+    [[nodiscard]] inline long embeddingCount() const { return _embeddings.size(); }
     
     // Segment ID
     [[nodiscard]] inline UUIDWrapper id() const { return _id; }
     
+    // Check if no embeddings have been assigned to it
+    [[nodiscard]] inline bool isEmpty() const { return _embeddings.empty(); }
+    
+    [[nodiscard]] std::vector<SpeakerEmbeddingWrapper>& embeddings() {
+        return _embeddings;
+    }
+    
     // Get segment centroid
-    [[nodiscard]] inline SpeakerEmbeddingWrapper centroid() { 
-        return LP::computeCentroid(_id, embeddings.get(), _embeddingCount, std::move(_speakerSegmentIds));
+    [[nodiscard]] inline SpeakerEmbeddingWrapper centroid(const LinkagePolicy* linkagePolicy) {
+        return linkagePolicy->computeCentroid(_id, _embeddings.data(), _embeddings.size(), std::move(speakerSegmentIds));
+    }
+    
+    /**
+     * @brief Add a segment
+     * @param id Pointer to the UUID's memory block
+     */
+    inline void addSegmentId(const uuid_t id) {
+        speakerSegmentIds.emplace_back(id);
+    }
+    
+    /**
+     * @brief Add a speaker embedding
+     * @param swiftEmbeddingPtr Pointer to a Swift Speaker Embedding object
+     */
+    inline void addEmbedding(void const* swiftEmbeddingPtr) {
+        _embeddings.emplace_back(swiftEmbeddingPtr);
+#if (!MUST_LINK)
+        _embeddings[_embeddings.size() - 1].segmentIds() = speakerSegmentIds;
+#endif
     }
 };
-
-template class EmbeddingSegmentWrapper<WardLinkage>;
-template class EmbeddingSegmentWrapper<CosineAverageLinkage>;
-template class EmbeddingSegmentWrapper<WeightedAverageLinkage>;
-template class EmbeddingSegmentWrapper<WeightedCosineAverageLinkage>;
-
-

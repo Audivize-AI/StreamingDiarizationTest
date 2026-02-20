@@ -1,41 +1,94 @@
 #pragma once
 
 #include <vector>
+#include <span>
+#include <ranges>
+#include <unordered_map>
 #include "SpeakerEmbeddingWrapper.hpp"
 #include "EmbeddingSegmentWrapper.hpp"
 #include "LinkagePolicy.hpp"
 
-template<LinkagePolicy> class Dendrogram;
 
-template<LinkagePolicy LP>
+class Dendrogram;
+
 class EmbeddingDistanceMatrix {
 private:
+    struct ControlBlock {
+        std::vector<std::ptrdiff_t> freeIndices{};
+        std::unordered_map<UUIDWrapper, long> tentativeIndices{};
+        long embeddingCount{0};
+        long capacity{0};
+        long size{0};
+        long matrixEndIndex{0};
+        std::size_t refcount{1};
+        
+        ControlBlock() = default;
+    };
+    
     float* matrix;
-    SpeakerEmbeddingWrapper* embeddings;
-    std::vector<std::ptrdiff_t> freeIndices{};
-    std::unordered_map<UUIDWrapper, long> tentativeIndices{};
-    long _embeddingCount{0};
-    long _capacity{0};
-    long _size{0};
-    long matrixEndIndex{0};
+    SpeakerEmbeddingWrapper* _embeddings;
+    ControlBlock* data;
+    const LinkagePolicy* linkagePolicy{nullptr};
 
-    template<LinkagePolicy> friend class Dendrogram;
-    template<LinkagePolicy> friend class SpeakerForest;
+    friend class Dendrogram;
     
     void remove(long index, bool canBeTentative);
     
+    inline void inc() const { if (data) ++data->refcount; };
+    
+    inline void dec() {
+        if (!data) return;
+        if (--(data->refcount) <= 0) {
+            delete[] matrix;
+            delete[] _embeddings;
+            delete data;
+        }
+    }
+    
 public:
-    using EmbeddingSegment = EmbeddingSegmentWrapper<LP>;
-    EmbeddingDistanceMatrix();
+    EmbeddingDistanceMatrix() = delete;
+    explicit EmbeddingDistanceMatrix(const LinkagePolicy* linkagePolicy);
     EmbeddingDistanceMatrix(EmbeddingDistanceMatrix&& other) noexcept;
-    EmbeddingDistanceMatrix(const EmbeddingDistanceMatrix&) = delete;
+    EmbeddingDistanceMatrix(const EmbeddingDistanceMatrix&);
     ~EmbeddingDistanceMatrix();
     
-    [[nodiscard]] inline long embeddingCount() const { return _embeddingCount; }
-    [[nodiscard]] inline long finalizedCount() const { return _embeddingCount - tentativeIndices.size(); }
-    [[nodiscard]] inline long tentativeCount() const { return tentativeIndices.size(); }
-    [[nodiscard]] inline long size() const { return _size; }
-    [[nodiscard]] inline long capacity() const { return _capacity; }
+    [[nodiscard]] inline long embeddingCount() const {
+        return data->embeddingCount;
+    }
+    
+    [[nodiscard]] inline long finalizedCount() const {
+        return data->embeddingCount - static_cast<long>(data->tentativeIndices.size());
+    }
+    
+    [[nodiscard]] inline long tentativeCount() const {
+        return static_cast<long>(data->tentativeIndices.size());
+    }
+    
+    [[nodiscard]] inline std::vector<long> tentativeIndices() const {
+        auto view = data->tentativeIndices | std::views::values;
+        return {view.begin(), view.end()};
+    }
+    
+    [[nodiscard]] inline std::vector<UUIDWrapper> tentativeIDs() const {
+        auto view = data->tentativeIndices | std::views::keys;
+        return {view.begin(), view.end()};
+    }
+    
+    [[nodiscard]] inline std::vector<std::pair<UUIDWrapper, long>> tentatives() const {
+        return {data->tentativeIndices.begin(), data->tentativeIndices.end()};
+    }
+    
+    [[nodiscard]] inline long size() const {
+        return data->size;
+    }
+    
+    [[nodiscard]] inline long capacity() const {
+        return data->capacity;
+    }
+    
+    [[nodiscard]] inline const SpeakerEmbeddingWrapper* embeddings() const {
+        return _embeddings;
+    }
     
     /**
      * @brief Reserve memory for more embeddings if necessary.
@@ -52,14 +105,16 @@ public:
     [[nodiscard]] float distance(long row, long col) const;
     
     // Get the embedding at the row
-    [[nodiscard]] inline SpeakerEmbeddingWrapper& embedding(long index) const { return embeddings[index]; }
+    [[nodiscard]] inline SpeakerEmbeddingWrapper embedding(long index) const {
+        return _embeddings[index];
+    }
     
     /**
      * Insert a new embedding to the matrix at the next free slot and records the slot in the embedding
      * @param embedding The embedding to add
      * @param isTentative Whether the embedding is tentative
      */
-    void insert(SpeakerEmbeddingWrapper& embedding, bool isTentative = false);
+    void insert(SpeakerEmbeddingWrapper const& embedding, bool isTentative = false);
 
     /**
      * Replace the embedding at a given index with a new one and update the distances
@@ -80,33 +135,49 @@ public:
      * @param newFinalized New finalized embedding segments
      * @param newTentative New tentative embedding segments
      */
-    void stream(std::vector<EmbeddingSegment>& newFinalized, std::vector<EmbeddingSegment>& newTentative);
+    inline void stream(std::vector<EmbeddingSegmentWrapper>& newFinalized,
+                       std::vector<EmbeddingSegmentWrapper>& newTentative) {
+        stream({newFinalized.begin(), newFinalized.size()},
+               {newTentative.begin(), newTentative.size()});
+    }
+    
+    /**
+     * @brief Stream new tentative and finalized embeddings to the matrix.
+     * Removes old tentative embeddings and that don't match anything.
+     * @param newFinalized New finalized embedding segments
+     * @param newTentative New tentative embedding segments
+     */
+    void stream(std::span<EmbeddingSegmentWrapper> newFinalized, std::span<EmbeddingSegmentWrapper> newTentative);
     
     /**
      * @brief Build dendrogram from the embeddings
      * @param ignoreTentative Whether to exclude tentative embeddings from the dendrogram  
      * @return Dendrogram object
      */
-    [[nodiscard]] inline Dendrogram<LP> dendrogram(bool ignoreTentative = false) const {
-        return Dendrogram<LP>(*this, ignoreTentative);
-    }
+    [[nodiscard]] Dendrogram dendrogram(bool ignoreTentative = false) const;
     
     /**
      * @brief Builds a new distance matrix from the indices provided and removes them from this matrix.
      * @param indices Indices of the embeddings to gather/isolate 
      * @return The new distance matrix
      */
-    EmbeddingDistanceMatrix<LP> gatherAndPop(std::vector<long> const& indices);
+    inline EmbeddingDistanceMatrix gatherAndPop(std::vector<long> const& indices) {
+        return gatherAndPop(std::span<const long>(indices.begin(), indices.end()));
+    }
+    
+    /**
+     * @brief Builds a new distance matrix from the indices provided and removes them from this matrix.
+     * @param indices Indices of the embeddings to gather/isolate
+     * @return The new distance matrix
+     */
+    EmbeddingDistanceMatrix gatherAndPop(std::span<const long> indices);
 
     /**
-     * @brief Absorb another matrix
-     * @param other Indices of the embeddings to gather/isolate
+     * @brief Absorb another distance matrix
+     * @param other Matrix to absorb
      */
     void absorb(const EmbeddingDistanceMatrix& other);
     
-    EmbeddingDistanceMatrix& operator=(const EmbeddingDistanceMatrix&) = delete;
+    EmbeddingDistanceMatrix& operator=(const EmbeddingDistanceMatrix&);
     EmbeddingDistanceMatrix& operator=(EmbeddingDistanceMatrix&&) noexcept;
 };
-
-using CosineDistanceMatrix = EmbeddingDistanceMatrix<CosineAverageLinkage>;
-using WardDistanceMatrix = EmbeddingDistanceMatrix<WardLinkage>;

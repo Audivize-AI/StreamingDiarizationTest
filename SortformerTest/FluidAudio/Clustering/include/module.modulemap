@@ -5,8 +5,9 @@
 //  Created by Benjamin Lee on 2/10/26.
 //
 
-module AHCClustering {
-    header "EmbeddingDistanceMatrix.hpp"
-
+module AHCClustering [system] {
+    header "clustering-includes.h"
+    requires cplusplus
     export *
+    
 }

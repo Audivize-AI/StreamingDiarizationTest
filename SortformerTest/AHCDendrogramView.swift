@@ -11,7 +11,7 @@ private enum DendrogramPalette {
     static let grid = Color(red: 0.29, green: 0.43, blue: 0.57)
     static let threshold = Color(red: 0.84, green: 0.23, blue: 0.16)
     static let thresholdText = Color(red: 0.50, green: 0.17, blue: 0.13)
-    static let thresholdExceeded = Color(red: 0.52, green: 0.55, blue: 0.60)
+    static let thresholdExceeded = Color(red: 0.78, green: 0.82, blue: 0.87)
     static let rootHalo = Color(red: 0.08, green: 0.64, blue: 0.77)
     static let unknownSpeaker = Color(red: 0.42, green: 0.46, blue: 0.54)
     static let speakerSwatches: [Color] = [
@@ -463,6 +463,12 @@ private struct DendrogramLayout {
             return nil
         }
 
+        let thresholdExceededNodeIds = Set(
+            model.nodes
+                .filter(\.exceedsLinkageThreshold)
+                .map(\.id)
+        )
+
         let internalMergeDistances = reachable.compactMap { id -> Float? in
             guard let node = nodesById[id], !node.isLeaf, node.mergeDistance.isFinite else { return nil }
             return node.mergeDistance
@@ -522,7 +528,99 @@ private struct DendrogramLayout {
         var path: Set<Int> = []
         _ = assignCoordinates(nodeId: model.rootIndex, path: &path)
 
-        let leafCount = max(leafCursor, 1)
+        var seenLeafNodeIds: Set<Int> = []
+        let orderedLeafNodeIds = leafNodeIds
+            .filter { seenLeafNodeIds.insert($0).inserted }
+            .sorted { (logicalX[$0] ?? 0) < (logicalX[$1] ?? 0) }
+
+        var parentByNodeId: [Int: Int] = [:]
+        parentByNodeId.reserveCapacity(branches.count * 2)
+        for branch in branches {
+            parentByNodeId[branch.left] = branch.parent
+            parentByNodeId[branch.right] = branch.parent
+        }
+
+        func thresholdClusterRoot(for leafNodeId: Int) -> Int {
+            var nodeId = leafNodeId
+            var currentParent = parentByNodeId[nodeId]
+            while let parentId = currentParent {
+                if thresholdExceededNodeIds.contains(parentId) {
+                    break
+                }
+                nodeId = parentId
+                currentParent = parentByNodeId[nodeId]
+            }
+            return nodeId
+        }
+
+        var clusterRootByLeafNodeId: [Int: Int] = [:]
+        clusterRootByLeafNodeId.reserveCapacity(orderedLeafNodeIds.count)
+        for leafNodeId in orderedLeafNodeIds {
+            clusterRootByLeafNodeId[leafNodeId] = thresholdClusterRoot(for: leafNodeId)
+        }
+
+        // Add visible whitespace between adjacent threshold-cut clusters.
+        let interClusterGapUnits: CGFloat = 2.0
+        var adjustedLeafX: [Int: CGFloat] = [:]
+        adjustedLeafX.reserveCapacity(orderedLeafNodeIds.count)
+        var adjustedCursor: CGFloat = 0
+        var previousLeafNodeId: Int?
+        for leafNodeId in orderedLeafNodeIds {
+            if let previousLeafNodeId {
+                adjustedCursor += 1
+                if clusterRootByLeafNodeId[previousLeafNodeId] != clusterRootByLeafNodeId[leafNodeId] {
+                    adjustedCursor += interClusterGapUnits
+                }
+            }
+            adjustedLeafX[leafNodeId] = adjustedCursor
+            previousLeafNodeId = leafNodeId
+        }
+
+        var adjustedXCache: [Int: CGFloat] = [:]
+        adjustedXCache.reserveCapacity(logicalX.count)
+
+        func adjustedX(nodeId: Int, path: inout Set<Int>) -> CGFloat {
+            if let cached = adjustedXCache[nodeId] {
+                return cached
+            }
+
+            guard
+                !path.contains(nodeId),
+                let node = nodesById[nodeId],
+                reachable.contains(nodeId)
+            else {
+                return logicalX[nodeId] ?? 0
+            }
+
+            path.insert(nodeId)
+            defer { path.remove(nodeId) }
+
+            let hasBothChildren = node.leftChild >= 0 && node.rightChild >= 0 &&
+                reachable.contains(node.leftChild) && reachable.contains(node.rightChild)
+
+            let xValue: CGFloat
+            if node.isLeaf || !hasBothChildren {
+                xValue = adjustedLeafX[nodeId] ?? logicalX[nodeId] ?? 0
+            } else {
+                let leftX = adjustedX(nodeId: node.leftChild, path: &path)
+                let rightX = adjustedX(nodeId: node.rightChild, path: &path)
+                xValue = (leftX + rightX) * 0.5
+            }
+
+            adjustedXCache[nodeId] = xValue
+            return xValue
+        }
+
+        for nodeId in logicalX.keys {
+            var trace: Set<Int> = []
+            _ = adjustedX(nodeId: nodeId, path: &trace)
+        }
+
+        let minAdjustedX = adjustedXCache.values.min() ?? 0
+        let maxAdjustedX = adjustedXCache.values.max() ?? minAdjustedX
+        let hasXVariance = (maxAdjustedX - minAdjustedX) > 1e-6
+        let xSpan = max(maxAdjustedX - minAdjustedX, 1)
+
         let leftPad: CGFloat = 42
         let rightPad: CGFloat = 16
         let topPad: CGFloat = 18
@@ -534,25 +632,24 @@ private struct DendrogramLayout {
         let baseY = plotRect.maxY
 
         var points: [Int: CGPoint] = [:]
-        let xDenominator = max(CGFloat(leafCount - 1), 1)
-
-        for (nodeId, xValue) in logicalX {
+        for nodeId in logicalX.keys {
             guard let yValue = normalizedY[nodeId] else {
                 continue
             }
 
+            let xValue = adjustedXCache[nodeId] ?? logicalX[nodeId] ?? 0
             let x: CGFloat
-            if leafCount == 1 {
+            if !hasXVariance {
                 x = plotRect.minX + drawWidth * 0.5
             } else {
-                x = plotRect.minX + (xValue / xDenominator) * drawWidth
+                x = plotRect.minX + ((xValue - minAdjustedX) / xSpan) * drawWidth
             }
 
             let y = baseY - yValue * drawHeight
             points[nodeId] = CGPoint(x: x, y: y)
         }
 
-        let uniqueLeafNodeIds = Array(Set(leafNodeIds))
+        let uniqueLeafNodeIds = orderedLeafNodeIds
         branches.sort { lhs, rhs in
             let leftDistance = nodesById[lhs.parent]?.mergeDistance ?? 0
             let rightDistance = nodesById[rhs.parent]?.mergeDistance ?? 0
@@ -649,11 +746,7 @@ private struct DendrogramLayout {
         self.leafNodeIds = uniqueLeafNodeIds
         self.dominantSpeakerByNodeId = dominantSpeakerByNodeId
         self.leafSpeakerByNodeId = leafSpeakerByNodeId
-        self.thresholdExceededNodeIds = Set(
-            model.nodes
-                .filter(\.exceedsLinkageThreshold)
-                .map(\.id)
-        )
+        self.thresholdExceededNodeIds = thresholdExceededNodeIds
     }
 
     func distance(atY y: CGFloat) -> Float {

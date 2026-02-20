@@ -9,7 +9,6 @@
 #include "LinkagePolicy.hpp"
 #include <unordered_set>
 
-template<LinkagePolicy LP>
 class Dendrogram {
 public:
     static constexpr DendrogramNode nullNode = {-1, -1, -1, -1, -1, -1.f, 0};
@@ -17,7 +16,7 @@ public:
     Dendrogram() = default;
     Dendrogram(Dendrogram const& clustering) = default;
     Dendrogram(Dendrogram&& clustering) noexcept;
-    explicit Dendrogram(EmbeddingDistanceMatrix<LP> const& embeddingMatrix, bool ignoreTentative = false);
+    explicit Dendrogram(EmbeddingDistanceMatrix const& embeddingMatrix, bool ignoreTentative = false);
     
     // Get number of nodes
     [[nodiscard]] inline long nodeCount() const { return count; }
@@ -26,11 +25,14 @@ public:
     [[nodiscard]] inline std::shared_ptr<DendrogramNode[]> nodes() const { return _nodes; }
     
     // Get root node
-    [[nodiscard]] inline DendrogramNode root() const {
-        if (!_nodes || _rootId < 0) {
+    [[nodiscard]] inline DendrogramNode root() const { return _nodes ? _nodes[_rootId] : nullNode; }
+
+    // Get node by index (returns nullNode if out of range)
+    [[nodiscard]] inline DendrogramNode node(long index) const {
+        if (!_nodes || index < 0 || index >= count) {
             return nullNode;
         }
-        return _nodes[_rootId];
+        return _nodes[index];
     }
     
     // Get root ID
@@ -56,7 +58,6 @@ public:
 
     /**
      * @brief Extract clusters
-     * @param root Parent node ID
      * @param linkageThreshold Maximum linkage distance to split. Leave as -1 for the max gap linkage threshold.
      * @param maxClusters Maximum number of clusters to extract. Leave as -1 for no limit.
      * @return Array of Cluster objects
@@ -83,9 +84,11 @@ public:
     [[nodiscard]] Cluster collectClusterLeaves(long root) const;
     
     Dendrogram& operator=(const Dendrogram&) = default;
-    Dendrogram& operator=(Dendrogram&&) = default;
+    Dendrogram& operator=(Dendrogram&&) noexcept;
+    
 private:
     struct Aux {
+        const LinkagePolicy* linkagePolicy;
         float* matrix{nullptr};
         bool* activeFlags{nullptr};
         long* matrixToNode{nullptr};

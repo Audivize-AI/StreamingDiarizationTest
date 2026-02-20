@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import Foundation
+import AHCClustering
 
 /// ViewModel managing real-time speaker diarization state.
 /// Uses FluidAudio's SortformerDiarizer with default configuration.
@@ -46,7 +47,7 @@ final class DiarizerViewModel: ObservableObject {
     /// Segment annotations - maps "startFrame-endFrame-speaker" to custom label
     @Published var segmentAnnotations: [String: String] = [:]
 
-    /// Latest live AHC dendrogram snapshot from C++ clustering
+    /// Latest live dendrogram model built from SpeakerProfile clustering
     @Published private(set) var dendrogramModel: AHCDendrogramModel = .empty
     
     /// All recorded audio samples for playback (16kHz mono)
@@ -59,16 +60,20 @@ final class DiarizerViewModel: ObservableObject {
     private var processingTask: Task<Void, Never>?
     private var audioPlayer: AVAudioPlayer?
     private var audioConverter: AudioConverter
-    private let ahcBridge = AHCSpeakerForestBridge(
-        numRepresentatives: 24,
-        minEmbeddings: 600,
-        maxEmbeddings: 1500
+    private let dendrogramClusteringConfig = ClusteringConfig(
+        linkagePolicy: dendrogramLinkagePolicy,
+        minSeparation: 0.3,
+        clusteringThreshold: 0.3,
+        maxEmbeddings: 20,
+        minEmbeddings: 10,
+        maxRepresentatives: 1
     )
+    private var speakerProfile: SpeakerProfile
     private var streamedFinalizedEmbeddingSegmentCount = 0
-    private let clusteringEmbeddingDimensions = 192
-    // Keep bridge traffic bounded so replay/incremental catch-up cannot explode memory.
+    // Keep replay traffic bounded so replay/incremental catch-up cannot explode memory.
     private let dendrogramMaxFinalizedReplaySegments = 3000
     private let dendrogramMaxTentativeReplaySegments = 1500
+    private let wardLogFloor: Float = 1e-12
     
     private let sampleRate: Double = 16000.0
     
@@ -80,6 +85,7 @@ final class DiarizerViewModel: ObservableObject {
     
     init() {
         self.audioConverter = AudioConverter()
+        self.speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig)
         Task {
             await loadModels()
         }
@@ -192,7 +198,7 @@ final class DiarizerViewModel: ObservableObject {
         
         do {
             // Load audio file
-            fileProcessingProgress = 0.1
+            fileProcessingProgress = 0.02
             
             // Allow UI to update
             try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
@@ -206,7 +212,7 @@ final class DiarizerViewModel: ObservableObject {
                 return
             }
             
-            fileProcessingProgress = 0.2
+            fileProcessingProgress = 0.04
             statusMessage = "Reading audio data..."
             
             // Allow UI to update
@@ -220,7 +226,7 @@ final class DiarizerViewModel: ObservableObject {
             }
             
             // Convert to mono
-            fileProcessingProgress = 0.3
+            fileProcessingProgress = 0.06
             statusMessage = "Converting to mono..."
             
             // Allow UI to update
@@ -240,14 +246,14 @@ final class DiarizerViewModel: ObservableObject {
             }
             
             // Resample to 16kHz if needed
-            fileProcessingProgress = 0.4
+            fileProcessingProgress = 0.08
             statusMessage = "Resampling audio..."
             
             // Allow UI to update
             try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
             
             let resampledSamples: [Float]
-            if abs(format.sampleRate - sampleRate) > 1.0 {
+            if Swift.abs(format.sampleRate - sampleRate) > 1.0 {
                 resampledSamples = try audioConverter.resample(samples, from: format.sampleRate)
             } else {
                 resampledSamples = samples
@@ -255,21 +261,25 @@ final class DiarizerViewModel: ObservableObject {
             
             // Store for playback
             recordedAudio = resampledSamples
-            fileProcessingProgress = 0.5
+            fileProcessingProgress = 0.1
             statusMessage = "Processing \(url.lastPathComponent)..."
             
             // Allow UI to update before heavy processing
             try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
             
             // Process complete audio
-            timeline = try diarizer.processComplete(resampledSamples)
-            fileProcessingProgress = 0.9
-            statusMessage = "Finalizing..."
+            timeline = try await diarizer.processComplete(resampledSamples) { processed, total in
+                self.fileProcessingProgress = 0.1 + Double(processed) / Double(total) * 0.89
+                print("Processed \(processed) out of \(total)")
+                try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+            }
+            fileProcessingProgress = 0.99
+            statusMessage = "Loading results..."
             
             // Allow UI to update
             try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
             
-            try? timeline?.finalize()  // Finalize all tentative predictions and segments
+//            try? timeline?.finalize()  // Finalize all tentative predictions and segments
             spkcachePreds = diarizer.state.spkcachePreds  // Update speaker cache display
             fifoPreds = diarizer.state.fifoPreds  // Update FIFO queue display
             updateTrigger += 1
@@ -440,7 +450,7 @@ final class DiarizerViewModel: ObservableObject {
         // Resample if not 16kHz
         let inputSampleRate = format.sampleRate
         let resampledSamples: [Float]
-        if abs(inputSampleRate - sampleRate) > 1.0 {
+        if Swift.abs(inputSampleRate - sampleRate) > 1.0 {
             resampledSamples = try audioConverter.resample(samples, from: inputSampleRate)
         } else {
             resampledSamples = samples
@@ -496,35 +506,9 @@ final class DiarizerViewModel: ObservableObject {
     }
 
     private func resetDendrogramState() {
-        ahcBridge.reset()
+        speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig)
         streamedFinalizedEmbeddingSegmentCount = 0
         dendrogramModel = .empty
-    }
-
-    private func makeBridgeSegments(from segments: [EmbeddingSegment]) -> [AHCEmbeddingSegmentInput] {
-        var converted: [AHCEmbeddingSegmentInput] = []
-        converted.reserveCapacity(segments.count)
-
-        for segment in segments {
-            var embeddings: [AHCEmbeddingSample] = []
-            embeddings.reserveCapacity(segment.embeddings.count)
-
-            for embedding in segment.embeddings where embedding.embedding.count == clusteringEmbeddingDimensions {
-                let swiftPointer = UnsafeRawPointer(Unmanaged.passUnretained(embedding).toOpaque())
-                embeddings.append(AHCEmbeddingSample(swiftEmbeddingPointer: swiftPointer))
-            }
-
-            guard !embeddings.isEmpty else { continue }
-            converted.append(
-                AHCEmbeddingSegmentInput(
-                    segmentIdentifier: segment.id,
-                    speakerIndex: segment.speakerIndex,
-                    embeddings: embeddings
-                )
-            )
-        }
-
-        return converted
     }
 
     private func updateDendrogram() {
@@ -545,53 +529,209 @@ final class DiarizerViewModel: ObservableObject {
         }
 
         let newFinalized = Array(tl.embeddingSegments.dropFirst(streamedFinalizedEmbeddingSegmentCount))
+        let tentativeWindow = Array(tl.tentativeEmbeddingSegments.suffix(dendrogramMaxTentativeReplaySegments))
+        speakerProfile.stream(newFinalized: newFinalized, newTentative: tentativeWindow)
+        streamedFinalizedEmbeddingSegmentCount = tl.embeddingSegments.count
 
-        let finalizedSegments = makeBridgeSegments(from: newFinalized)
-        let tentativeSegments = makeBridgeSegments(from: tl.tentativeEmbeddingSegments)
-        let streamedIncremental = ahcBridge.stream(
-            withFinalizedSegments: finalizedSegments,
-            tentativeSegments: tentativeSegments
+        let speakerIndexBySegmentId = makeSpeakerIndexBySegmentId(from: tl)
+        var nextModel = makeDendrogramModel(
+            from: speakerProfile,
+            speakerIndexBySegmentId: speakerIndexBySegmentId
         )
-        if streamedIncremental {
-            streamedFinalizedEmbeddingSegmentCount = tl.embeddingSegments.count
-        } else {
-            print("[Dendrogram] Incremental stream failed; replaying full clustering state")
-            _ = replayFullDendrogramState(from: tl)
-        }
-
-        var snapshot = ahcBridge.dendrogramSnapshot()
-        if snapshotHasInvalidMergeDistance(snapshot) {
+        if nextModel.nodes.contains(where: { !$0.mergeDistance.isFinite }) {
             print("[Dendrogram] Invalid merge distance detected; replaying full clustering state")
-            _ = replayFullDendrogramState(from: tl)
-            snapshot = ahcBridge.dendrogramSnapshot()
+            if replayFullDendrogramState(from: tl) {
+                nextModel = makeDendrogramModel(
+                    from: speakerProfile,
+                    speakerIndexBySegmentId: speakerIndexBySegmentId
+                )
+            }
         }
-        dendrogramModel = AHCDendrogramModel(snapshot: snapshot)
+        dendrogramModel = nextModel
     }
 
     @discardableResult
     private func replayFullDendrogramState(from timeline: SortformerTimeline) -> Bool {
-        ahcBridge.reset()
+        speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig)
         let finalizedWindow = Array(timeline.embeddingSegments.suffix(dendrogramMaxFinalizedReplaySegments))
         let tentativeWindow = Array(timeline.tentativeEmbeddingSegments.suffix(dendrogramMaxTentativeReplaySegments))
-        let finalizedSegments = makeBridgeSegments(from: finalizedWindow)
-        let tentativeSegments = makeBridgeSegments(from: tentativeWindow)
-        let success = ahcBridge.stream(
-            withFinalizedSegments: finalizedSegments,
-            tentativeSegments: tentativeSegments
-        )
-        if success {
-            print("[Dendrogram] Full replay succeeded (\(timeline.embeddingSegments.count) finalized segments)")
-        } else {
-            print("[Dendrogram] Full replay failed")
-        }
-        streamedFinalizedEmbeddingSegmentCount = success ? timeline.embeddingSegments.count : 0
-        return success
+        speakerProfile.stream(newFinalized: finalizedWindow, newTentative: tentativeWindow)
+        print("[Dendrogram] Full replay succeeded (\(timeline.embeddingSegments.count) finalized segments)")
+        streamedFinalizedEmbeddingSegmentCount = timeline.embeddingSegments.count
+        return true
     }
 
-    private func snapshotHasInvalidMergeDistance(_ snapshot: AHCDendrogramSnapshot) -> Bool {
-        return snapshot.nodes.contains { node in
-            !node.mergeDistance.isFinite
+    private func makeSpeakerIndexBySegmentId(from timeline: SortformerTimeline) -> [UUID: Int] {
+        var lookup: [UUID: Int] = [:]
+        lookup.reserveCapacity(timeline.embeddingSegments.count + timeline.tentativeEmbeddingSegments.count)
+
+        for segment in timeline.embeddingSegments {
+            lookup[segment.id] = segment.speakerIndex
         }
+        for segment in timeline.tentativeEmbeddingSegments {
+            lookup[segment.id] = segment.speakerIndex
+        }
+
+        return lookup
+    }
+
+    private func makeDendrogramModel(
+        from profile: SpeakerProfile,
+        speakerIndexBySegmentId: [UUID: Int]
+    ) -> AHCDendrogramModel {
+        let matrix = profile.matrix
+        let dendrogram = profile.dendrogram
+        let rootIndex = Int(dendrogram.rootId())
+        let nodeCount = Int(dendrogram.nodeCount())
+        let activeLeafCount = max(0, Int(matrix.embeddingCount()))
+
+        guard rootIndex >= 0, rootIndex < nodeCount else {
+            return AHCDendrogramModel(rootIndex: -1, activeLeafCount: activeLeafCount, nodes: [])
+        }
+
+        let nodeIds = reachableNodeIds(in: dendrogram, rootIndex: rootIndex, nodeCount: nodeCount)
+        guard !nodeIds.isEmpty else {
+            return AHCDendrogramModel(rootIndex: -1, activeLeafCount: activeLeafCount, nodes: [])
+        }
+
+        let linkagePolicy = profile.config.linkagePolicy
+        let useDynamicWardThreshold = linkagePolicy == .wardLinkage
+        var hasLinkageCutoff = false
+        var linkageCutoff: Float = 0
+
+        if useDynamicWardThreshold {
+            var internalMergeDistances: [Float] = []
+            internalMergeDistances.reserveCapacity(nodeIds.count)
+
+            for nodeId in nodeIds {
+                let node = dendrogram.node(nodeId)
+                let leftChild = Int(node.leftChild)
+                let rightChild = Int(node.rightChild)
+                let isInternalNode = leftChild >= 0 && rightChild >= 0 &&
+                    leftChild < nodeCount && rightChild < nodeCount
+                guard isInternalNode else { continue }
+                internalMergeDistances.append(
+                    transformedLinkageDistance(node.mergeDistance, linkagePolicy: linkagePolicy)
+                )
+            }
+
+            if !internalMergeDistances.isEmpty {
+                let sum = internalMergeDistances.reduce(0, +)
+                let mean = sum / Float(internalMergeDistances.count)
+                let variance = internalMergeDistances.reduce(0) { partial, distance in
+                    let delta = distance - mean
+                    return partial + delta * delta
+                } / Float(internalMergeDistances.count)
+                let stddev = sqrtf(max(variance, 0))
+                linkageCutoff = mean + 2 * stddev
+                hasLinkageCutoff = linkageCutoff.isFinite
+            }
+        } else {
+            linkageCutoff = profile.config.mergeThreshold
+            hasLinkageCutoff = linkageCutoff.isFinite
+        }
+
+        var nodes: [AHCDendrogramNodeModel] = []
+        nodes.reserveCapacity(nodeIds.count)
+        let matrixSize = Int(matrix.size())
+
+        for nodeId in nodeIds {
+            let node = dendrogram.node(nodeId)
+            let matrixIndex = Int(node.matrixIndex)
+            let leftChild = Int(node.leftChild)
+            let rightChild = Int(node.rightChild)
+            let isLeaf = leftChild < 0 || rightChild < 0
+            var speakerIndex = -1
+
+            if isLeaf && matrixIndex >= 0 && matrixIndex < matrixSize {
+                let embedding = matrix.embedding(matrixIndex)
+                if embedding.hasVector() {
+                    speakerIndex = speakerIndexBySegmentId[uuid(from: embedding.id())] ?? -1
+                }
+            }
+
+            let mergeDistance = transformedLinkageDistance(node.mergeDistance, linkagePolicy: linkagePolicy)
+            let isInternalNode = leftChild >= 0 && rightChild >= 0 &&
+                leftChild < nodeCount && rightChild < nodeCount
+            let exceedsLinkageThreshold = isInternalNode && hasLinkageCutoff &&
+                mergeDistance.isFinite && mergeDistance > linkageCutoff
+
+            nodes.append(
+                AHCDendrogramNodeModel(
+                    id: nodeId,
+                    matrixIndex: matrixIndex,
+                    leftChild: leftChild,
+                    rightChild: rightChild,
+                    speakerIndex: speakerIndex,
+                    count: Int(node.count),
+                    weight: node.weight,
+                    mergeDistance: mergeDistance,
+                    mustLink: false,
+                    exceedsLinkageThreshold: exceedsLinkageThreshold
+                )
+            )
+        }
+
+        return AHCDendrogramModel(
+            rootIndex: rootIndex,
+            activeLeafCount: activeLeafCount,
+            nodes: nodes
+        )
+    }
+
+    private func reachableNodeIds(in dendrogram: Dendrogram, rootIndex: Int, nodeCount: Int) -> [Int] {
+        guard rootIndex >= 0, rootIndex < nodeCount else {
+            return []
+        }
+
+        var visited: Set<Int> = []
+        visited.reserveCapacity(nodeCount)
+        var stack: [Int] = [rootIndex]
+        stack.reserveCapacity(nodeCount)
+
+        while let nodeId = stack.popLast() {
+            guard nodeId >= 0, nodeId < nodeCount, visited.insert(nodeId).inserted else {
+                continue
+            }
+
+            let node = dendrogram.node(nodeId)
+            let leftChild = Int(node.leftChild)
+            let rightChild = Int(node.rightChild)
+
+            if leftChild >= 0 {
+                stack.append(leftChild)
+            }
+            if rightChild >= 0 {
+                stack.append(rightChild)
+            }
+        }
+
+        return visited.sorted()
+    }
+
+    private func transformedLinkageDistance(_ mergeDistance: Float, linkagePolicy: LinkagePolicyType) -> Float {
+        guard mergeDistance.isFinite else {
+            return 0
+        }
+
+        if linkagePolicy == .wardLinkage {
+            let flooredDistance = max(mergeDistance, wardLogFloor)
+            let loggedDistance = logf(flooredDistance)
+            return loggedDistance.isFinite ? loggedDistance : 0
+        }
+
+        return mergeDistance < 0 ? 0 : mergeDistance
+    }
+
+    private func uuid(from wrapper: UUIDWrapper) -> UUID {
+        var uuidTuple: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        var words = (wrapper.data.0, wrapper.data.1)
+        withUnsafeMutableBytes(of: &uuidTuple) { destination in
+            withUnsafeBytes(of: &words) { source in
+                destination.copyBytes(from: source)
+            }
+        }
+        return UUID(uuid: uuidTuple)
     }
     
     /// Print all segments in CSV format: speaker_id,start_time,end_time

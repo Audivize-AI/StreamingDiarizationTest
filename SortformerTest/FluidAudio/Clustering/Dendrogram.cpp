@@ -3,30 +3,26 @@
 //
 #include "Dendrogram.hpp"
 #include "Cluster.hpp"
-#include "LinkagePolicy.hpp"
 #include <iostream>
 #include <queue>
 
-template<LinkagePolicy LP>
-Dendrogram<LP>::Dendrogram(EmbeddingDistanceMatrix<LP> const& distMat, bool ignoreTentative) {
-    // Setup
-    long nodesRemaining = distMat._embeddingCount - (ignoreTentative ? static_cast<long>(distMat.tentativeIndices.size()) : 0L);
-    if (nodesRemaining <= 0) {
-        this->count = 0;
-        this->_rootId = -1;
-        this->_nodes = nullptr;
-        return;
-    }
 
+Dendrogram::Dendrogram(EmbeddingDistanceMatrix const& distMat, bool ignoreTentative) {
+    // Setup
+    long nodesRemaining = distMat.embeddingCount() - (ignoreTentative ? 0L : distMat.tentativeCount());
+    if (nodesRemaining == 0) return;
+    
+    auto size = distMat.size();
     this->count = nodesRemaining * 2 - 1;
-    this->_nodes = std::make_shared<DendrogramNode[]>(std::max(count, distMat._size));
+    this->_nodes = std::make_shared<DendrogramNode[]>(std::max(count, size));
 
     Aux aux = {
-            .matrix                 = new float[distMat.matrixEndIndex],
-            .activeFlags            = new bool[distMat._size],
-            .matrixToNode           = new long[distMat._size],
-            .freeIndices            = distMat.freeIndices,
-            .size                   = distMat._size,
+            .linkagePolicy          = distMat.linkagePolicy,
+            .matrix                 = new float[distMat.data->matrixEndIndex],
+            .activeFlags            = new bool[size],
+            .matrixToNode           = new long[size],
+            .freeIndices            = distMat.data->freeIndices,
+            .size                   = size,
             .numClustersRemaining   = nodesRemaining
     };
 
@@ -34,12 +30,12 @@ Dendrogram<LP>::Dendrogram(EmbeddingDistanceMatrix<LP> const& distMat, bool igno
     int numActive = 0;
 
     // Fill _nodes and aux
-    for (int i = 0; i < distMat._size; ++i) {
-        bool isActive = distMat.embeddings[i].hasVector();
+    for (int i = 0; i < size; ++i) {
+        bool isActive = distMat._embeddings[i].hasVector();
         aux.matrixToNode[i] = i;
         aux.activeFlags[i] = isActive;
         this->_nodes[i].matrixIndex = i;
-        this->_nodes[i].weight = distMat.embeddings[i].weight();
+        this->_nodes[i].weight = distMat._embeddings[i].weight();
         numActive += isActive;
         if (!foundActive && isActive) {
             aux.firstActiveMatrixIndex = i;
@@ -53,7 +49,7 @@ Dendrogram<LP>::Dendrogram(EmbeddingDistanceMatrix<LP> const& distMat, bool igno
     }
     
     if (ignoreTentative) {
-        for (auto [_, index]: distMat.tentativeIndices) {
+        for (auto [_, index]: distMat.data->tentativeIndices) {
             aux.freeIndices.push_back(index);
             aux.activeFlags[index] = false;
             --numActive;
@@ -71,21 +67,25 @@ Dendrogram<LP>::Dendrogram(EmbeddingDistanceMatrix<LP> const& distMat, bool igno
     }
     
     // Copy the distance matrix
-    std::memcpy(aux.matrix, distMat.matrix, distMat.matrixEndIndex * sizeof(float));
+    std::copy(distMat.matrix, distMat.matrix + distMat.data->matrixEndIndex, aux.matrix);
 
     // Build the _nodes
     buildDendrogram(aux);
 }
 
-template<LinkagePolicy LP>
-Dendrogram<LP>::Dendrogram(Dendrogram&& clustering) noexcept: 
-        count(clustering.count),
-        _rootId(clustering._rootId),
-        elbowLinkage(clustering.elbowLinkage),
-        _nodes(std::move(clustering._nodes)) {}
 
-template<LinkagePolicy LP>
-std::vector<Cluster> Dendrogram<LP>::extractSubClusters(long root, float linkageThreshold, long maxClusters) const {
+Dendrogram::Dendrogram(Dendrogram&& other) noexcept: 
+        count(other.count),
+        _rootId(other._rootId),
+        elbowLinkage(other.elbowLinkage),
+        _nodes(std::move(other._nodes)) {
+    other.count = 0;
+    other._rootId = 0;
+    other.elbowLinkage = 0;
+}
+
+
+std::vector<Cluster> Dendrogram::extractSubClusters(long root, float linkageThreshold, long maxClusters) const {
     auto clusterRootIds = extractSubClusterRoots(root, linkageThreshold, maxClusters);
     std::vector<Cluster> results;
     results.reserve(clusterRootIds.size());
@@ -97,8 +97,8 @@ std::vector<Cluster> Dendrogram<LP>::extractSubClusters(long root, float linkage
     return results;
 }
 
-template<LinkagePolicy LP>
-std::vector<long> Dendrogram<LP>::extractSubClusterRoots(long root, float linkageThreshold, long maxClusters) const {
+
+std::vector<long> Dendrogram::extractSubClusterRoots(long root, float linkageThreshold, long maxClusters) const {
     if (root == -1) root = this->_rootId;
     if (root == -1) return {};
 
@@ -152,8 +152,8 @@ std::vector<long> Dendrogram<LP>::extractSubClusterRoots(long root, float linkag
     return results;
 }
 
-template<LinkagePolicy LP>
-Cluster Dendrogram<LP>::collectClusterLeaves(long root) const {
+
+Cluster Dendrogram::collectClusterLeaves(long root) const {
     auto& clusterRoot = _nodes[root]; 
     auto cluster = Cluster(clusterRoot);
     long i = 0;
@@ -179,8 +179,8 @@ Cluster Dendrogram<LP>::collectClusterLeaves(long root) const {
     return cluster;
 }
 
-template<LinkagePolicy LP>
-void Dendrogram<LP>::buildDendrogram(Aux& aux) {
+
+void Dendrogram::buildDendrogram(Aux& aux) {
     if (aux.numClustersRemaining < 1) 
         return;
     
@@ -194,43 +194,12 @@ void Dendrogram<LP>::buildDendrogram(Aux& aux) {
             stack[++topIndex] = lastSurvivor;
 
         auto top = stack[topIndex];
-        if (top < 0 || top >= aux.size || !aux.activeFlags[top]) {
-            // Recover to any active index to avoid spinning on invalid chain entries.
-            top = -1;
-            for (long i = 0; i < aux.size; ++i) {
-                if (aux.activeFlags[i]) {
-                    top = i;
-                    break;
-                }
-            }
-            if (top < 0) {
-                break;
-            }
-            stack[topIndex] = top;
-        }
-
         auto next = nearestNeighbor(top, aux);
-        if (next < 0 || next >= aux.size || !aux.activeFlags[next]) {
-            for (long i = 0; i < aux.size; ++i) {
-                if (aux.activeFlags[i] && i != top) {
-                    next = i;
-                    break;
-                }
-            }
-            if (next < 0 || next == top) {
-                break;
-            }
-        }
 
         if (topIndex > 0 && next == stack[topIndex - 1]) {
             lastSurvivor = merge(top, next, aux);
             topIndex -= 2;
         } else {
-            if (topIndex + 1 >= aux.numClustersRemaining) {
-                // Invalid chain growth guard: restart chain from current top.
-                topIndex = 0;
-                stack[topIndex] = top;
-            }
             stack[++topIndex] = next;
         }
     }
@@ -239,8 +208,8 @@ void Dendrogram<LP>::buildDendrogram(Aux& aux) {
     this->_rootId = aux.matrixToNode[lastSurvivor];
 }
 
-template<LinkagePolicy LP>
-std::ptrdiff_t Dendrogram<LP>::merge(std::ptrdiff_t leftIndex, std::ptrdiff_t rightIndex, Aux& aux) {
+
+std::ptrdiff_t Dendrogram::merge(std::ptrdiff_t leftIndex, std::ptrdiff_t rightIndex, Aux& aux) {
     std::ptrdiff_t matrixIndex;
     
     if (leftIndex > rightIndex) 
@@ -270,7 +239,7 @@ std::ptrdiff_t Dendrogram<LP>::merge(std::ptrdiff_t leftIndex, std::ptrdiff_t ri
         const auto wC = this->_nodes[aux.matrixToNode[col]].weight;
         const auto distAC = distance(leftIndex, col, aux);
         const auto distBC = distance(rightIndex, col, aux);
-        aux.matrix[matrixIndex] = LP::distance(distAC, wA, distBC, wB, distAB, wC);
+        aux.matrix[matrixIndex] = aux.linkagePolicy->distance(distAC, wA, distBC, wB, distAB, wC);
     }
     
     // Update each (row, matrixRow) squaredDistanceTo for row > matrixRow
@@ -283,7 +252,7 @@ std::ptrdiff_t Dendrogram<LP>::merge(std::ptrdiff_t leftIndex, std::ptrdiff_t ri
         const auto wC = this->_nodes[aux.matrixToNode[col]].weight;
         const auto distAC = distance(leftIndex, col, aux);
         const auto distBC = distance(rightIndex, col, aux);
-        aux.matrix[matrixIndex] = LP::distance(distAC, wA, distBC, wB, distAB, wC);
+        aux.matrix[matrixIndex] = aux.linkagePolicy->distance(distAC, wA, distBC, wB, distAB, wC);
     }
     
     long clusterRow;
@@ -317,12 +286,8 @@ std::ptrdiff_t Dendrogram<LP>::merge(std::ptrdiff_t leftIndex, std::ptrdiff_t ri
     return matrixRow;
 }
 
-template<LinkagePolicy LP>
-std::ptrdiff_t Dendrogram<LP>::nearestNeighbor(std::ptrdiff_t index, Aux& aux) {
-    if (index < 0 || index >= aux.size || !aux.activeFlags[index]) {
-        return -1;
-    }
 
+std::ptrdiff_t Dendrogram::nearestNeighbor(std::ptrdiff_t index, Aux& aux) {
     float minDist = std::numeric_limits<float>::infinity();
     std::ptrdiff_t nearestIndex = -1;
 
@@ -351,7 +316,15 @@ std::ptrdiff_t Dendrogram<LP>::nearestNeighbor(std::ptrdiff_t index, Aux& aux) {
     return nearestIndex;
 }
 
-template class Dendrogram<WardLinkage>;
-template class Dendrogram<CosineAverageLinkage>;
-template class Dendrogram<WeightedAverageLinkage>;
-template class Dendrogram<WeightedCosineAverageLinkage>;
+Dendrogram& Dendrogram::operator=(Dendrogram&& other) noexcept {
+    count = other.count;
+    elbowLinkage = other.elbowLinkage;
+    _rootId = other._rootId;
+    _nodes = std::move(other._nodes);
+    
+    other.count = 0;
+    other._rootId = 0;
+    other.elbowLinkage = 0;
+    
+    return *this;
+}

@@ -114,10 +114,10 @@ public:
     // Release the vector it held
     inline void releaseVector() {
         if (!this->swiftPtr) return;
-        swiftSpeakerEmbeddingRelease(this->swiftPtr);
+        swiftSpeakerEmbeddingRelease(this->swiftPtr); 
         this->swiftPtr = nullptr;
         this->_vector = nullptr; 
-        this->_id = {0, 0};
+        this->_id = {0, 0}; // NULL
     }
 
     // Get weight
@@ -126,19 +126,19 @@ public:
     // Get weight reference
     [[nodiscard]] inline float& weight() { return _weight; }
     
-    // Get the embedding UUIDWrapper
+    // Get the embedding ID
     [[nodiscard]] inline UUIDWrapper id() const { return _id; }
 
-    // Get the embedding UUIDWrapper reference
+    // Get reference to embedding ID
     [[nodiscard]] inline UUIDWrapper& id() { return _id; }
 
-    // Get the segment UUIDWrapper
+    // Get IDs of the corresponding segments
     [[nodiscard]] inline std::vector<UUIDWrapper> const& segmentIds() const { return this->_segmentIds; }
     
-    // Get segment UUIDWrapper reference
+    // Get reference to IDs of the corresponding segments
     [[nodiscard]] inline std::vector<UUIDWrapper>& segmentIds() { return _segmentIds; }
     
-    // Whether this embedding is nil
+    // Check whether this embedding is nil
     [[nodiscard]] inline bool expired() const { return !_vector; }
 
     // Check if this has a vector
@@ -157,20 +157,16 @@ public:
     [[nodiscard]] float normSquared() const;
     
     bool operator==(const SpeakerEmbeddingWrapper& other) const;
-
-    SpeakerEmbeddingWrapper operator+(const SpeakerEmbeddingWrapper& other) const;
-    SpeakerEmbeddingWrapper operator-(const SpeakerEmbeddingWrapper& other) const;
+    
     SpeakerEmbeddingWrapper operator*(float scalar) const;
     SpeakerEmbeddingWrapper operator/(float scalar) const;
     SpeakerEmbeddingWrapper& operator=(const SpeakerEmbeddingWrapper& other);
     SpeakerEmbeddingWrapper& operator=(SpeakerEmbeddingWrapper&& other) noexcept;
-    SpeakerEmbeddingWrapper& operator+=(const SpeakerEmbeddingWrapper& other);
-    SpeakerEmbeddingWrapper& operator-=(const SpeakerEmbeddingWrapper& other);
     SpeakerEmbeddingWrapper& operator*=(float scalar);
     SpeakerEmbeddingWrapper& operator/=(float scalar);
 
 protected:
-    UUIDWrapper _id { 0, 0 };
+    UUIDWrapper _id{0, 0};
     const void* swiftPtr{nullptr};
     float* _vector{nullptr};
     std::vector<UUIDWrapper> _segmentIds{};

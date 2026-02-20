@@ -2,7 +2,7 @@
 
 #include "SpeakerEmbeddingWrapper.hpp"
 #include <memory>
-#include <unordered_set>
+#include <span>
 
 struct DendrogramNode {
     long matrixIndex{0};
@@ -16,7 +16,7 @@ struct DendrogramNode {
 
 class Cluster {
 private:
-    std::shared_ptr<long[]> indices{nullptr};
+    std::shared_ptr<long[]> _indices{nullptr};
     long _count;
     long _segmentCount;
     float _weight;
@@ -40,7 +40,7 @@ public:
     };
 
     inline Cluster(Cluster&& other) noexcept: 
-            indices(std::move(other.indices)),
+            _indices(std::move(other._indices)),
             _count(other._count), 
             _segmentCount(other._segmentCount),
             _weight(other._weight), 
@@ -48,26 +48,40 @@ public:
             
     inline Cluster(const Cluster& other) = default;
     explicit inline Cluster(const DendrogramNode& node):
-            indices(std::make_shared<long[]>(node.count)),
+            _indices(std::make_shared<long[]>(node.count)),
             _count(node.count),
             _segmentCount(node.segmentCount),
             _weight(node.weight),
             _spread(node.mergeDistance) {}
 
-    inline long& operator[](long i) { return indices[i]; }
-    inline long operator[](long i) const { return indices[i]; }
+    inline long& operator[](long i) { return _indices[i]; }
+    inline long operator[](long i) const { return _indices[i]; }
 
     [[nodiscard]] inline long count() const { return _count; }
     [[nodiscard]] inline long segmentCount() const { return _count; }
     [[nodiscard]] inline float weight() const { return _weight; }
     [[nodiscard]] inline float spread() const { return _spread; }
 
-    [[nodiscard]] inline long front() const { return indices[0]; }
-    [[nodiscard]] inline long back() const { return indices[_count - 1]; }
+    [[nodiscard]] inline long front() const { return _indices[0]; }
+    [[nodiscard]] inline long back() const { return _indices[_count - 1]; }
     
-    [[nodiscard]] inline Iterator begin() const { return Iterator(indices.get()); }
-    [[nodiscard]] inline Iterator end() const { return Iterator(indices.get() + _count); }
+    [[nodiscard]] inline Iterator begin() const { return Iterator(_indices.get()); }
+    [[nodiscard]] inline Iterator end() const { return Iterator(_indices.get() + _count); }
+    
+    [[nodiscard]] inline std::span<long> indices() const {
+        return std::span<long>(_indices.get(), _indices.get() + _count);
+    }
 
     inline Cluster& operator=(const Cluster& cluster) = default;
-    inline Cluster& operator=(Cluster&& cluster) = default;
+    
+    inline Cluster& operator=(Cluster&& cluster) noexcept {
+        this->_indices = std::move(cluster._indices);
+        this->_count = cluster._count;
+        this->_spread = cluster._spread;
+        this->_weight = cluster._weight;
+        this->_segmentCount = cluster._segmentCount;
+        
+        cluster._count = 0;
+        return *this;
+    }
 };

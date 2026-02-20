@@ -64,7 +64,7 @@ public func speakerEmbeddingLoad(
     vectorOut.pointee = embedding.embedding.baseAddress
     
     // Copy length
-    weightOut.pointee = Float(embedding.length)
+    weightOut.pointee = Float(embedding.length) / 31.0
 }
 
 @_cdecl("swiftSpeakerEmbeddingRetain")

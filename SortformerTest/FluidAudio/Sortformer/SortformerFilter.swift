@@ -10,15 +10,19 @@ import Accelerate
 
 /// EMA filter for smoothing predictions using FIFO queue as reference
 internal class SortformerFilter {
-    private let weights: [Float]
+    private let defaultWeights: [Float]
+    private var weights: [Float]
     private var tmpBuffer: [Float]
     public let windowSize: Int
+    public let numSpeakers: Int
 
     /// - Parameters:
     ///   - weights: EMA alpha weights [T] - higher = more weight on original x, lower = more weight on new y
     ///   - numSpeakers: Number of speakers
     init(weights: [Float], numSpeakers: Int) {
         self.windowSize = weights.count
+        self.numSpeakers = numSpeakers
+        self.defaultWeights = weights
         // Interleave weights for [T, numSpeakers] layout
         self.weights = weights.flatMap {
             Array(repeating: $0, count: numSpeakers)
@@ -46,6 +50,12 @@ internal class SortformerFilter {
         
         // x <- tmp + y = [(x - y) * α] + y
         vDSP_vadd(tmpBuffer, 1, y, 1, result, 1, vCount)
+    }
+    
+    func reset() {
+        self.weights = self.defaultWeights.flatMap {
+            Array(repeating: $0, count: self.numSpeakers)
+        }
     }
 }
 

@@ -30,26 +30,6 @@ struct AHCDendrogramModel: Equatable {
         self.updatedAt = updatedAt
     }
 
-    init(snapshot: AHCDendrogramSnapshot) {
-        self.rootIndex = snapshot.rootIndex
-        self.activeLeafCount = snapshot.activeLeafCount
-        self.nodes = snapshot.nodes.map { node in
-            AHCDendrogramNodeModel(
-                id: node.index,
-                matrixIndex: node.matrixIndex,
-                leftChild: node.leftChild,
-                rightChild: node.rightChild,
-                speakerIndex: node.speakerIndex,
-                count: node.count,
-                weight: node.weight,
-                mergeDistance: node.mergeDistance,
-                mustLink: node.mustLink,
-                exceedsLinkageThreshold: node.exceedsLinkageThreshold
-            )
-        }
-        self.updatedAt = Date()
-    }
-
     static let empty = AHCDendrogramModel(rootIndex: -1, activeLeafCount: 0, nodes: [], updatedAt: .distantPast)
 
     var isEmpty: Bool {
