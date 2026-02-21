@@ -7,22 +7,21 @@
 #include <queue>
 
 
-Dendrogram::Dendrogram(EmbeddingDistanceMatrix const& distMat, bool ignoreTentative) {
+Dendrogram::Dendrogram(CDistanceMatrix const& distMat, bool ignoreTentative) {
     // Setup
     long nodesRemaining = distMat.embeddingCount() - (ignoreTentative ? 0L : distMat.tentativeCount());
     if (nodesRemaining == 0) return;
     
-    auto size = distMat.size();
     this->count = nodesRemaining * 2 - 1;
-    this->_nodes = std::make_shared<DendrogramNode[]>(std::max(count, size));
+    this->_nodes = std::make_shared<DendrogramNode[]>(std::max(count, distMat._size));
 
     Aux aux = {
             .linkagePolicy          = distMat.linkagePolicy,
-            .matrix                 = new float[distMat.data->matrixEndIndex],
-            .activeFlags            = new bool[size],
-            .matrixToNode           = new long[size],
-            .freeIndices            = distMat.data->freeIndices,
-            .size                   = size,
+            .matrix                 = new float[distMat._matrixEndIndex],
+            .activeFlags            = new bool[distMat._size],
+            .matrixToNode           = new long[distMat._size],
+            .freeIndices            = distMat._freeIndices,
+            .size                   = distMat._size,
             .numClustersRemaining   = nodesRemaining
     };
 
@@ -30,7 +29,7 @@ Dendrogram::Dendrogram(EmbeddingDistanceMatrix const& distMat, bool ignoreTentat
     int numActive = 0;
 
     // Fill _nodes and aux
-    for (int i = 0; i < size; ++i) {
+    for (int i = 0; i < distMat._size; ++i) {
         bool isActive = distMat._embeddings[i].hasVector();
         aux.matrixToNode[i] = i;
         aux.activeFlags[i] = isActive;
@@ -49,7 +48,7 @@ Dendrogram::Dendrogram(EmbeddingDistanceMatrix const& distMat, bool ignoreTentat
     }
     
     if (ignoreTentative) {
-        for (auto [_, index]: distMat.data->tentativeIndices) {
+        for (auto [_, index]: distMat._tentativeIndices) {
             aux.freeIndices.push_back(index);
             aux.activeFlags[index] = false;
             --numActive;
@@ -67,7 +66,7 @@ Dendrogram::Dendrogram(EmbeddingDistanceMatrix const& distMat, bool ignoreTentat
     }
     
     // Copy the distance matrix
-    std::copy(distMat.matrix, distMat.matrix + distMat.data->matrixEndIndex, aux.matrix);
+    std::copy(distMat.matrix, distMat.matrix + distMat._matrixEndIndex, aux.matrix);
 
     // Build the _nodes
     buildDendrogram(aux);

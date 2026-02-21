@@ -8,7 +8,8 @@
 import Foundation
 import AHCClustering
 
-let globalConfig: SortformerConfig = .nvidiaHighLatency
+let globalConfig: SortformerConfig = .default
+//let globalConfig: SortformerConfig = .nvidiaHighLatency
 //let globalConfig: SortformerConfig = .nvidiaLowLatency
 
 /// Linkage policy used by the live dendrogram visualization.

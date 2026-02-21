@@ -579,7 +579,7 @@ public protocol SortformerFrameRange {
 
 public protocol SpeakerFrameRange: SortformerFrameRange {
     /// Speaker index in Sortformer's output
-    var speakerIndex: Int { get }
+    var slot: Int { get }
 
     /// Check if the ranges overlap or touch
     func isContiguous<T>(with other: T, ensuringSameSpeaker: Bool) -> Bool
@@ -596,7 +596,7 @@ public protocol SpeakerFrameRange: SortformerFrameRange {
 
 internal struct SortformerFrameRangeHelpers {
     static func overlaps<L, R>(_ lhs: L, _ rhs: R, ensuringSameSpeaker: Bool) -> Bool where L: SpeakerFrameRange, R: SpeakerFrameRange {
-        let sameSpeaker = !ensuringSameSpeaker || lhs.speakerIndex == rhs.speakerIndex
+        let sameSpeaker = !ensuringSameSpeaker || lhs.slot == rhs.slot
         return sameSpeaker && lhs.frames.overlaps(rhs.frames)
     }
     
@@ -605,7 +605,7 @@ internal struct SortformerFrameRangeHelpers {
     }
     
     static func isContiguous<L, R>(_ lhs: L, _ rhs: R, ensuringSameSpeaker: Bool) -> Bool where L: SpeakerFrameRange, R: SpeakerFrameRange {
-        let sameSpeaker = !ensuringSameSpeaker || lhs.speakerIndex == rhs.speakerIndex
+        let sameSpeaker = !ensuringSameSpeaker || lhs.slot == rhs.slot
         return sameSpeaker && lhs.startFrame <= rhs.endFrame && lhs.endFrame >= rhs.startFrame
     }
     
@@ -616,7 +616,7 @@ internal struct SortformerFrameRangeHelpers {
     }
     
     static func overlapLength<L, R>(_ lhs: L, _ rhs: R, ensuringSameSpeaker: Bool) -> Int where L: SpeakerFrameRange, R: SpeakerFrameRange {
-        guard !ensuringSameSpeaker || lhs.speakerIndex == rhs.speakerIndex else { return 0 }
+        guard !ensuringSameSpeaker || lhs.slot == rhs.slot else { return 0 }
         let overlapStart = max(lhs.startFrame, rhs.startFrame)
         let overlapEnd = min(lhs.endFrame, rhs.endFrame)
         return max(0, overlapEnd - overlapStart)
@@ -627,7 +627,7 @@ internal struct SortformerFrameRangeHelpers {
     }
     
     static func checkEqual<L, R>(_ lhs: L, _ rhs: R) -> Bool where L: SpeakerFrameRange, R: SpeakerFrameRange {
-        return lhs.speakerIndex == rhs.speakerIndex && lhs.startFrame == rhs.startFrame && lhs.endFrame == rhs.endFrame
+        return lhs.slot == rhs.slot && lhs.startFrame == rhs.startFrame && lhs.endFrame == rhs.endFrame
     }
     
     static func checkLessThan<L, R>(_ lhs: L, _ rhs: R) -> Bool where L: SortformerFrameRange, R: SortformerFrameRange {

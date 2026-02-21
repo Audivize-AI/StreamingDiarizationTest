@@ -115,7 +115,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     public private(set) var id: UUID = .zero
 
     /// Speaker index in Sortformer output
-    public var speakerIndex: Int
+    public var slot: Int
 
     /// Index of segment start frame
     public var startFrame: Int
@@ -138,8 +138,8 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// IDs of the corresponding `SortformerSegments`
     public var segmentIds: ContiguousArray<UUID>
     
-    public var isNone: Bool { speakerIndex < 0 }
-    public var isValid: Bool { speakerIndex >= 0 }
+    public var isNone: Bool { slot < 0 }
+    public var isValid: Bool { slot >= 0 }
     
     public static let none: EmbeddingSegment = .init(speakerIndex: -1, startFrame: 0, endFrame: 0, segmentIds: [])
     
@@ -151,7 +151,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         finalized: Bool = true,
         segmentIds: ContiguousArray<UUID> = []
     ) {
-        self.speakerIndex = speakerIndex
+        self.slot = speakerIndex
         self.startFrame = startFrame
         self.endFrame = endFrame
         self.isFinalized = finalized
@@ -166,7 +166,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         finalized: Bool = true,
         segmentId: UUID
     ) {
-        self.speakerIndex = speakerIndex
+        self.slot = speakerIndex
         self.startFrame = startFrame
         self.endFrame = endFrame
         self.isFinalized = finalized
@@ -492,7 +492,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// This requires that the last segment ID in this segment is the first segment ID in `other`.
     /// - Note: Segments can only absorb segments built after itself.
     internal func mustLink(with other: EmbeddingSegment) -> Bool {
-        return (self.speakerIndex == other.speakerIndex &&
+        return (self.slot == other.slot &&
                 self.segmentIds.last == other.segmentIds.first)
     }
     

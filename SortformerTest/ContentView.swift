@@ -239,7 +239,7 @@ struct ContentView: View {
                     Text("Annotate Segment")
                         .font(.headline)
                     
-                    Text("Speaker \(segment.speakerIndex): \(String(format: "%.2f", segment.startTime))s - \(String(format: "%.2f", segment.endTime))s")
+                    Text("Speaker \(segment.slot): \(String(format: "%.2f", segment.startTime))s - \(String(format: "%.2f", segment.endTime))s")
                         .foregroundColor(.secondary)
                     
                     TextField("Label (e.g., name or ID)", text: $annotationText)
@@ -299,7 +299,7 @@ struct ContentView: View {
         
         for segment in allSegments {
             // Use annotation if available, otherwise use original speaker index
-            let label = viewModel.getAnnotation(for: segment) ?? String(segment.speakerIndex)
+            let label = viewModel.getAnnotation(for: segment) ?? String(segment.slot)
             let startStr = String(format: "%.2f", segment.startTime)
             let endStr = String(format: "%.2f", segment.endTime)
             output += "\(label),\(startStr),\(endStr)\n"

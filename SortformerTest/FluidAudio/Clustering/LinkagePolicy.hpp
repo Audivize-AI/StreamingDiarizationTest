@@ -16,7 +16,7 @@ enum class LinkagePolicyType {
     upgma,
 };
 
-class EmbeddingDistanceMatrix;
+class CDistanceMatrix;
 
 class LinkagePolicy {
 public:
@@ -51,7 +51,7 @@ public:
     }
     
     [[nodiscard]] static SpeakerEmbeddingWrapper computeCentroid(const LinkagePolicy* policy,
-                                                                 EmbeddingDistanceMatrix matrix,
+                                                                 CDistanceMatrix matrix,
                                                                  const Cluster &cluster);
     
 protected:

@@ -11,79 +11,61 @@
 
 class Dendrogram;
 
-class EmbeddingDistanceMatrix {
+class CDistanceMatrix {
 private:
-    struct ControlBlock {
-        std::vector<std::ptrdiff_t> freeIndices{};
-        std::unordered_map<UUIDWrapper, long> tentativeIndices{};
-        long embeddingCount{0};
-        long capacity{0};
-        long size{0};
-        long matrixEndIndex{0};
-        std::size_t refcount{1};
-        
-        ControlBlock() = default;
-    };
-    
     float* matrix;
     SpeakerEmbeddingWrapper* _embeddings;
-    ControlBlock* data;
+    std::vector<std::ptrdiff_t> _freeIndices{};
+    std::unordered_map<UUIDWrapper, long> _tentativeIndices{};
+    long _embeddingCount{0};
+    long _capacity{0};
+    long _size{0};
+    long _matrixEndIndex{0};
     const LinkagePolicy* linkagePolicy{nullptr};
 
     friend class Dendrogram;
     
     void remove(long index, bool canBeTentative);
     
-    inline void inc() const { if (data) ++data->refcount; };
-    
-    inline void dec() {
-        if (!data) return;
-        if (--(data->refcount) <= 0) {
-            delete[] matrix;
-            delete[] _embeddings;
-            delete data;
-        }
-    }
-    
 public:
-    EmbeddingDistanceMatrix() = delete;
-    explicit EmbeddingDistanceMatrix(const LinkagePolicy* linkagePolicy);
-    EmbeddingDistanceMatrix(EmbeddingDistanceMatrix&& other) noexcept;
-    EmbeddingDistanceMatrix(const EmbeddingDistanceMatrix&);
-    ~EmbeddingDistanceMatrix();
+    CDistanceMatrix() = default;
+    explicit CDistanceMatrix(const LinkagePolicy* linkagePolicy);
+    CDistanceMatrix(CDistanceMatrix&& other) noexcept;
+    CDistanceMatrix(const CDistanceMatrix&) = delete;
+    ~CDistanceMatrix();
     
     [[nodiscard]] inline long embeddingCount() const {
-        return data->embeddingCount;
+        return _embeddingCount;
     }
     
     [[nodiscard]] inline long finalizedCount() const {
-        return data->embeddingCount - static_cast<long>(data->tentativeIndices.size());
+        return _embeddingCount - static_cast<long>(_tentativeIndices.size());
     }
     
     [[nodiscard]] inline long tentativeCount() const {
-        return static_cast<long>(data->tentativeIndices.size());
+        return static_cast<long>(_tentativeIndices.size());
     }
     
     [[nodiscard]] inline std::vector<long> tentativeIndices() const {
-        auto view = data->tentativeIndices | std::views::values;
+        auto view = _tentativeIndices | std::views::values;
         return {view.begin(), view.end()};
     }
     
     [[nodiscard]] inline std::vector<UUIDWrapper> tentativeIDs() const {
-        auto view = data->tentativeIndices | std::views::keys;
+        auto view = _tentativeIndices | std::views::keys;
         return {view.begin(), view.end()};
     }
     
     [[nodiscard]] inline std::vector<std::pair<UUIDWrapper, long>> tentatives() const {
-        return {data->tentativeIndices.begin(), data->tentativeIndices.end()};
+        return {_tentativeIndices.begin(), _tentativeIndices.end()};
     }
     
     [[nodiscard]] inline long size() const {
-        return data->size;
+        return _size;
     }
     
     [[nodiscard]] inline long capacity() const {
-        return data->capacity;
+        return _capacity;
     }
     
     [[nodiscard]] inline const SpeakerEmbeddingWrapper* embeddings() const {
@@ -161,7 +143,7 @@ public:
      * @param indices Indices of the embeddings to gather/isolate 
      * @return The new distance matrix
      */
-    inline EmbeddingDistanceMatrix gatherAndPop(std::vector<long> const& indices) {
+    inline CDistanceMatrix gatherAndPop(std::vector<long> const& indices) {
         return gatherAndPop(std::span<const long>(indices.begin(), indices.end()));
     }
     
@@ -170,14 +152,20 @@ public:
      * @param indices Indices of the embeddings to gather/isolate
      * @return The new distance matrix
      */
-    EmbeddingDistanceMatrix gatherAndPop(std::span<const long> indices);
+    CDistanceMatrix gatherAndPop(std::span<const long> indices);
 
     /**
      * @brief Absorb another distance matrix
      * @param other Matrix to absorb
      */
-    void absorb(const EmbeddingDistanceMatrix& other);
+    void absorb(const CDistanceMatrix& other);
+
+    /**
+     * @brief Insert all tentative embeddings from another matrix into this matrix.
+     * @param other Source matrix
+     */
+    void insertTentativeFrom(const CDistanceMatrix& other);
     
-    EmbeddingDistanceMatrix& operator=(const EmbeddingDistanceMatrix&);
-    EmbeddingDistanceMatrix& operator=(EmbeddingDistanceMatrix&&) noexcept;
+    CDistanceMatrix& operator=(const CDistanceMatrix&) = delete;
+    CDistanceMatrix& operator=(CDistanceMatrix&&) noexcept;
 };

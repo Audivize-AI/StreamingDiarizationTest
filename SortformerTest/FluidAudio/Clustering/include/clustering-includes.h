@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../EmbeddingDistanceMatrix.hpp"
+#include "../CDistanceMatrix.hpp"
+#include "../AHCSpeakerForestBridge.h"
 #include "../LinkagePolicy.hpp"
 #include "../Dendrogram.hpp"
 #include "../EmbeddingSegmentWrapper.hpp"

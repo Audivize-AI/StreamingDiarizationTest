@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "EmbeddingDistanceMatrix.hpp"
+#include "CDistanceMatrix.hpp"
 #include "Cluster.hpp"
 #include "LinkagePolicy.hpp"
 #include <unordered_set>
@@ -16,7 +16,7 @@ public:
     Dendrogram() = default;
     Dendrogram(Dendrogram const& clustering) = default;
     Dendrogram(Dendrogram&& clustering) noexcept;
-    explicit Dendrogram(EmbeddingDistanceMatrix const& embeddingMatrix, bool ignoreTentative = false);
+    explicit Dendrogram(CDistanceMatrix const& embeddingMatrix, bool ignoreTentative = false);
     
     // Get number of nodes
     [[nodiscard]] inline long nodeCount() const { return count; }

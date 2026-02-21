@@ -1,47 +1,45 @@
 //
 // Created by Benjamin Lee on 1/29/26.
 //
-#include "EmbeddingDistanceMatrix.hpp"
+#include "CDistanceMatrix.hpp"
 #include "Dendrogram.hpp"
 
 
-EmbeddingDistanceMatrix::EmbeddingDistanceMatrix(const LinkagePolicy* linkagePolicy): 
+CDistanceMatrix::CDistanceMatrix(const LinkagePolicy* linkagePolicy): 
         matrix(nullptr),
         _embeddings(nullptr),
-        linkagePolicy(linkagePolicy),
-        data(new ControlBlock()) {}
+        linkagePolicy(linkagePolicy) {}
 
-EmbeddingDistanceMatrix::EmbeddingDistanceMatrix(EmbeddingDistanceMatrix const& other) :
+CDistanceMatrix::CDistanceMatrix(CDistanceMatrix&& other) noexcept :
         matrix(other.matrix),
         _embeddings(other._embeddings),
-        data(other.data),
-        linkagePolicy(other.linkagePolicy)
-{
-    inc();
-}
-
-EmbeddingDistanceMatrix::EmbeddingDistanceMatrix(EmbeddingDistanceMatrix&& other) noexcept :
-        matrix(other.matrix),
-        _embeddings(other._embeddings),
-        data(other.data),
+        _tentativeIndices(std::move(other._tentativeIndices)),
+        _freeIndices(std::move(other._freeIndices)),
+        _size(other._size),
+        _capacity(other._capacity),
+        _embeddingCount(other._embeddingCount),
+        _matrixEndIndex(other._matrixEndIndex),
         linkagePolicy(other.linkagePolicy)
 {
     other.matrix = nullptr;
     other._embeddings = nullptr;
-    other.data = nullptr;
+    other._size = 0;
+    other._capacity = 0;
+    other._embeddingCount = 0;
+    other._matrixEndIndex = 0;
 }
 
-EmbeddingDistanceMatrix::~EmbeddingDistanceMatrix() {
-    dec();
+CDistanceMatrix::~CDistanceMatrix() {
+    delete[] matrix;
+    delete[] _embeddings;
 }
 
-void EmbeddingDistanceMatrix::reserve(long newCapacity) {
-    if (newCapacity <= data->capacity)
+void CDistanceMatrix::reserve(long newCapacity) {
+    if (newCapacity <= _capacity)
         return;
     
     // Copy embeddings
     auto newEmbeddings = new SpeakerEmbeddingWrapper[newCapacity]{};
-    auto _size = data->size;
     if (_embeddings != nullptr) {
         for (auto i = 0; i < _size; ++i) {
             newEmbeddings[i] = std::move(_embeddings[i]);
@@ -54,16 +52,16 @@ void EmbeddingDistanceMatrix::reserve(long newCapacity) {
     auto newMatrixCapacity = newCapacity * (newCapacity - 1) / 2;
     auto newMatrix = new float[newMatrixCapacity];
     if (matrix != nullptr) {
-        std::memcpy(newMatrix, matrix, data->matrixEndIndex * sizeof(float));
+        std::memcpy(newMatrix, matrix, _matrixEndIndex * sizeof(float));
         delete[] matrix;
     }
     matrix = newMatrix;
     
-    data->capacity = newCapacity;
+    _capacity = newCapacity;
 }
 
 
-float EmbeddingDistanceMatrix::distance(long row, long col) const {
+float CDistanceMatrix::distance(long row, long col) const {
     // Diagonal elements are always 0 because cosineDistance(E, E) = 0
     if (row == col)
         return 0.f;
@@ -77,20 +75,18 @@ float EmbeddingDistanceMatrix::distance(long row, long col) const {
 }
 
 
-void EmbeddingDistanceMatrix::insert(SpeakerEmbeddingWrapper const& embedding, bool isTentative) {
+void CDistanceMatrix::insert(SpeakerEmbeddingWrapper const& embedding, bool isTentative) {
     long index, matrixIndex;
-    auto _size = data->size;
     
-    if (data->freeIndices.empty()) {
-        auto _capacity = data->capacity;
-        index = _size++;
+    if (_freeIndices.empty()) {
+        index = _size;
         // Ensure there is enough capacity if appending to the end
-        if (_size > _capacity)
-            reserve(std::max(_capacity * 2, _size));
-        data->matrixEndIndex += data->size++;
+        if (_size + 1 > _capacity)
+            reserve(std::max(_capacity * 2, _size + 1));
+        _matrixEndIndex += _size++;
     } else {
-        index = data->freeIndices.back();
-        data->freeIndices.pop_back();
+        index = _freeIndices.back();
+        _freeIndices.pop_back();
 
         // Update each (row, index) squaredDistanceTo for row > index
         // Start at (r, c) = (index + 1, index)
@@ -108,14 +104,14 @@ void EmbeddingDistanceMatrix::insert(SpeakerEmbeddingWrapper const& embedding, b
     }
 
     _embeddings[index] = embedding;
-    ++data->embeddingCount;
+    ++_embeddingCount;
 
     if (isTentative)
-        data->tentativeIndices[embedding.id()] = index;
+        _tentativeIndices[embedding.id()] = index;
 }
 
 
-void EmbeddingDistanceMatrix::replace(long index, SpeakerEmbeddingWrapper& embedding) {
+void CDistanceMatrix::replace(long index, SpeakerEmbeddingWrapper& embedding) {
     if (_embeddings[index] == embedding) return;
     
     // Update each (index, col)
@@ -125,7 +121,6 @@ void EmbeddingDistanceMatrix::replace(long index, SpeakerEmbeddingWrapper& embed
         matrix[matrixIndex++] = linkagePolicy->distance(embedding, _embeddings[i]);
     }
 
-    auto _size = data->size;
     if (index < _size) {
         // Update each (r, index) squaredDistanceTo for r > index
         // Start at (r, c) = (index + 1, 0)
@@ -141,24 +136,23 @@ void EmbeddingDistanceMatrix::replace(long index, SpeakerEmbeddingWrapper& embed
 }
 
 
-void EmbeddingDistanceMatrix::remove(long index, bool canBeTentative) {
-    auto _size = data->size;
+void CDistanceMatrix::remove(long index, bool canBeTentative) {
     if (index >= _size || _embeddings[index].expired())
         return;
     if (index < _size - 1)
-        data->freeIndices.emplace_back(index);
+        _freeIndices.emplace_back(index);
     else
-        data->matrixEndIndex -= --data->size;
+        _matrixEndIndex -= --_size;
     
     if (canBeTentative)
-        data->tentativeIndices.erase(_embeddings[index].id());
+        _tentativeIndices.erase(_embeddings[index].id());
     
     _embeddings[index].releaseVector();
-    --data->embeddingCount;
+    --_embeddingCount;
 }
 
 
-void EmbeddingDistanceMatrix::stream(std::span<EmbeddingSegmentWrapper> newFinalized, std::span<EmbeddingSegmentWrapper> newTentative) {
+void CDistanceMatrix::stream(std::span<EmbeddingSegmentWrapper> newFinalized, std::span<EmbeddingSegmentWrapper> newTentative) {
     std::unordered_map<UUIDWrapper, long> keptTentativeIndices = {};
     std::vector<SpeakerEmbeddingWrapper> unseenFinalized = {};
     std::vector<SpeakerEmbeddingWrapper> unseenTentative = {};
@@ -167,15 +161,14 @@ void EmbeddingDistanceMatrix::stream(std::span<EmbeddingSegmentWrapper> newFinal
     keptTentativeIndices.reserve(newTentative.size());
 
     // Filter for unmatched embeddings in both the tentative indices and the incoming embeddings
-    auto tentativeIndices = std::move(data->tentativeIndices);
     for (auto& segment : newTentative) {
 #if (!MUST_LINK)
         for (auto& segment: segment.embeddings()) {
 #endif
             const auto id = segment.id();
-            auto pIndex = tentativeIndices.find(id);
+            auto pIndex = _tentativeIndices.find(id);
             
-            if (pIndex == tentativeIndices.end()) {
+            if (pIndex == _tentativeIndices.end()) {
 #if (MUST_LINK)
                 unseenTentative.emplace_back(segment.centroid(linkagePolicy));
 #else
@@ -185,7 +178,7 @@ void EmbeddingDistanceMatrix::stream(std::span<EmbeddingSegmentWrapper> newFinal
             }
             
             auto index = pIndex->second;
-            if (tentativeIndices.erase(id))
+            if (_tentativeIndices.erase(id))
                 keptTentativeIndices[id] = index;
 #if (!MUST_LINK)
         }
@@ -197,9 +190,9 @@ void EmbeddingDistanceMatrix::stream(std::span<EmbeddingSegmentWrapper> newFinal
         for (auto& segment : segment.embeddings()) {
 #endif
             const auto id = segment.id();
-            auto pIndex = tentativeIndices.find(id);
+            auto pIndex = _tentativeIndices.find(id);
             
-            if (pIndex == tentativeIndices.end()) {
+            if (pIndex == _tentativeIndices.end()) {
 #if (MUST_LINK)
                 unseenFinalized.emplace_back(segment.centroid(linkagePolicy));
 #else
@@ -208,17 +201,17 @@ void EmbeddingDistanceMatrix::stream(std::span<EmbeddingSegmentWrapper> newFinal
                 continue;
             }
             
-            tentativeIndices.erase(id);
+            _tentativeIndices.erase(id);
 #if (!MUST_LINK)
         }
 #endif
     }
 
     // Remove unmatched indices
-    for (auto [_, index]: tentativeIndices)
+    for (auto [_, index]: _tentativeIndices)
         remove(index, false);
     
-    data->tentativeIndices = std::move(keptTentativeIndices);
+    _tentativeIndices = std::move(keptTentativeIndices);
 
     // Append new embeddings
     for (auto& embedding: unseenFinalized)
@@ -228,40 +221,36 @@ void EmbeddingDistanceMatrix::stream(std::span<EmbeddingSegmentWrapper> newFinal
         insert(embedding, true);
 }
 
-EmbeddingDistanceMatrix& EmbeddingDistanceMatrix::operator=(const EmbeddingDistanceMatrix& other) {
-    if (this == &other) return *this;
-    if (this->data == other.data) return *this;
-    dec();
+CDistanceMatrix& CDistanceMatrix::operator=(CDistanceMatrix&& other) noexcept {
+    delete[] matrix;
+    delete[] _embeddings;
     matrix = other.matrix;
     _embeddings = other._embeddings;
-    data = other.data;
-    inc();
-    return *this;
-}
-
-EmbeddingDistanceMatrix& EmbeddingDistanceMatrix::operator=(EmbeddingDistanceMatrix&& other) noexcept {
-    if (this->data == other.data) return *this;
-    dec();
-    matrix = other.matrix;
-    _embeddings = other._embeddings;
-    data = other.data;
+    _size = other._size;
+    _capacity = other._capacity;
+    _embeddingCount = other._embeddingCount;
+    _matrixEndIndex = other._matrixEndIndex;
+    
     other.matrix = nullptr;
     other._embeddings = nullptr;
-    other.data = nullptr;
+    other._size = 0;
+    other._capacity = 0;
+    other._embeddingCount = 0;
+    other._matrixEndIndex = 0;
     return *this;
 }
 
-EmbeddingDistanceMatrix EmbeddingDistanceMatrix::gatherAndPop(std::span<const long> indices) {
+CDistanceMatrix CDistanceMatrix::gatherAndPop(std::span<const long> indices) {
     const auto k = static_cast<long>(indices.size());
-    if (k == 0) return EmbeddingDistanceMatrix(linkagePolicy);
+    if (k == 0) return CDistanceMatrix(linkagePolicy);
     
-    EmbeddingDistanceMatrix result(linkagePolicy);
+    CDistanceMatrix result(linkagePolicy);
     result.reserve(k);
     
-    result.data->size = k;
-    result.data->embeddingCount = k;
-    result.data->matrixEndIndex = k * (k - 1) / 2;
-    this->data->embeddingCount -= k;
+    result._size = k;
+    result._embeddingCount = k;
+    result._matrixEndIndex = k * (k - 1) / 2;
+    this->_embeddingCount -= k;
 
     // Copy pairwise distances directly from the source packed lower-triangular matrix.
     for (long newRow = 1; newRow < k; ++newRow) {
@@ -277,12 +266,7 @@ EmbeddingDistanceMatrix EmbeddingDistanceMatrix::gatherAndPop(std::span<const lo
     // Transfer embeddings
     long newIndex = 0;
     
-    auto myTentativeIndices = std::move(data->tentativeIndices);
-    auto myFreeIndices = std::move(data->freeIndices);
-    auto mySize = data->size;
-    auto myMatrixEndIndex = data->matrixEndIndex;
-    std::unordered_map<UUIDWrapper, long> splitTentativeIndices{};
-    splitTentativeIndices.reserve(myTentativeIndices.size());
+    result._tentativeIndices.reserve(_tentativeIndices.size());
     
     for (auto oldIndex: indices) {
         // Put the embedding in the new matrix
@@ -290,66 +274,66 @@ EmbeddingDistanceMatrix EmbeddingDistanceMatrix::gatherAndPop(std::span<const lo
         dstEmbedding = std::move(this->_embeddings[oldIndex]);
         
         const auto embId = dstEmbedding.id();
-        if (myTentativeIndices.erase(embId))
-            splitTentativeIndices[embId] = newIndex;
+        if (_tentativeIndices.erase(embId))
+            result._tentativeIndices[embId] = newIndex;
         ++newIndex;
         
         // Free the spot in this matrix
-        if (oldIndex < mySize - 1)
-            myFreeIndices.emplace_back(oldIndex);
+        if (oldIndex < _size - 1)
+            _freeIndices.emplace_back(oldIndex);
         else
-            myMatrixEndIndex -= --mySize;
+            _matrixEndIndex -= --_size;
     }
-    
-    result.data->tentativeIndices = std::move(splitTentativeIndices);
-    
-    data->size = mySize;
-    data->matrixEndIndex = myMatrixEndIndex;
-    data->freeIndices = std::move(myFreeIndices);
-    data->tentativeIndices = std::move(myTentativeIndices);
     
     return result;
 }
 
+void CDistanceMatrix::insertTentativeFrom(const CDistanceMatrix& other) {
+    const auto tentativeCount = static_cast<long>(other._tentativeIndices.size());
+    if (tentativeCount == 0) return;
 
-void EmbeddingDistanceMatrix::absorb(const EmbeddingDistanceMatrix& other) {
-    auto otherEmbeddingCount = other.data->embeddingCount;
-    if (otherEmbeddingCount == 0) return;
-    auto otherSize = other.data->size;
-    auto otherTentativeIndices = std::move(other.data->tentativeIndices);
-    
-    auto myCapacity = data->capacity;
-    auto myEmbeddingCount = data->embeddingCount;
-    auto myMatrixEndIndex = data->matrixEndIndex;
-    auto mySize = data->size;
-    auto myFreeIndices = std::move(data->freeIndices);
-    auto myTentativeIndices = std::move(data->tentativeIndices);
+    const auto targetCount = _embeddingCount + tentativeCount;
+    if (targetCount > _capacity) {
+        reserve(std::max(_capacity * 2, targetCount));
+    }
+
+    for (const auto& [_, index] : other._tentativeIndices) {
+        if (index < 0 || index >= other._size) continue;
+        const auto& embedding = other._embeddings[index];
+        if (embedding.expired()) continue;
+        insert(embedding, true);
+    }
+}
+
+
+void CDistanceMatrix::absorb(const CDistanceMatrix& other) {
+    if (other._embeddingCount == 0) return;
     
     // Ensure capacity for all incoming embeddings
-    myEmbeddingCount += otherEmbeddingCount;
-    if (myEmbeddingCount > myCapacity)
-        reserve(std::max(myCapacity * 2, myEmbeddingCount));
+    _embeddingCount += other._embeddingCount;
+    if (_embeddingCount > _capacity)
+        reserve(std::max(_capacity * 2, _embeddingCount));
 
     // Map other's indices to new indices in this matrix.
-    auto oldToNew = std::make_unique<long[]>(otherSize); // index in other -> index in this
-    auto isNew = std::make_unique<bool[]>(mySize);
-    std::fill(oldToNew.get(), oldToNew.get() + otherSize, -1);
-    const auto oldSize = mySize;
+    auto oldToNew = std::make_unique<long[]>(other._size); // index in other -> index in this
+    auto isNew = std::make_unique<bool[]>(_size);
+    std::fill(oldToNew.get(), oldToNew.get() + other._size, -1);
+    const auto oldSize = _size;
     
     // Transfer embeddings
-    for (long i = 0; i < otherSize; ++i) {
+    for (long i = 0; i < other._size; ++i) {
         if (other._embeddings[i].expired())
             continue;
         
         // Get next index
         long nextIndex;
-        if (!myFreeIndices.empty()) {
-            nextIndex = myFreeIndices.back();
-            myFreeIndices.pop_back();
+        if (!_freeIndices.empty()) {
+            nextIndex = _freeIndices.back();
+            _freeIndices.pop_back();
             isNew[nextIndex] = true;
         } else {
-            nextIndex = mySize;
-            myMatrixEndIndex += mySize++;
+            nextIndex = _size;
+            _matrixEndIndex += _size++;
         }
         oldToNew[i] = nextIndex;
         
@@ -358,8 +342,8 @@ void EmbeddingDistanceMatrix::absorb(const EmbeddingDistanceMatrix& other) {
         dstEmbedding = other._embeddings[i];
         
         auto embId = dstEmbedding.id();
-        if (otherTentativeIndices.contains(embId))
-            myTentativeIndices[embId] = nextIndex;
+        if (other._tentativeIndices.contains(embId))
+            _tentativeIndices[embId] = nextIndex;
         
         // Compute intra-matrix distances
         auto dstMatrixIndex = nextIndex * (nextIndex - 1) / 2;
@@ -387,7 +371,7 @@ void EmbeddingDistanceMatrix::absorb(const EmbeddingDistanceMatrix& other) {
     }
     
     // Copy pairwise distances
-    for (long rOld = 1; rOld < otherSize; ++rOld) {
+    for (long rOld = 1; rOld < other._size; ++rOld) {
         const auto rNew = oldToNew[rOld];
         const auto srcBase = rNew * (rNew - 1) / 2;
         for (auto cOld = 0; cOld < rOld; ++cOld) {
@@ -396,16 +380,8 @@ void EmbeddingDistanceMatrix::absorb(const EmbeddingDistanceMatrix& other) {
             this->matrix[r * (r - 1) / 2 + c] = other.matrix[srcBase + cOld];
         }
     }
-    
-    other.data->tentativeIndices = std::move(otherTentativeIndices);
-    
-    data->size = mySize;
-    data->embeddingCount = myEmbeddingCount;
-    data->matrixEndIndex = myMatrixEndIndex;
-    data->freeIndices = std::move(myFreeIndices);
-    data->tentativeIndices = std::move(myTentativeIndices);
 }
 
-Dendrogram EmbeddingDistanceMatrix::dendrogram(bool ignoreTentative) const {
+Dendrogram CDistanceMatrix::dendrogram(bool ignoreTentative) const {
     return Dendrogram(*this, ignoreTentative);
 }

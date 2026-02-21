@@ -241,7 +241,7 @@ struct SpeechPlotView: View {
                             let idStr = segment.id.uuidString.prefix(4)
                             
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Spk \(segment.speakerIndex): \(startStr)s - \(endStr)s (\(durationStr)s)")
+                                Text("Spk \(segment.slot): \(startStr)s - \(endStr)s (\(durationStr)s)")
                                 Text("ID: \(idStr)")
                                     .font(.caption2)
                                     .foregroundColor(.gray)
@@ -258,10 +258,10 @@ struct SpeechPlotView: View {
                             let endStr = String(format: "%.2f", Float(embSegment.endFrame) * 0.08)
                             
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Spk \(embSegment.speakerIndex): \(startStr)s - \(endStr)s")
+                                Text("Spk \(embSegment.slot): \(startStr)s - \(endStr)s")
                                 if !embSegment.segmentIds.isEmpty {
                                     let ids = embSegment.segmentIds.map { $0.uuidString.prefix(4) }.joined(separator: ", ")
-                                    Text("Speaker: \(embSegment.speakerIndex), IDs: [\(ids)]")
+                                    Text("Speaker: \(embSegment.slot), IDs: [\(ids)]")
                                         .font(.caption2)
                                         .foregroundColor(.gray)
                                 }
@@ -591,14 +591,14 @@ struct SpeechPlotView: View {
         // Finalized embeddings
         for segment in tl.embeddingSegments {
             for emb in segment.embeddings {
-                allEmbeddings.append((emb, segment.speakerIndex, false))
+                allEmbeddings.append((emb, segment.slot, false))
             }
         }
         
         // Tentative embeddings
         for segment in tl.tentativeEmbeddingSegments {
             for emb in segment.embeddings {
-                allEmbeddings.append((emb, segment.speakerIndex, true))
+                allEmbeddings.append((emb, segment.slot, true))
             }
         }
         
@@ -709,12 +709,12 @@ struct SpeechPlotView: View {
     @inline(__always)
     private func embeddingSegmentAt(frame: Int, preferredSpeaker: Int, timeline: SortformerTimeline) -> EmbeddingSegment? {
         let finalized = segmentContaining(frame: frame, in: timeline.embeddingSegments)
-        if let finalized, finalized.speakerIndex == preferredSpeaker {
+        if let finalized, finalized.slot == preferredSpeaker {
             return finalized
         }
 
         let tentative = segmentContaining(frame: frame, in: timeline.tentativeEmbeddingSegments)
-        if let tentative, tentative.speakerIndex == preferredSpeaker {
+        if let tentative, tentative.slot == preferredSpeaker {
             return tentative
         }
 
@@ -788,14 +788,14 @@ struct SpeechPlotView: View {
         // Finalized embeddings
         for segment in tl.embeddingSegments {
             for emb in segment.embeddings {
-                allEmbeddings.append((emb, segment.speakerIndex))
+                allEmbeddings.append((emb, segment.slot))
             }
         }
         
         // Tentative embeddings
         for segment in tl.tentativeEmbeddingSegments {
             for emb in segment.embeddings {
-                allEmbeddings.append((emb, segment.speakerIndex))
+                allEmbeddings.append((emb, segment.slot))
             }
         }
         
@@ -863,12 +863,12 @@ struct SpeechPlotView: View {
     private func drawSegmentLabel(context: GraphicsContext, segment: SortformerSegment,
                                   cellWidth: CGFloat, cellHeight: CGFloat) {
         let x = CGFloat(segment.startFrame) * cellWidth
-        let y = CGFloat(segment.speakerIndex) * cellHeight
+        let y = CGFloat(segment.slot) * cellHeight
         let segmentWidth = CGFloat(segment.endFrame - segment.startFrame) * cellWidth
         
         // Get annotation or use speaker index
         let key = DiarizerViewModel.segmentKey(segment)
-        let label = segmentAnnotations[key] ?? String(segment.speakerIndex)
+        let label = segmentAnnotations[key] ?? String(segment.slot)
         
         // Only draw if segment is wide enough
         guard segmentWidth > 20 else { return }
@@ -1055,7 +1055,7 @@ struct SpeechPlotView: View {
     
     private func drawSegmentOutline(context: GraphicsContext, segment: SortformerSegment,
                                     cellWidth: CGFloat, cellHeight: CGFloat, tentative: Bool) {
-        let speaker = segment.speakerIndex
+        let speaker = segment.slot
         let startFrame = segment.startFrame
         let endFrame = segment.endFrame
         

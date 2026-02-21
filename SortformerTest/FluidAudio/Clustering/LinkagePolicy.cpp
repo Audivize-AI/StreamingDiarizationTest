@@ -1,5 +1,5 @@
 #include "LinkagePolicy.hpp"
-#include "EmbeddingDistanceMatrix.hpp"
+#include "CDistanceMatrix.hpp"
 
 const UPGMALinkage LinkagePolicy::upgmaLinkage{};
 const WardLinkage LinkagePolicy::wardLinkage{};
@@ -153,7 +153,7 @@ SpeakerEmbeddingWrapper LinkagePolicy::computeCentroidHelper(
 
 
 SpeakerEmbeddingWrapper LinkagePolicy::computeCentroid(const LinkagePolicy* policy,
-                                                       EmbeddingDistanceMatrix matrix,
+                                                       CDistanceMatrix matrix,
                                                        const Cluster &cluster) {
     return policy->computeCentroid(matrix.embeddings(), cluster);
 }

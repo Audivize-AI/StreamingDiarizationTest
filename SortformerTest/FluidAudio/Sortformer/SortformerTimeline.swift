@@ -221,6 +221,24 @@ public class SortformerTimeline {
         }
     }
     
+    private func leastActiveSlot() -> Int {
+        var lowestEnergy: Float = .infinity
+        var lowestEnergyIndex: Int = 0
+        
+        let stride = vDSP_Stride(config.numSpeakers)
+        let length = vDSP_Length(numTentative)
+        for i in (0..<config.numSpeakers) {
+            var totalEnergy: Float = 0
+            vDSP_sve(tentativePredictions, stride, &totalEnergy, length)
+            if totalEnergy < lowestEnergy {
+                lowestEnergy = totalEnergy
+                lowestEnergyIndex = i
+            }
+        }
+        
+        return lowestEnergyIndex
+    }
+    
     /// Remove the speaker at a given index
     public func removeSpeaker(_ speakerIndex: Int) {
         queue.sync(flags: .barrier) {
@@ -237,8 +255,8 @@ public class SortformerTimeline {
                 clearPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: speakerIndex)
                 segments[speakerIndex].removeAll()
                 tentativeSegments[speakerIndex].removeAll()
-                embeddingSegments.removeAll(where: { $0.speakerIndex == speakerIndex })
-                tentativeEmbeddingSegments.removeAll(where: { $0.speakerIndex == speakerIndex })
+                embeddingSegments.removeAll(where: { $0.slot == speakerIndex })
+                tentativeEmbeddingSegments.removeAll(where: { $0.slot == speakerIndex })
                 state.resetSlot(at: speakerIndex)
                 return
             }
@@ -264,7 +282,7 @@ public class SortformerTimeline {
             func shiftSegments(segments: inout [[SortformerSegment]], after index: Int) {
                 for speakerIndex in index+1..<config.numSpeakers {
                     for i in 0..<segments[speakerIndex].count {
-                        segments[speakerIndex][i].speakerIndex -= 1
+                        segments[speakerIndex][i].slot -= 1
                     }
                     segments[speakerIndex - 1] = segments[speakerIndex]
                 }
@@ -272,9 +290,9 @@ public class SortformerTimeline {
             }
             
             func shiftEmbeddingSegments(segments: inout [EmbeddingSegment], after index: Int) {
-                segments.removeAll(where: { $0.speakerIndex == index })
-                for i in 0..<segments.count where segments[i].speakerIndex > index {
-                    segments[i].speakerIndex -= 1
+                segments.removeAll(where: { $0.slot == index })
+                for i in 0..<segments.count where segments[i].slot > index {
+                    segments[i].slot -= 1
                 }
             }
             
@@ -448,13 +466,13 @@ public class SortformerTimeline {
            firstTentativeSegment.isValid,
            firstTentativeSegment.startFrame < firstTentativeFrame {
             
-            let finalizedEnd = oldFinalizedSegmentCounts[firstTentativeSegment.speakerIndex]
-            if let finalizedStart = self.segments[firstTentativeSegment.speakerIndex].prefix(finalizedEnd)
+            let finalizedEnd = oldFinalizedSegmentCounts[firstTentativeSegment.slot]
+            if let finalizedStart = self.segments[firstTentativeSegment.slot].prefix(finalizedEnd)
                     .lastIndex(where: { firstTentativeSegment.startFrame > $0.endFrame })?
                     .advanced(by: 1),
                finalizedStart < finalizedEnd
             {
-                segments.append(contentsOf: self.segments[firstTentativeSegment.speakerIndex][finalizedStart..<finalizedEnd])
+                segments.append(contentsOf: self.segments[firstTentativeSegment.slot][finalizedStart..<finalizedEnd])
             }
         }
         tentativeEmbeddingSegments.removeAll(keepingCapacity: true)
@@ -464,8 +482,8 @@ public class SortformerTimeline {
         boundaryFrames.reserveCapacity(segments.count * 2)
         
         for segment in segments {
-            boundaryFrames.append((segment.startFrame, segment.speakerIndex, true, segment.id, segment.isFinalized))
-            boundaryFrames.append((segment.endFrame, segment.speakerIndex, false, segment.id, segment.isFinalized))
+            boundaryFrames.append((segment.startFrame, segment.slot, true, segment.id, segment.isFinalized))
+            boundaryFrames.append((segment.endFrame, segment.slot, false, segment.id, segment.isFinalized))
         }
         
         // Sort by frame, with ends before starts at the same frame
@@ -515,7 +533,7 @@ public class SortformerTimeline {
                 let isFinalized = isActiveFinalized && endFrame <= firstTentativeFrame
                 
                 if currentSegment.isValid,
-                   activeSpeaker == currentSegment.speakerIndex,
+                   activeSpeaker == currentSegment.slot,
                    startFrame - currentSegment.endFrame < minSegmentGap
                 {
                     // Merge with the previous segment
@@ -637,7 +655,7 @@ public final class SortformerSegment: @unchecked Sendable, Identifiable, Hashabl
     public let id: UUID
 
     /// Speaker index in Sortformer output
-    public var speakerIndex: Int
+    public var slot: Int
 
     /// Index of segment start frame
     public var startFrame: Int
@@ -668,7 +686,7 @@ public final class SortformerSegment: @unchecked Sendable, Identifiable, Hashabl
 
     /// Speaker label (e.g., "Speaker 0")
     public var speakerLabel: String {
-        "Speaker \(speakerIndex)"
+        "Speaker \(slot)"
     }
     
     public var key: SegmentKey { .init(from: self) }
@@ -682,7 +700,7 @@ public final class SortformerSegment: @unchecked Sendable, Identifiable, Hashabl
         frameDurationSeconds: Float = 0.08
     ) {
         self.id = id ?? UUID()
-        self.speakerIndex = speakerIndex
+        self.slot = speakerIndex
         self.startFrame = startFrame
         self.endFrame = endFrame
         self.isFinalized = finalized
@@ -698,7 +716,7 @@ public final class SortformerSegment: @unchecked Sendable, Identifiable, Hashabl
         frameDurationSeconds: Float = 0.08
     ) {
         self.id = id ?? UUID()
-        self.speakerIndex = speakerIndex
+        self.slot = speakerIndex
         self.startFrame = Int(round(startTime / frameDurationSeconds))
         self.endFrame = Int(round(endTime / frameDurationSeconds))
         self.isFinalized = finalized
@@ -761,7 +779,7 @@ public final class SortformerSegment: @unchecked Sendable, Identifiable, Hashabl
         
         return SortformerSegment(
             id: id,
-            speakerIndex: speakerIndex,
+            speakerIndex: slot,
             startFrame: startFrame,
             endFrame: endFrame,
             finalized: isFinalized,
@@ -782,7 +800,7 @@ public final class SortformerSegment: @unchecked Sendable, Identifiable, Hashabl
     public func hash(into hasher: inout Hasher) {
         hasher.combine(startFrame)
         hasher.combine(endFrame)
-        hasher.combine(speakerIndex)
+        hasher.combine(slot)
 //        hasher.combine(id)
     }
     
@@ -809,7 +827,7 @@ public struct SegmentKey: Hashable {
     public init<T>(from segment: T) where T: SpeakerFrameRange {
         self.start = segment.startFrame
         self.end = segment.endFrame
-        self.speakerIndex = segment.speakerIndex
+        self.speakerIndex = segment.slot
     }
     
     public func hash(into hasher: inout Hasher) {

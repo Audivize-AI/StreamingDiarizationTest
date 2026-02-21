@@ -8,36 +8,43 @@
 import Foundation
 import AHCClustering
 
-
-
 class SpeakerProfile {
     typealias ClusterRepresentative = (centroid: SpeakerEmbeddingWrapper, cluster: Cluster)
     
     public let config: ClusteringConfig
 
-    public private(set) var matrix: EmbeddingDistanceMatrix
+    public private(set) var matrix: AHCDistanceMatrix
     public private(set) var dendrogram: Dendrogram
     public private(set) var representatives: [ClusterRepresentative] = []
     public private(set) var slot: Int?
+    public var speakerIndex: Int
     public var cannotLink: Set<Int> = []
+    
+    public var hasOutliers: Bool { !outlierIndices.isEmpty }
+    
+    public var embeddingCount: Int { matrix.embeddingCount() }
+    public var weight: Float { representatives.reduce(0) { $0 + $1.cluster.weight() } }
 
     private let linkagePolicy: UnsafePointer<LinkagePolicy>
     private var outlierIndices: [Int] = []
     
-    init(config: ClusteringConfig, slot: Int? = nil) {
+    init(config: ClusteringConfig, speakerIndex: Int, slot: Int? = nil) {
         self.config = config
         self.linkagePolicy = LinkagePolicy.getPolicy(config.linkagePolicy)
-        self.matrix = EmbeddingDistanceMatrix(linkagePolicy)
+        self.matrix = AHCDistanceMatrix(linkagePolicy: linkagePolicy)
         self.dendrogram = Dendrogram()
         self.slot = slot
+        self.speakerIndex = speakerIndex
     }
     
-    private init(config: ClusteringConfig, slot: Int? = nil, matrix: EmbeddingDistanceMatrix, representatives: [ClusterRepresentative], cannotLink: Set<Int>) {
+    private init(config: ClusteringConfig, speakerIndex: Int, slot: Int? = nil, matrix: AHCDistanceMatrix, representatives: [ClusterRepresentative], cannotLink: Set<Int>) {
         self.config = config
         self.linkagePolicy = LinkagePolicy.getPolicy(config.linkagePolicy)
-        self.matrix = EmbeddingDistanceMatrix(linkagePolicy)
+        self.matrix = matrix
         self.dendrogram = Dendrogram()
+        self.representatives = representatives
         self.slot = slot
+        self.speakerIndex = speakerIndex
         self.cannotLink = cannotLink
     }
     
@@ -46,43 +53,7 @@ class SpeakerProfile {
         newTentative: [EmbeddingSegment],
         checkOutliers: Bool = false
     ) {
-        @inline(__always)
-        func buildWrappers(from segments: [EmbeddingSegment]) -> [EmbeddingSegmentWrapper] {
-            return segments.map { segment in
-                let segmentId = segment.id
-                
-                var wrapper = withUnsafeBytes(of: segmentId) { idBytes in
-                    EmbeddingSegmentWrapper(
-                        idBytes.baseAddress!,
-                        segment.embeddings.count,
-                        segment.segmentIds.count
-                    )
-                }
-                
-                let ids: [uuid_t] = segment.segmentIds.map { $0.uuid }
-                ids.withUnsafeBufferPointer { buf in
-                    guard let base = buf.baseAddress else { return }
-                    for i in 0..<buf.count {
-                        wrapper.addSegmentId(base.advanced(by: i)) // uuid_t*
-                    }
-                }
-                
-                for embedding in segment.embeddings {
-                    wrapper.addEmbedding(Unmanaged.passUnretained(embedding).toOpaque())
-                }
-                
-                return wrapper
-            }
-        }
-        
-        var finalizedWrappers = buildWrappers(from: newFinalized)
-        var tentativeWrappers = buildWrappers(from: newTentative)
-        
-        finalizedWrappers.withUnsafeMutableBufferPointer { finalizedBuf in
-            tentativeWrappers.withUnsafeMutableBufferPointer { tentativeBuf in
-                matrix.stream(.init(finalizedBuf), .init(tentativeBuf))
-            }
-        }
+        matrix.stream(finalized: newFinalized, tentative: newTentative)
         
         dendrogram = matrix.dendrogram(false)
         
@@ -94,9 +65,8 @@ class SpeakerProfile {
                            linkageThreshold: config.clusteringThreshold)
         }
         
-        if matrix.finalizedCount() > config.maxEmbeddings {
-            compress(maxSize: config.minEmbeddings,
-                     linkageThreshold: config.minSeparation)
+        if !newFinalized.isEmpty {
+            compress(keepTentative: true)
         }
     }
     
@@ -130,52 +100,68 @@ class SpeakerProfile {
         representatives = dendrogram
             .extractClusters(config.clusteringThreshold, config.maxRepresentatives)
             .map { cluster in
-                (LinkagePolicy.computeCentroid(linkagePolicy, matrix, cluster), cluster)
+                (matrix.computeCentroid(with: linkagePolicy, cluster: cluster), cluster)
             }
     }
     
-    public func compress(maxSize: Int, linkageThreshold: Float, keepTentative: Bool = false) {
+    public func compress(keepTentative: Bool = false) {
+        guard matrix.finalizedCount() > 1 ||
+                (!keepTentative && matrix.embeddingCount() > 1) else {
+            return
+        }
+        
+        let linkageThreshold = config.clusteringThreshold
+        
         let clusters = keepTentative
-            ? matrix.dendrogram(true).extractClusters(linkageThreshold, maxSize)
-            : dendrogram.extractClusters(linkageThreshold, maxSize)
+            ? matrix.dendrogram(true).extractClusters(linkageThreshold)
+            : dendrogram.extractClusters(linkageThreshold)
         
         // Create a new matrix and reserve capacity (approximate: 2x cluster count as in original intent)
-        var newMatrix = EmbeddingDistanceMatrix(linkagePolicy)
-        newMatrix.reserve(config.maxEmbeddings)
+        let newMatrix = AHCDistanceMatrix(linkagePolicy: linkagePolicy)
+        newMatrix.reserve(config.maxEmbeddings + matrix.tentativeCount())
         
         // Add compressed cluster centroids
         for cluster in clusters {
-            newMatrix.insert(LinkagePolicy.computeCentroid(linkagePolicy, matrix, cluster))
+            newMatrix.insertEmbedding(
+                matrix.computeCentroid(with: linkagePolicy, cluster: cluster),
+                tentative: false
+            )
         }
         
         if (keepTentative) {
-            // Add the tentative embeddings back
-            let indices = matrix.tentativeIndices()
-            for i in indices {
-                newMatrix.insert(matrix.embedding(i), true)
-            }
+            newMatrix.insertTentative(from: matrix)
         }
         
         // Replace matrix and rebuild dendrogram
         self.matrix = newMatrix
-        self.dendrogram = self.matrix.dendrogram()
+        self.dendrogram = matrix.dendrogram(false)
         self.updateRepresentatives()
     }
     
-    public func isolateOutliers(slot: Int) -> SpeakerProfile {
+    public func isolateOutliers(speakerIndex: Int, slot: Int) -> SpeakerProfile {
         let outlierRepresentatives = outlierIndices.map { representatives[$0] }
         for i in outlierIndices.reversed() {
             representatives.remove(at: i)
         }
         
-        let outlierMatrix = outlierRepresentatives
-            .flatMap { $0.cluster.indices() }
-            .withUnsafeBufferPointer { matrix.gatherAndPop(.init($0)) }
+        var outlierIndices: [CLong] = []
+        outlierIndices.reserveCapacity(
+            outlierRepresentatives.reduce(0) { partialResult, representative in
+                partialResult + Int(representative.cluster.count())
+            }
+        )
+        for (_, cluster) in outlierRepresentatives {
+            for index in cluster.indices() {
+                outlierIndices.append(CLong(truncatingIfNeeded: index))
+            }
+        }
+        let outlierMatrix = matrix.gatherAndPopIndices(outlierIndices)
         
         dendrogram = matrix.dendrogram(false)
         
         return SpeakerProfile(
             config: config,
+            speakerIndex: speakerIndex,
             slot: slot,
             matrix: outlierMatrix,
             representatives: outlierRepresentatives,
@@ -187,5 +173,68 @@ class SpeakerProfile {
         matrix.absorb(other.matrix)
         dendrogram = matrix.dendrogram(false)
         updateRepresentatives()
+    }
+}
+
+extension AHCDistanceMatrix {
+    @inline(__always)
+    func gatherAndPopIndices(_ indices: [CLong]) -> AHCDistanceMatrix {
+        indices.withUnsafeBufferPointer { buf in
+            gatherAndPopIndices(buf.baseAddress, count: buf.count)
+        }
+    }
+
+    @inline(__always)
+    func stream( finalized: [EmbeddingSegment], tentative: [EmbeddingSegment]) {
+        if finalized.isEmpty && tentative.isEmpty {
+            stream(withFinalized: nil, finalizedCount: 0, tentative: nil, tentativeCount: 0)
+            return
+        }
+
+        var finalizedWrappers = Self.buildSegmentWrappers(from: finalized)
+        var tentativeWrappers = Self.buildSegmentWrappers(from: tentative)
+
+        finalizedWrappers.withUnsafeMutableBufferPointer { finalizedBuf in
+            tentativeWrappers.withUnsafeMutableBufferPointer { tentativeBuf in
+                stream(
+                    withFinalized: finalizedBuf.baseAddress,
+                    finalizedCount: finalizedBuf.count,
+                    tentative: tentativeBuf.baseAddress,
+                    tentativeCount: tentativeBuf.count
+                )
+            }
+        }
+    }
+
+    @inline(__always)
+    private static func buildSegmentWrappers(from segments: [EmbeddingSegment]) -> ContiguousArray<EmbeddingSegmentWrapper> {
+        var wrappers = ContiguousArray<EmbeddingSegmentWrapper>()
+        wrappers.reserveCapacity(segments.count)
+
+        for segment in segments {
+            var rawSegmentId: uuid_t = segment.id.uuid
+            var wrapper = withUnsafePointer(to: &rawSegmentId) { idPtr in
+                EmbeddingSegmentWrapper(
+                    idPtr,
+                    segment.embeddings.count,
+                    segment.segmentIds.count
+                )
+            }
+
+            for segmentId in segment.segmentIds {
+                var rawId: uuid_t = segmentId.uuid
+                withUnsafePointer(to: &rawId) { idPtr in
+                    wrapper.addSegmentId(idPtr)
+                }
+            }
+
+            for embedding in segment.embeddings {
+                wrapper.addEmbedding(Unmanaged.passUnretained(embedding).toOpaque())
+            }
+
+            wrappers.append(wrapper)
+        }
+
+        return wrappers
     }
 }

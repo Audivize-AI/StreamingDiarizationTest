@@ -85,7 +85,7 @@ final class DiarizerViewModel: ObservableObject {
     
     init() {
         self.audioConverter = AudioConverter()
-        self.speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig)
+        self.speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig, speakerIndex: 0)
         Task {
             await loadModels()
         }
@@ -506,7 +506,7 @@ final class DiarizerViewModel: ObservableObject {
     }
 
     private func resetDendrogramState() {
-        speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig)
+        speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig, speakerIndex: 0)
         streamedFinalizedEmbeddingSegmentCount = 0
         dendrogramModel = .empty
     }
@@ -552,7 +552,7 @@ final class DiarizerViewModel: ObservableObject {
 
     @discardableResult
     private func replayFullDendrogramState(from timeline: SortformerTimeline) -> Bool {
-        speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig)
+        speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig, speakerIndex: 0)
         let finalizedWindow = Array(timeline.embeddingSegments.suffix(dendrogramMaxFinalizedReplaySegments))
         let tentativeWindow = Array(timeline.tentativeEmbeddingSegments.suffix(dendrogramMaxTentativeReplaySegments))
         speakerProfile.stream(newFinalized: finalizedWindow, newTentative: tentativeWindow)
@@ -566,10 +566,10 @@ final class DiarizerViewModel: ObservableObject {
         lookup.reserveCapacity(timeline.embeddingSegments.count + timeline.tentativeEmbeddingSegments.count)
 
         for segment in timeline.embeddingSegments {
-            lookup[segment.id] = segment.speakerIndex
+            lookup[segment.id] = segment.slot
         }
         for segment in timeline.tentativeEmbeddingSegments {
-            lookup[segment.id] = segment.speakerIndex
+            lookup[segment.id] = segment.slot
         }
 
         return lookup
@@ -747,7 +747,7 @@ final class DiarizerViewModel: ObservableObject {
         for segment in allSegments {
             let startStr = String(format: "%.2f", segment.startTime)
             let endStr = String(format: "%.2f", segment.endTime)
-            print("\(segment.speakerIndex),\(startStr),\(endStr)")
+            print("\(segment.slot),\(startStr),\(endStr)")
         }
         
         print("--- End Segments (\(allSegments.count) total) ---\n")
@@ -776,7 +776,7 @@ final class DiarizerViewModel: ObservableObject {
     
     /// Generate a unique key for a segment
     static func segmentKey(_ segment: SortformerSegment) -> String {
-        return "\(segment.startFrame)-\(segment.endFrame)-\(segment.speakerIndex)"
+        return "\(segment.startFrame)-\(segment.endFrame)-\(segment.slot)"
     }
     
     /// Set annotation for a segment
@@ -806,7 +806,7 @@ final class DiarizerViewModel: ObservableObject {
         
         for segment in allSegments {
             // Use annotation if available, otherwise use original speaker index
-            let label = getAnnotation(for: segment) ?? String(segment.speakerIndex)
+            let label = getAnnotation(for: segment) ?? String(segment.slot)
             let startStr = String(format: "%.2f", segment.startTime)
             let endStr = String(format: "%.2f", segment.endTime)
             output += "\(label),\(startStr),\(endStr)\n"
