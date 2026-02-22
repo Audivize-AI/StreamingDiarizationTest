@@ -23,47 +23,84 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
     public let frames: Range<Int>
     
     /// The actual embedding vector
-    public let embedding: UnsafeMutableBufferPointer<Float>
+    public var bufferView: UnsafeBufferPointer<Float> {
+        UnsafeBufferPointer(buffer)
+    }
+    
+    public var baseAddress: UnsafePointer<Float>? {
+        return bufferView.baseAddress
+    }
     
     /// Number of features in the embedding vector
-    public var count: Int { embedding.count }
+    public var count: Int { bufferView.count }
     
     /// Length in frames
     public var length: Int { frames.count }
     
-    public init(id: UUID = UUID(), unitEmbedding: [Float], startFrame: Int, endFrame: Int) {
-        self.id = id
-        self.frames = startFrame..<endFrame
-        self.embedding = UnsafeMutableBufferPointer<Float>.allocate(capacity: unitEmbedding.count)
-        _ = self.embedding.initialize(from: unitEmbedding)
+    /// Vector magnitude
+    public var magnitude: Float {
+        if let m = cachedMagnitude { return m }
+        let m = sqrt(vDSP.sumOfSquares(bufferView))
+        cachedMagnitude = m
+        return m
     }
     
-    public init(id: UUID = UUID(), embedding: [Float], startFrame: Int, endFrame: Int) {
+    /// Buffer holding the embedding vector
+    private let buffer: UnsafeMutableBufferPointer<Float>
+    
+    /// Cached magnitude
+    private var cachedMagnitude: Float? = nil
+    
+    public init(id: UUID = UUID(), startFrame: Int, endFrame: Int) {
         self.id = id
         self.frames = startFrame..<endFrame
-        self.embedding = UnsafeMutableBufferPointer<Float>.allocate(capacity: embedding.count)
+        self.buffer = UnsafeMutableBufferPointer<Float>.allocate(capacity: EmbeddingConfig.embeddingFeatures)
+    }
+    
+    public convenience init<C>(id: UUID = UUID(), embedding: C, startFrame: Int, endFrame: Int, shouldNormalize: Bool = false)
+    where C: Sequence, C.Element == Float {
+        self.init(id: id, startFrame: startFrame, endFrame: endFrame)
+        _ = self.buffer.initialize(from: embedding)
         
-        // Normalize the embedding vector
-        var normalizer = 1 / sqrt(vDSP.sumOfSquares(embedding))
-        vDSP_vsmul(embedding, 1, &normalizer,
-                   self.embedding.baseAddress!, 1,
-                   vDSP_Length(embedding.count))
+        if shouldNormalize {
+            self.normalize()
+        }
     }
     
     deinit {
-        self.embedding.deallocate()
+        self.buffer.deallocate()
     }
     
     /// Get the cosine distance to another embedding
     public func cosineDistance(to other: SpeakerEmbedding) -> Float {
-        let length = vDSP_Length(embedding.count)
+        let length = vDSP_Length(buffer.count)
         var dot: Float = 0
         vDSP_dotpr(
-            self.embedding.baseAddress!, 1,
-            other.embedding.baseAddress!, 1,
+            self.buffer.baseAddress!, 1,
+            other.buffer.baseAddress!, 1,
             &dot, length
         )
-        return 1.0 - dot
+        return 1.0 - dot / (self.magnitude * other.magnitude)
+    }
+    
+    /// Normalize this embedding vector to a new magnitude
+    public func normalize(toLength newMagnitude: Float = 1) {
+        var normalizer = newMagnitude / sqrt(vDSP.sumOfSquares(buffer))
+        vDSP_vsmul(buffer.baseAddress!, 1, &normalizer,
+                   buffer.baseAddress!, 1,
+                   vDSP_Length(buffer.count))
+        cachedMagnitude = newMagnitude
+    }
+    
+    /// Get the embedding buffer (non-mutable)
+    public func withUnsafeBufferPointer<R>(_ body: (UnsafeBufferPointer<Float>) throws -> R) rethrows -> R {
+        return try body(bufferView)
+    }
+    
+    /// Get the embedding buffer (mutable)
+    public func withUnsafeMutableBufferPointer<R>(_ body: (UnsafeMutableBufferPointer<Float>) throws -> R) rethrows -> R {
+        self.cachedMagnitude = nil
+        return try body(buffer)
     }
     
     /// Check if this region contains a frame
@@ -111,6 +148,12 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
 
 /// Tracks embeddings for a disjoint segment
 public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
+    enum NormalizationPolicy {
+        case byWeight /// Normalize by total weight, i.e., the sum of the durations of all the embeddings in this segment
+        case toUnitVector /// Normalize to a unit vector
+        case none   /// Don't normalize
+    }
+    
     /// Segment ID
     public private(set) var id: UUID = .zero
 
@@ -132,11 +175,13 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// Whether this segment is subject to updates
     public var isFinalized: Bool
     
+    public private(set) var centroid: SpeakerClusterCentroid?
+    
     /// Extracted embedding regions for this segment
-    public private(set) var embeddings: ContiguousArray<SpeakerEmbedding>
+    public private(set) var embeddings: [SpeakerEmbedding]
     
     /// IDs of the corresponding `SortformerSegments`
-    public var segmentIds: ContiguousArray<UUID>
+    public var segmentIds: [UUID]
     
     public var isNone: Bool { slot < 0 }
     public var isValid: Bool { slot >= 0 }
@@ -149,7 +194,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         startFrame: Int,
         endFrame: Int,
         finalized: Bool = true,
-        segmentIds: ContiguousArray<UUID> = []
+        segmentIds: [UUID] = []
     ) {
         self.slot = speakerIndex
         self.startFrame = startFrame
@@ -277,7 +322,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         let newEmbeddings = try extractor.processRequests(requests)
         embeddings.append(contentsOf: newEmbeddings)
         
-        initId()
+        initializeId()
     }
     
     /// - Parameters:
@@ -465,7 +510,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         return requests
     }
     
-    private func initId() {
+    private func initializeId() {
         guard !embeddings.isEmpty else { return }
         self.id = embeddings[0].id
         guard embeddings.count > 1 else { return }
@@ -525,6 +570,66 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         
         return true
     }
+    
+    // MARK: - Centroid computation
+    public func initializeCentroid(withCache cache: [UUID : SpeakerClusterCentroid] = [:]) {
+        guard !embeddings.isEmpty else { return }
+
+        if let cached = cache[id] {
+            self.centroid = cached
+            return
+        }
+        
+        guard embeddings.count > 1 else {
+            self.centroid = SpeakerClusterCentroid(
+                id: id,
+                embedding: embeddings[0],
+                segmentIds: segmentIds,
+                weight: Float(embeddings[0].length),
+                isFinalized: isFinalized
+            )
+            return
+        }
+
+        var w0 = Float(embeddings[0].length)
+        var w1 = Float(embeddings[1].length)
+        
+        let centroid = SpeakerClusterCentroid(
+            id: id,
+            segmentIds: segmentIds,
+            weight: w0 + w1,
+            isFinalized: isFinalized
+        )
+        
+        centroid.withUnsafeMutableBufferPointer { centroidPtr in
+            let dims = vDSP_Length(embeddings[0].count)
+            
+            // Centroid = (embedding_0 * weight_0) + (embedding_1 * weight_1)
+            vDSP_vsmsma(
+                embeddings[0].baseAddress!, 1, &w0,
+                embeddings[1].baseAddress!, 1, &w1,
+                centroidPtr.baseAddress!, 1,
+                dims
+            )
+            
+            // Accumulate remaining embeddings
+            for embedding in embeddings.dropFirst(2) {
+                var weight = Float(embedding.length)
+                centroid.weight += weight // This shouldn't violate the exclusive access
+                
+                // Centroid += embedding * weight
+                vDSP_vsma(
+                    embedding.baseAddress!, 1, &weight,
+                    centroidPtr.baseAddress!, 1,
+                    centroidPtr.baseAddress!, 1,
+                    dims
+                )
+            }
+        }
+
+        centroid.embedding.normalize()
+        self.centroid = centroid
+    }
 }
 
 public struct EmbeddingRequest: SortformerFrameRange, Hashable {
@@ -574,3 +679,4 @@ extension UUID {
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00))
     }
 }
+

@@ -134,14 +134,14 @@ public class EmbeddingManager {
         }
     }
     
-    public func takeMatches(for segment: EmbeddingSegment) -> ContiguousArray<SpeakerEmbedding> {
+    public func takeMatches(for segment: EmbeddingSegment) -> [SpeakerEmbedding] {
         queue.sync(flags: .barrier) {
             guard !availibleEmbeddings.isEmpty else {
                 return []
             }
             
             let count = availibleEmbeddings.count
-            var embeddings: ContiguousArray<SpeakerEmbedding> = []
+            var embeddings: [SpeakerEmbedding] = []
             for i in (0..<count).reversed() {
                 if availibleEmbeddings[i].framesOutside(of: segment) <= config.maxOutsideFrames {
                     embeddings.append(availibleEmbeddings.remove(at: i))

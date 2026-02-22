@@ -47,7 +47,7 @@ class SpeakerDatabase {
             speaker.stream(
                 newFinalized: sortedFinalized[slot],
                 newTentative: sortedTentative[slot],
-                checkOutliers: checkOutliers
+                updateOutliers: checkOutliers
             )
             
             if speaker.hasOutliers {
