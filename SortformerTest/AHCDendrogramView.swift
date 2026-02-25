@@ -25,14 +25,14 @@ private enum DendrogramPalette {
     }
 }
 
-struct AHCDendrogramView: View {
-    let model: AHCDendrogramModel
+struct KMeansDendrogramView: View {
+    let model: KMeansDendrogramModel
     @State private var hoverLocation: CGPoint?
 
     private var speakerIndices: [Int] {
         let leafSpeakers = model.nodes
             .filter { $0.isLeaf && $0.speakerIndex >= 0 }
-            .map(\AHCDendrogramNodeModel.speakerIndex)
+            .map(\KMeansDendrogramNodeModel.speakerIndex)
         return Array(Set(leafSpeakers)).sorted()
     }
 
@@ -113,10 +113,10 @@ struct AHCDendrogramView: View {
     private var header: some View {
         HStack(alignment: .top, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Hierarchy")
+                Text("K-means Groups")
                     .font(.system(size: 14, weight: .bold, design: .rounded))
                     .foregroundStyle(DendrogramPalette.title)
-                Text(model.isEmpty ? "Waiting for live merges" : "Live speaker-colored merge tree")
+                Text(model.isEmpty ? "Waiting for cluster centroids" : "Live centroid hierarchy from K-means grouping")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(DendrogramPalette.subtitle)
             }
@@ -173,7 +173,7 @@ struct AHCDendrogramView: View {
             Image(systemName: "tree")
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundStyle(DendrogramPalette.subtitle.opacity(0.8))
-            Text("Dendrogram will appear as merges stream in")
+            Text("Dendrogram appears after K-means centroids are available")
                 .font(.system(size: 11, weight: .medium, design: .rounded))
                 .foregroundStyle(DendrogramPalette.subtitle.opacity(0.9))
         }
@@ -433,7 +433,7 @@ private struct DendrogramLayout {
     let leafSpeakerByNodeId: [Int: Int]
     let thresholdExceededNodeIds: Set<Int>
 
-    init?(model: AHCDendrogramModel, size: CGSize) {
+    init?(model: KMeansDendrogramModel, size: CGSize) {
         guard !model.isEmpty else {
             return nil
         }
@@ -739,7 +739,7 @@ private struct DendrogramLayout {
 
         self.points = points
         self.branches = branches
-        self.mustLinkNodeIds = Set(model.nodes.filter(\AHCDendrogramNodeModel.mustLink).map(\AHCDendrogramNodeModel.id))
+        self.mustLinkNodeIds = Set(model.nodes.filter(\KMeansDendrogramNodeModel.mustLink).map(\KMeansDendrogramNodeModel.id))
         self.minDistance = minInternalDistance
         self.maxDistance = maxInternalDistance
         self.plotRect = plotRect

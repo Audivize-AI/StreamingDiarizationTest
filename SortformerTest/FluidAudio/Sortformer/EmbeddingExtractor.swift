@@ -87,8 +87,41 @@ public struct TitaNetEmbeddingExtractor {
     }
 }
 
-
 public enum TitaNetError: Error, LocalizedError {
     case invalidAudioInput(String)
     case predictionFailed(String)
+}
+
+public enum TitaNetVariant {
+    case large2_48s
+    case large3_04s
+    case small2_48s
+    case small3_04s
+    
+    public func model(configuration: MLModelConfiguration) throws -> MLModel {
+        switch self {
+        case .large2_48s: return try TitaNet_large_2_48s(configuration: configuration).model
+        case .small2_48s: return try TitaNet_small_2_48s(configuration: configuration).model
+        case .large3_04s: return try TitaNet_large_3_04s(configuration: configuration).model
+        case .small3_04s: return try TitaNet_small_3_04s(configuration: configuration).model
+        }
+    }
+    
+    public var name: String {
+        switch self {
+        case .large2_48s: return "TitaNet_large_2_48s"
+        case .small2_48s: return "TitaNet_small_2_48s"
+        case .large3_04s: return "TitaNet_large_3_04s"
+        case .small3_04s: return "TitaNet_small_3_04s"
+        }
+    }
+    
+    public var maxInputFrames: Int {
+        switch self {
+        case .large2_48s: return 31
+        case .large3_04s: return 38
+        case .small2_48s: return 31
+        case .small3_04s: return 38
+        }
+    }
 }

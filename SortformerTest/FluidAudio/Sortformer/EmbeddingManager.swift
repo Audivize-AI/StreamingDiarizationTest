@@ -151,11 +151,12 @@ public class EmbeddingManager {
             return embeddings
         }
     }
-
+    
     /// Cache all embeddings from a segment
     public func returnEmbeddings(from segment: EmbeddingSegment) {
         queue.sync(flags: .barrier) {
             availibleEmbeddings.append(contentsOf: segment.embeddings)
+            segment.clearEmbeddings()
         }
     }
     

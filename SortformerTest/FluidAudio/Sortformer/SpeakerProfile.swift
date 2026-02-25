@@ -7,35 +7,67 @@
 
 import Foundation
 import Accelerate
+import OrderedCollections
 
-class SpeakerProfile {
+public class SpeakerProfile {
     public let config: ClusteringConfig
     public private(set) var finalizedClusters: [SpeakerClusterCentroid] = []
     public private(set) var tentativeClusters: [SpeakerClusterCentroid] = []
     public private(set) var finalizedOutliers: [SpeakerClusterCentroid] = []
     public private(set) var tentativeOutliers: [SpeakerClusterCentroid] = []
-    public private(set) var slot: Int?
-    public var speakerIndex: Int
+    public private(set) var finalizedSegments: OrderedSet<SpeakerSegment> = []
+    public private(set) var tentativeSegments: OrderedSet<SpeakerSegment> = []
+    
+    /// The ID of the speaker whose outliers formed this speaker profile
+    public private(set) var parentSpeakerId: Int? = nil
+    
+    /// Speaker ID
+    public var speakerId: Int
+    
+    /// Set of speaker IDs with which this profile cannot link
     public var cannotLink: Set<Int> = []
     
+    /// Whether this speaker has any clusters
+    public var hasClusters: Bool {
+        !(finalizedClusters.isEmpty && tentativeClusters.isEmpty)
+    }
+    
+    /// Whether this speaker has any segments
+    public var hasSegments: Bool {
+        !(finalizedSegments.isEmpty && tentativeSegments.isEmpty)
+    }
+    
+    /// Whether this speaker has any outliers
     public var hasOutliers: Bool {
         !(finalizedOutliers.isEmpty && tentativeOutliers.isEmpty)
     }
     
-    public var weight: Float {
-        finalizedClusters.reduce(0) { $0 + $1.weight } + tentativeClusters.reduce(0) { $0 + $1.weight }
+    /// The combined weight of all confirmed clusters
+    public var finalizedWeight: Float {
+        finalizedClusters.reduce(0) { $0 + $1.weight }
     }
     
-    init(config: ClusteringConfig, speakerIndex: Int, slot: Int? = nil) {
+    /// The combined weight of all tentative clusters
+    public var tentativeWeight: Float {
+        tentativeClusters.reduce(0) { $0 + $1.weight }
+    }
+    
+    public var isFinalized: Bool {
+        tentativeClusters.isEmpty && tentativeOutliers.isEmpty && tentativeSegments.isEmpty
+    }
+    
+    // MARK: - Init
+    
+    init(config: ClusteringConfig, speakerIndex: Int) {
         self.config = config
-        self.slot = slot
-        self.speakerIndex = speakerIndex
+        self.speakerId = speakerIndex
     }
     
     private init(
         config: ClusteringConfig,
         speakerIndex: Int,
-        slot: Int? = nil,
+        finalizedSegments: OrderedSet<SpeakerSegment>,
+        tentativeSegments: OrderedSet<SpeakerSegment>,
         finalizedClusters: [SpeakerClusterCentroid],
         tentativeClusters: [SpeakerClusterCentroid],
         cannotLink: Set<Int>
@@ -43,10 +75,55 @@ class SpeakerProfile {
         self.config = config
         self.finalizedClusters = finalizedClusters
         self.tentativeClusters = tentativeClusters
-        self.slot = slot
-        self.speakerIndex = speakerIndex
+        self.finalizedSegments = finalizedSegments
+        self.tentativeSegments = tentativeSegments
+        self.speakerId = speakerIndex
         self.cannotLink = cannotLink
     }
+    
+    // MARK: - Segment Updates
+    
+    @inline(__always)
+    public func appendFinalizedSegment(_ segment: SpeakerSegment) {
+        self.finalizedSegments.updateOrAppend(segment)
+    }
+    
+    @inline(__always)
+    public func appendTentativeSegment(_ segment: SpeakerSegment) {
+        self.tentativeSegments.updateOrAppend(segment)
+    }
+    
+    @inline(__always)
+    @discardableResult
+    public func appendSegment(_ segment: SpeakerSegment) -> SpeakerSegment? {
+        return segment.isFinalized
+            ? finalizedSegments.updateOrAppend(segment)
+            : tentativeSegments.updateOrAppend(segment)
+    }
+    
+    @inline(__always)
+    public func popFinalizedSegment() -> SpeakerSegment? {
+        guard !finalizedSegments.isEmpty else { return nil }
+        return finalizedSegments.removeLast()
+    }
+    
+    @inline(__always)
+    public func popTentativeSegment() -> SpeakerSegment? {
+        guard !tentativeSegments.isEmpty else { return nil }
+        return tentativeSegments.removeLast()
+    }
+    
+    @inline(__always)
+    public func popSegment(finalized: Bool) -> SpeakerSegment? {
+        return finalized ? popFinalizedSegment() : popTentativeSegment()
+    }
+    
+    @inline(__always)
+    public func clearTentativeSegments() {
+        return tentativeSegments.removeAll()
+    }
+    
+    // MARK: - Embedding Updates
     
     public func stream(
         newFinalized: [EmbeddingSegment],
@@ -59,17 +136,20 @@ class SpeakerProfile {
                     continue
                 }
                 
-                if let (cluster, _) = findCluster(for: centroid, in: clusters, maxDistance: config.clusteringThreshold) {
+                // Find the best match
+                if let (cluster, _) = Self.findCluster(for: centroid, in: clusters, maxDistance: config.clusteringThreshold) {
                     cluster.update(with: segment)
                     continue
                 }
                 
+                // Create a new cluster if we aren't checking for outliers
                 if !updateOutliers {
                     clusters.append(centroid.deepCopy())
                     continue
                 }
                 
-                if let (cluster, _) = findCluster(for: centroid, in: outliers, maxDistance: config.clusteringThreshold) {
+                // Create an outlier cluster
+                if let (cluster, _) = Self.findCluster(for: centroid, in: outliers, maxDistance: config.clusteringThreshold) {
                     cluster.update(with: segment)
                 } else {
                     outliers.append(centroid.deepCopy())
@@ -98,7 +178,7 @@ class SpeakerProfile {
         update(clusters: &tentativeClusters, outliers: &tentativeOutliers, from: newTentative, updateOutliers: updateOutliers)
     }
     
-    public func findCluster(for embedding: SpeakerEmbedding, in clusters: [SpeakerClusterCentroid], maxDistance: Float = .infinity) -> (cluster: SpeakerClusterCentroid, distance: Float)? {
+    public static func findCluster(for embedding: SpeakerEmbedding, in clusters: [SpeakerClusterCentroid], maxDistance: Float = .infinity) -> (cluster: SpeakerClusterCentroid, distance: Float)? {
         if clusters.isEmpty { return nil }
         
         var bestDistance = maxDistance.nextUp
@@ -117,41 +197,77 @@ class SpeakerProfile {
     }
     
     @inline(__always)
-    public func findCluster(for centroid: SpeakerClusterCentroid, in clusters: [SpeakerClusterCentroid], maxDistance: Float = .infinity) -> (cluster: SpeakerClusterCentroid, distance: Float)? {
+    public static func findCluster(for centroid: SpeakerClusterCentroid, in clusters: [SpeakerClusterCentroid], maxDistance: Float = .infinity) -> (cluster: SpeakerClusterCentroid, distance: Float)? {
         return findCluster(for: centroid.embedding, in: clusters, maxDistance: maxDistance)
     }
     
     /// Get the chamfer distance between two SpeakerProfiles
+    /// - Parameters:
+    ///   - other: Another speaker profile
+    ///   - useTentative: Whether to use tentative clusters in the distance calculation (defaults to `true`)
+    /// - Returns: The chamfer distance to the other speaker profile
     public func distance(to other: SpeakerProfile, useTentative: Bool = true) -> Float {
+        guard !other.cannotLink.contains(self.speakerId),
+              !self.cannotLink.contains(other.speakerId) else {
+            return .infinity
+        }
+        
         let clustersA = useTentative ? self.tentativeClusters : self.finalizedClusters
         let clustersB = useTentative ? other.tentativeClusters : other.finalizedClusters
         
-        var bestB: [Float] = Array(repeating: .infinity, count: clustersB.count)
+        var bestB: [(dist: Float, weight: Float)] = Array(repeating: (.infinity, 0), count: clustersB.count)
         var sumA: Float = 0
+        var sumWeightsA: Float = 0
+        
         for embA in clustersA {
-            var minA = Float.infinity
+            var minDistA = Float.infinity
+            var bestWeightA: Float = 0
             for (i, embB) in clustersB.enumerated() {
                 let dist: Float = embA.cosineDistance(to: embB)
-                if dist < minA { minA = dist }
-                if dist < bestB[i] { bestB[i] = dist }
+                if dist < minDistA {
+                    minDistA = dist
+                    bestWeightA = embB.weight
+                }
+                if dist < bestB[i].dist {
+                    bestB[i] = (dist, embB.weight * embA.weight)
+                }
             }
-            sumA += minA
+            
+            let weight = embA.weight * bestWeightA
+            
+            sumWeightsA += weight
+            sumA += weight * minDistA
         }
         
-        let sumB: Float = bestB.reduce(0, +)
-        return (sumA / Float(clustersA.count) + sumB / Float(clustersB.count)) / 2
+        let (sumB, sumWeightsB) = bestB.reduce((dist: 0 as Float, weight: 0 as Float)) {
+            ($0.dist + $1.dist * $1.weight, $0.weight + $1.weight)
+        }
+        
+        return (sumA / sumWeightsA + sumB / sumWeightsB) / 2
     }
     
-    public func fromOutliers(slot: Int, speakerIndex: Int) -> SpeakerProfile {
+    public func takeOutliers(speakerId: Int, cannotLink: Set<Int> = []) -> SpeakerProfile {
+        // Collect segments
+        var outlierSegments = self.tentativeOutliers.flatMap(\.segments)
+        let numTentativeOutliers = outlierSegments.partition(by: \.isFinalized)
+        outlierSegments[0..<numTentativeOutliers].sort()
+        outlierSegments[numTentativeOutliers...].sort()
+        
+        var outlierTentativeSegments = OrderedSet(outlierSegments.prefix(numTentativeOutliers))
+        var outlierFinalizedSegments = OrderedSet(outlierSegments.suffix(from: numTentativeOutliers))
+        
+        self.tentativeSegments.subtract(outlierTentativeSegments)
+        self.finalizedSegments.subtract(outlierFinalizedSegments)
+        
         let result = SpeakerProfile(
             config: self.config,
-            speakerIndex: speakerIndex,
-            slot: slot,
+            speakerIndex: speakerId,
+            finalizedSegments: outlierFinalizedSegments,
+            tentativeSegments: outlierTentativeSegments,
             finalizedClusters: self.finalizedOutliers,
             tentativeClusters: self.tentativeOutliers,
-            cannotLink: self.cannotLink
+            cannotLink: cannotLink
         )
-        result.cannotLink.insert(self.speakerIndex)
         
         self.finalizedOutliers.removeAll()
         self.tentativeOutliers.removeAll()
@@ -159,31 +275,113 @@ class SpeakerProfile {
         return result
     }
     
-    public func absorb(_ other: SpeakerProfile) {
+    public func finalize() {
+        if !tentativeClusters.isEmpty {
+            self.finalizedClusters = self.tentativeClusters
+            self.tentativeClusters.removeAll()
+        }
+        if !finalizedOutliers.isEmpty {
+            self.finalizedOutliers = self.tentativeOutliers
+            self.tentativeOutliers.removeAll()
+        }
+        if !tentativeSegments.isEmpty {
+            self.finalizedSegments.append(contentsOf: self.tentativeSegments)
+            self.tentativeSegments.removeAll()
+        }
+    }
+    
+    public func absorbAndFinalize(_ other: SpeakerProfile) {
+        self.finalize()
+        other.finalize()
+        
+        typealias ClusterAssignment = (src: SpeakerClusterCentroid, dst: SpeakerClusterCentroid)
+
+        // Update segments
+        self.finalizedSegments.append(contentsOf: other.finalizedSegments)
+        self.tentativeSegments.append(contentsOf: other.tentativeSegments)
+        finalizedSegments.sort()
+        tentativeSegments.sort()
+        
+        // Merge similar clusters
+        
+        var finalizedMatches: [UUID : SpeakerClusterCentroid] = [:]
+        var tentativeMatches: [UUID : SpeakerClusterCentroid] = [:]
+        
+        finalizedMatches.reserveCapacity(self.finalizedClusters.count)
+        tentativeMatches.reserveCapacity(self.tentativeClusters.count)
+        
+        for cluster in other.finalizedClusters {
+            finalizedMatches[cluster.id] = Self.findCluster(
+                for: cluster,
+                in: self.finalizedClusters,
+                maxDistance: config.clusteringThreshold
+            )?.cluster
+        }
+        
+        // Update/assign outliers
+        
+        var finalizedClusterAssignments: [ClusterAssignment] = []
+        var tentativeClusterAssignments: [ClusterAssignment] = []
+        finalizedClusterAssignments.reserveCapacity(self.finalizedOutliers.count + other.finalizedOutliers.count)
+        finalizedClusterAssignments.reserveCapacity(self.tentativeOutliers.count + other.tentativeOutliers.count)
+
+        var newFinalizedOutliers: [SpeakerClusterCentroid] = []
+        var newTentativeOutliers: [SpeakerClusterCentroid] = []
+        newFinalizedOutliers.reserveCapacity(finalizedClusterAssignments.capacity)
+        newTentativeOutliers.reserveCapacity(tentativeClusterAssignments.capacity)
+        
+        func updateAssignmentsAndOutliers(
+            outliers: [SpeakerClusterCentroid],
+            clusters: [SpeakerClusterCentroid],
+            assignments: inout [ClusterAssignment],
+            remainingOutliers: inout [SpeakerClusterCentroid]
+        ) {
+            for outlier in outliers {
+                if let (cluster, _) = Self.findCluster(
+                    for: outlier,
+                    in: clusters,
+                    maxDistance: config.clusteringThreshold
+                ) {
+                    assignments.append((outlier, cluster))
+                } else {
+                    remainingOutliers.append(outlier)
+                }
+            }
+        }
+        
+        updateAssignmentsAndOutliers(outliers: self.finalizedOutliers,
+                                     clusters: other.finalizedClusters,
+                                     assignments: &finalizedClusterAssignments,
+                                     remainingOutliers: &newFinalizedOutliers)
+        updateAssignmentsAndOutliers(outliers: other.finalizedOutliers,
+                                     clusters: self.finalizedClusters,
+                                     assignments: &finalizedClusterAssignments,
+                                     remainingOutliers: &newFinalizedOutliers)
+        updateAssignmentsAndOutliers(outliers: self.tentativeOutliers,
+                                     clusters: other.tentativeClusters,
+                                     assignments: &tentativeClusterAssignments,
+                                     remainingOutliers: &newTentativeOutliers)
+        updateAssignmentsAndOutliers(outliers: other.tentativeOutliers,
+                                     clusters: self.tentativeClusters,
+                                     assignments: &tentativeClusterAssignments,
+                                     remainingOutliers: &newTentativeOutliers)
+        
+        // Update clusters from outlier assignments
+        for (outlier, cluster) in finalizedClusterAssignments {
+            cluster.update(with: outlier)
+        }
+        
+        for (outlier, cluster) in tentativeClusterAssignments {
+            cluster.update(with: outlier)
+        }
+        
+        // Combine clusters
         self.finalizedClusters.append(contentsOf: other.finalizedClusters)
         self.tentativeClusters.append(contentsOf: other.tentativeClusters)
         
-        let combinedFinalizedOutliers = self.finalizedOutliers + other.finalizedOutliers
-        let combinedTentativeOutliers = self.finalizedOutliers + other.finalizedOutliers
-        
-        self.finalizedOutliers.removeAll(keepingCapacity: true)
-        self.tentativeOutliers.removeAll(keepingCapacity: true)
-        
-        for outlier in combinedFinalizedOutliers {
-            if let (cluster, _) = findCluster(for: outlier, in: finalizedClusters, maxDistance: config.clusteringThreshold) {
-                cluster.update(with: outlier)
-            } else {
-                finalizedOutliers.append(outlier)
-            }
-        }
-        
-        for outlier in combinedTentativeOutliers {
-            if let (cluster, _) = findCluster(for: outlier, in: tentativeClusters, maxDistance: config.clusteringThreshold) {
-                cluster.update(with: outlier)
-            } else {
-                tentativeOutliers.append(outlier)
-            }
-        }
+        // Combine bullshits
+        self.cannotLink.formUnion(other.cannotLink)
+        self.cannotLink.remove(speakerId)
     }
 }
 
@@ -191,24 +389,24 @@ public class SpeakerClusterCentroid: Identifiable {
     public var id: UUID { embedding.id }
     public let embedding: SpeakerEmbedding
     public var weight: Float
-    public var segmentIds: [UUID]
+    public var segments: [SpeakerSegment]
     public var isFinalized: Bool
     
     public var buffer: UnsafeBufferPointer<Float> { embedding.bufferView }
     public var baseAddress: UnsafePointer<Float>? { embedding.baseAddress }
     
-    public init(id: UUID = UUID(), segmentIds: [UUID] = [], weight: Float, isFinalized: Bool = false) {
+    public init(id: UUID = UUID(), segments: [SpeakerSegment] = [], weight: Float, isFinalized: Bool = false) {
         // Create a deep copy of the embedding
         self.embedding = SpeakerEmbedding(id: id, startFrame: 0, endFrame: 0)
-        self.segmentIds = segmentIds
+        self.segments = segments
         self.isFinalized = isFinalized
         self.weight = weight
     }
     
-    public init(id: UUID = UUID(), embedding: SpeakerEmbedding, segmentIds: [UUID] = [], weight: Float, isFinalized: Bool = false) {
+    public init(id: UUID = UUID(), embedding: SpeakerEmbedding, segments: [SpeakerSegment] = [], weight: Float, isFinalized: Bool = false) {
         // Create a deep copy of the embedding
         self.embedding = SpeakerEmbedding(id: id, embedding: embedding.bufferView, startFrame: embedding.startFrame, endFrame: embedding.endFrame)
-        self.segmentIds = segmentIds
+        self.segments = segments
         self.isFinalized = isFinalized
         self.weight = weight
     }
@@ -228,7 +426,7 @@ public class SpeakerClusterCentroid: Identifiable {
             )
         }
         
-        self.segmentIds.append(contentsOf: centroid.segmentIds)
+        self.segments.append(contentsOf: centroid.segments)
     }
     
     /// Update the centroid in place
@@ -245,7 +443,7 @@ public class SpeakerClusterCentroid: Identifiable {
         let result = SpeakerClusterCentroid(
             id: keepingId ? self.id : UUID(),
             embedding: self.embedding,
-            segmentIds: self.segmentIds + centroid.segmentIds,
+            segments: self.segments + centroid.segments,
             weight: self.weight + centroid.weight,
             isFinalized: self.isFinalized && centroid.isFinalized
         )
@@ -279,7 +477,7 @@ public class SpeakerClusterCentroid: Identifiable {
         SpeakerClusterCentroid(
             id: keepingId ? self.id : UUID(),
             embedding: self.embedding,
-            segmentIds: self.segmentIds,
+            segments: self.segments,
             weight: self.weight,
             isFinalized: self.isFinalized
         )

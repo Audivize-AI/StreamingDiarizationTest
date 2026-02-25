@@ -55,55 +55,70 @@ struct ContentView: View {
             }
             .padding(.horizontal)
             
-            // Speech plot and Cluster Plot (only shown after clustering)
+            // Speech plot and K-means grouping dendrogram (updates with embedding streams)
             HStack(spacing: 0) {
-                // Left side: Speech Plot (Heatmaps)
-                ZStack {
-                    SpeechPlotView(
+                // Left side: probability heatmaps + segment-only identity timeline
+                VStack(spacing: 10) {
+                    ZStack {
+                        SpeechPlotView(
+                            timeline: viewModel.timeline,
+                            spkcachePreds: viewModel.spkcachePreds,
+                            fifoPreds: viewModel.fifoPreds,
+                            chunkRightContext: viewModel.chunkRightContext,
+                            chunkLeftContext: viewModel.chunkLeftContext,
+                            isRecording: viewModel.isRecording,
+                            updateTrigger: viewModel.updateTrigger,
+                            segmentAnnotations: viewModel.segmentAnnotations,
+                            segmentCentroidDistances: viewModel.segmentCentroidDistances,
+                            embeddingSegmentCentroidDistances: viewModel.embeddingSegmentCentroidDistances,
+                            onPlaySegment: { start, end in
+                                viewModel.playSegment(startTime: start, endTime: end)
+                            },
+                            onAnnotateSegment: { segment in
+                                // Show annotation dialog
+                                selectedSegment = segment
+                                annotationText = viewModel.getAnnotation(for: segment) ?? ""
+                                showingAnnotationDialog = true
+                            },
+                            onPurgeSpeaker: { speakerIndex in
+                                viewModel.purgeSpeaker(at: speakerIndex)
+                            }
+                        )
+
+                        // Drag and drop overlay
+                        if isDragOver {
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.blue, style: StrokeStyle(lineWidth: 3, dash: [10]))
+                                .background(Color.blue.opacity(0.1))
+                                .cornerRadius(12)
+                                .overlay(
+                                    VStack(spacing: 8) {
+                                        Image(systemName: "arrow.down.doc.fill")
+                                            .font(.system(size: 48))
+                                            .foregroundColor(.blue)
+                                        Text("Drop audio file here")
+                                            .font(.headline)
+                                            .foregroundColor(.blue)
+                                    }
+                                )
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                    SpeakerIdentityTimelineView(
                         timeline: viewModel.timeline,
-                        spkcachePreds: viewModel.spkcachePreds,
-                        fifoPreds: viewModel.fifoPreds,
-                        chunkRightContext: viewModel.chunkRightContext,
-                        chunkLeftContext: viewModel.chunkLeftContext,
                         isRecording: viewModel.isRecording,
                         updateTrigger: viewModel.updateTrigger,
-                        segmentAnnotations: viewModel.segmentAnnotations,
                         onPlaySegment: { start, end in
                             viewModel.playSegment(startTime: start, endTime: end)
-                        },
-                        onAnnotateSegment: { segment in
-                            // Show annotation dialog
-                            selectedSegment = segment
-                            annotationText = viewModel.getAnnotation(for: segment) ?? ""
-                            showingAnnotationDialog = true
-                        },
-                        onPurgeSpeaker: { speakerIndex in
-                            viewModel.purgeSpeaker(at: speakerIndex)
                         }
                     )
-                    
-                    // Drag and drop overlay
-                    if isDragOver {
-                        RoundedRectangle(cornerRadius: 12)
-                            .stroke(Color.blue, style: StrokeStyle(lineWidth: 3, dash: [10]))
-                            .background(Color.blue.opacity(0.1))
-                            .cornerRadius(12)
-                            .overlay(
-                                VStack(spacing: 8) {
-                                    Image(systemName: "arrow.down.doc.fill")
-                                        .font(.system(size: 48))
-                                        .foregroundColor(.blue)
-                                    Text("Drop audio file here")
-                                        .font(.headline)
-                                        .foregroundColor(.blue)
-                                }
-                            )
-                    }
+                    .frame(minHeight: 110, maxHeight: 200)
                 }
                 .layoutPriority(1)
                 .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
 
-                AHCDendrogramView(model: viewModel.dendrogramModel)
+                KMeansDendrogramView(model: viewModel.dendrogramModel)
                     .frame(minWidth: 320, maxWidth: 440, maxHeight: .infinity)
                     .padding(.leading, 12)
             }

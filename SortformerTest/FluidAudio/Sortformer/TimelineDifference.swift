@@ -11,8 +11,8 @@ import OrderedCollections
 
 
 public struct SortformerTimelineDifference {
-    public private(set) var insertions: Set<SortformerSegment> = []
-    public private(set) var deletions: Set<SortformerSegment> = []
+    public private(set) var insertions: Set<SpeakerSegment> = []
+    public private(set) var deletions: Set<SpeakerSegment> = []
     
     public var isEmpty: Bool {
         return insertions.isEmpty && deletions.isEmpty
@@ -26,8 +26,8 @@ public struct SortformerTimelineDifference {
     }
     
     public init(
-        insertions: Set<SortformerSegment>,
-        deletions: Set<SortformerSegment>
+        insertions: Set<SpeakerSegment>,
+        deletions: Set<SpeakerSegment>
     ) {
         self.insertions = insertions
         self.deletions  = deletions
@@ -37,8 +37,8 @@ public struct SortformerTimelineDifference {
     /// Assumes the segments for each speaker are disjoint and sorted from oldest to newest
     /// Two segments are considered "matched" if they are identical
     public init(
-        old: [SortformerSegment],
-        new: [SortformerSegment]
+        old: [SpeakerSegment],
+        new: [SpeakerSegment]
     ) {
         let oldSet = Set(old)
         let newSet = Set(new)
@@ -53,7 +53,7 @@ public struct SortformerTimelineDifference {
         self.deletions = []
     }
     
-    public mutating func insert(_ segment: SortformerSegment) {
+    public mutating func insert(_ segment: SpeakerSegment) {
         // Try cancelling with a deletion
         if deletions.contains(segment) {
             deletions.remove(segment)
@@ -62,11 +62,11 @@ public struct SortformerTimelineDifference {
         }
     }
     
-    public mutating func insert(_ segments: [SortformerSegment]) {
+    public mutating func insert(_ segments: [SpeakerSegment]) {
         insertions.formUnion(Set(segments).subtracting(deletions))
     }
     
-    public mutating func delete(_ segment: SortformerSegment) {
+    public mutating func delete(_ segment: SpeakerSegment) {
         // Try cancelling with an insertion
         if insertions.contains(segment) {
             insertions.remove(segment)
@@ -75,21 +75,21 @@ public struct SortformerTimelineDifference {
         }
     }
     
-    public mutating func delete(_ segments: [SortformerSegment]) {
+    public mutating func delete(_ segments: [SpeakerSegment]) {
         deletions.formUnion(Set(segments).subtracting(insertions))
     }
     
-    public mutating func replace(_ segment: SortformerSegment, with newSegment: SortformerSegment) {
+    public mutating func replace(_ segment: SpeakerSegment, with newSegment: SpeakerSegment) {
         delete(segment)
         insert(newSegment)
     }
     
-    public mutating func merge(_ segments: [SortformerSegment], into newSegment: SortformerSegment) {
+    public mutating func merge(_ segments: [SpeakerSegment], into newSegment: SpeakerSegment) {
         delete(segments)
         insert(newSegment)
     }
     
-    public mutating func split(_ segment: SortformerSegment, into newSegments: [SortformerSegment]) {
+    public mutating func split(_ segment: SpeakerSegment, into newSegments: [SpeakerSegment]) {
         delete(segment)
         insert(newSegments)
     }
@@ -106,7 +106,7 @@ public struct SortformerTimelineDifference {
         deletions.formUnion(del)
     }
     
-    public func apply(to timeline: inout OrderedSet<SortformerSegment>) -> Bool {
+    public func apply(to timeline: inout OrderedSet<SpeakerSegment>) -> Bool {
         guard deletions.isSubset(of: timeline) else {
             return false
         }
@@ -122,8 +122,8 @@ public struct SortformerTimelineDifference {
     
     // TODO: Optimize this
     /// - Note: Timeline *must* be sorted chronologically from oldest to newest
-    public func compile<C>(for timeline: C) -> (deletions: [Int], insertions: [(index: Int, segment: SortformerSegment)])?
-    where C: RandomAccessCollection, C.Element == SortformerSegment, C.Index == Int {
+    public func compile<C>(for timeline: C) -> (deletions: [Int], insertions: [(index: Int, segment: SpeakerSegment)])?
+    where C: RandomAccessCollection, C.Element == SpeakerSegment, C.Index == Int {
         var deletionIndices: [Int] = []
         deletionIndices.reserveCapacity(deletions.count)
         
@@ -136,7 +136,7 @@ public struct SortformerTimelineDifference {
         
         deletionIndices.sort(by: >)
         
-        var compiledInsertions: [(index: Int, segment: SortformerSegment)] = []
+        var compiledInsertions: [(index: Int, segment: SpeakerSegment)] = []
         for insertion in insertions {
             var index = timeline.lastIndex { $0 < insertion }.map { $0 + 1 } ?? 0
             index -= deletions.count { $0 < insertion }

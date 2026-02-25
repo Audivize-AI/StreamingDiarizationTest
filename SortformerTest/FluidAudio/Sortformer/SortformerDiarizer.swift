@@ -83,7 +83,7 @@ public final class SortformerDiarizer {
 
     public init(
         config: SortformerConfig = .default,
-        postProcessingConfig: SortformerPostProcessingConfig? = nil,
+        postProcessingConfig: SortformerTimelineConfig? = nil,
         embeddingConfig: EmbeddingConfig? = nil
     ) {
         self.config = config

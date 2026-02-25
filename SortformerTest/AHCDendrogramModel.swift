@@ -1,6 +1,6 @@
 import Foundation
 
-struct AHCDendrogramNodeModel: Identifiable, Hashable {
+struct KMeansDendrogramNodeModel: Identifiable, Hashable {
     let id: Int
     let matrixIndex: Int
     let leftChild: Int
@@ -17,20 +17,20 @@ struct AHCDendrogramNodeModel: Identifiable, Hashable {
     }
 }
 
-struct AHCDendrogramModel: Equatable {
+struct KMeansDendrogramModel: Equatable {
     let rootIndex: Int
     let activeLeafCount: Int
-    let nodes: [AHCDendrogramNodeModel]
+    let nodes: [KMeansDendrogramNodeModel]
     let updatedAt: Date
 
-    init(rootIndex: Int, activeLeafCount: Int, nodes: [AHCDendrogramNodeModel], updatedAt: Date = Date()) {
+    init(rootIndex: Int, activeLeafCount: Int, nodes: [KMeansDendrogramNodeModel], updatedAt: Date = Date()) {
         self.rootIndex = rootIndex
         self.activeLeafCount = activeLeafCount
         self.nodes = nodes
         self.updatedAt = updatedAt
     }
 
-    static let empty = AHCDendrogramModel(rootIndex: -1, activeLeafCount: 0, nodes: [], updatedAt: .distantPast)
+    static let empty = KMeansDendrogramModel(rootIndex: -1, activeLeafCount: 0, nodes: [], updatedAt: .distantPast)
 
     var isEmpty: Bool {
         rootIndex < 0 || nodes.isEmpty
@@ -43,7 +43,7 @@ struct AHCDendrogramModel: Equatable {
             .max() ?? 0
     }
 
-    var nodesById: [Int: AHCDendrogramNodeModel] {
+    var nodesById: [Int: KMeansDendrogramNodeModel] {
         Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
     }
 }

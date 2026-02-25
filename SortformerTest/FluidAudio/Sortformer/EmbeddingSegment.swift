@@ -146,19 +146,15 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
     }
 }
 
+
+// MARK: - Embedding Segment
 /// Tracks embeddings for a disjoint segment
 public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
-    enum NormalizationPolicy {
-        case byWeight /// Normalize by total weight, i.e., the sum of the durations of all the embeddings in this segment
-        case toUnitVector /// Normalize to a unit vector
-        case none   /// Don't normalize
-    }
-    
     /// Segment ID
     public private(set) var id: UUID = .zero
 
     /// Speaker index in Sortformer output
-    public var slot: Int
+    public var speakerId: Int
 
     /// Index of segment start frame
     public var startFrame: Int
@@ -181,42 +177,42 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     public private(set) var embeddings: [SpeakerEmbedding]
     
     /// IDs of the corresponding `SortformerSegments`
-    public var segmentIds: [UUID]
+    public var segments: [SpeakerSegment]
     
-    public var isNone: Bool { slot < 0 }
-    public var isValid: Bool { slot >= 0 }
+    public var isNone: Bool { speakerId < 0 }
+    public var isValid: Bool { speakerId >= 0 }
     
-    public static let none: EmbeddingSegment = .init(speakerIndex: -1, startFrame: 0, endFrame: 0, segmentIds: [])
+    public static let none: EmbeddingSegment = .init(slot: -1, startFrame: 0, endFrame: 0, segments: [])
     
     // MARK: - Init
     public init(
-        speakerIndex: Int,
+        slot: Int,
         startFrame: Int,
         endFrame: Int,
         finalized: Bool = true,
-        segmentIds: [UUID] = []
+        segments: [SpeakerSegment] = []
     ) {
-        self.slot = speakerIndex
+        self.speakerId = slot
         self.startFrame = startFrame
         self.endFrame = endFrame
         self.isFinalized = finalized
         self.embeddings = []
-        self.segmentIds = segmentIds
+        self.segments = segments
     }
     
     public init(
-        speakerIndex: Int,
+        slot: Int,
         startFrame: Int,
         endFrame: Int,
         finalized: Bool = true,
-        segmentId: UUID
+        segment: SpeakerSegment
     ) {
-        self.slot = speakerIndex
+        self.speakerId = slot
         self.startFrame = startFrame
         self.endFrame = endFrame
         self.isFinalized = finalized
         self.embeddings = []
-        self.segmentIds = [segmentId]
+        self.segments = [segment]
     }
     
     // MARK: - Speaker Frame Range
@@ -273,7 +269,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         let requests: [EmbeddingRequest]
         let minEmbeddingLength = extractor.config.minEmbeddingFrames
         let maxEmbeddingLength = extractor.config.maxEmbeddingFrames
-        let maxGapLength = extractor.config.maxEmbeddingGap
+        let maxGapLength = extractor.config.maxFramesSkipped
         
         if embeddings.isEmpty {
             requests = generateInitialRequests(
@@ -296,7 +292,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
             let gaps = getGaps(
                 in: embeddingFrames,
                 before: cutoff,
-                ifAnyExceed: extractor.config.maxEmbeddingGap
+                ifAnyExceed: extractor.config.maxFramesSkipped
             )
             
             // Since frames are in descending order, the first range is the last one chronologically
@@ -306,7 +302,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
             
             let requestStarts = generateCovering(
                 for: gaps,
-                biggerThan: extractor.config.maxEmbeddingGap,
+                biggerThan: extractor.config.maxFramesSkipped,
                 withCoverLength: extractor.config.maxEmbeddingFrames,
                 lastEmbeddingEnd: lastEmbeddingEnd,
             )
@@ -537,8 +533,8 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// This requires that the last segment ID in this segment is the first segment ID in `other`.
     /// - Note: Segments can only absorb segments built after itself.
     internal func mustLink(with other: EmbeddingSegment) -> Bool {
-        return (self.slot == other.slot &&
-                self.segmentIds.last == other.segmentIds.first)
+        return (self.speakerId == other.speakerId &&
+                self.segments.last == other.segments.first)
     }
     
     /// Check if this segment must link with another segment and absorb it if so.
@@ -554,7 +550,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         self.isFinalized = self.isFinalized && other.isFinalized
         
         self.embeddings.append(contentsOf: other.embeddings)
-        self.segmentIds.append(contentsOf: other.segmentIds.dropFirst())
+        self.segments.append(contentsOf: other.segments.dropFirst())
         
         // Combine IDs
         withUnsafeMutableBytes(of: &self.id) { idPtr in
@@ -584,7 +580,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
             self.centroid = SpeakerClusterCentroid(
                 id: id,
                 embedding: embeddings[0],
-                segmentIds: segmentIds,
+                segments: segments,
                 weight: Float(embeddings[0].length),
                 isFinalized: isFinalized
             )
@@ -596,7 +592,7 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         
         let centroid = SpeakerClusterCentroid(
             id: id,
-            segmentIds: segmentIds,
+            segments: segments,
             weight: w0 + w1,
             isFinalized: isFinalized
         )

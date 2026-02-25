@@ -1,7 +1,6 @@
 import AVFoundation
 import Combine
 import Foundation
-import AHCClustering
 
 /// ViewModel managing real-time speaker diarization state.
 /// Uses FluidAudio's SortformerDiarizer with default configuration.
@@ -47,8 +46,14 @@ final class DiarizerViewModel: ObservableObject {
     /// Segment annotations - maps "startFrame-endFrame-speaker" to custom label
     @Published var segmentAnnotations: [String: String] = [:]
 
-    /// Latest live dendrogram model built from SpeakerProfile clustering
-    @Published private(set) var dendrogramModel: AHCDendrogramModel = .empty
+    /// Distance from each Sortformer segment centroid to its nearest live cluster centroid.
+    @Published private(set) var segmentCentroidDistances: [UUID: Float] = [:]
+
+    /// Distance from each embedding segment centroid to its nearest live cluster centroid.
+    @Published private(set) var embeddingSegmentCentroidDistances: [UUID: Float] = [:]
+
+    /// Latest live K-means grouping dendrogram built from SpeakerProfile clustering
+    @Published private(set) var dendrogramModel: KMeansDendrogramModel = .empty
     
     /// All recorded audio samples for playback (16kHz mono)
     private(set) var recordedAudio: [Float] = []
@@ -60,20 +65,38 @@ final class DiarizerViewModel: ObservableObject {
     private var processingTask: Task<Void, Never>?
     private var audioPlayer: AVAudioPlayer?
     private var audioConverter: AudioConverter
-    private let dendrogramClusteringConfig = ClusteringConfig(
-        linkagePolicy: dendrogramLinkagePolicy,
-        minSeparation: 0.3,
-        clusteringThreshold: 0.3,
-        maxEmbeddings: 20,
-        minEmbeddings: 10,
-        maxRepresentatives: 1
-    )
+    private let clusteringConfig = ClusteringConfig(clusteringThreshold: 0.25)
     private var speakerProfile: SpeakerProfile
     private var streamedFinalizedEmbeddingSegmentCount = 0
+    private var streamedFinalizedTailSignature = FinalizedEmbeddingTailSignature.empty
+    private var slotBySegmentIDHistory: [UUID: Int] = [:]
     // Keep replay traffic bounded so replay/incremental catch-up cannot explode memory.
-    private let dendrogramMaxFinalizedReplaySegments = 3000
-    private let dendrogramMaxTentativeReplaySegments = 1500
-    private let wardLogFloor: Float = 1e-12
+    private let clusterMaxFinalizedReplaySegments = 3000
+    private let clusterMaxTentativeReplaySegments = 1500
+
+    private struct DendrogramWorkingCluster {
+        let nodeId: Int
+        let vector: [Float]
+        let weight: Float
+        let leafCount: Int
+        let speakerHistogram: [Int: Int]
+    }
+
+    private struct FinalizedEmbeddingTailSignature: Equatable {
+        let count: Int
+        let lastID: UUID?
+        let lastSlot: Int
+        let lastStartFrame: Int
+        let lastEndFrame: Int
+
+        static let empty = FinalizedEmbeddingTailSignature(
+            count: 0,
+            lastID: nil,
+            lastSlot: -1,
+            lastStartFrame: -1,
+            lastEndFrame: -1
+        )
+    }
     
     private let sampleRate: Double = 16000.0
     
@@ -85,7 +108,7 @@ final class DiarizerViewModel: ObservableObject {
     
     init() {
         self.audioConverter = AudioConverter()
-        self.speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig, speakerIndex: 0)
+        self.speakerProfile = SpeakerProfile(config: clusteringConfig, speakerIndex: 0)
         Task {
             await loadModels()
         }
@@ -102,7 +125,7 @@ final class DiarizerViewModel: ObservableObject {
         recordedAudio = []
         diarizer?.reset()
         timeline = diarizer?.timeline
-        resetDendrogramState()
+        resetClusterState()
         
         // Start audio capture
         do {
@@ -148,7 +171,7 @@ final class DiarizerViewModel: ObservableObject {
         try? timeline?.finalize()
         updateTrigger += 1
 
-        updateDendrogram()
+        updateClusterVisualization()
         
         isRecording = false
         statusMessage = "Ready - Click segments to play"
@@ -179,7 +202,7 @@ final class DiarizerViewModel: ObservableObject {
         guard isReady, !isRecording else { return }
         guard let diarizer = diarizer else { return }
 
-        resetDendrogramState()
+        resetClusterState()
         
         fileProcessingProgress = 0.0
         statusMessage = "Loading audio file..."
@@ -284,7 +307,7 @@ final class DiarizerViewModel: ObservableObject {
             fifoPreds = diarizer.state.fifoPreds  // Update FIFO queue display
             updateTrigger += 1
 
-            updateDendrogram()
+            updateClusterVisualization()
             
             fileProcessingProgress = 1.0
             
@@ -404,7 +427,7 @@ final class DiarizerViewModel: ObservableObject {
             
             self.diarizer = newDiarizer
             self.timeline = newDiarizer.timeline
-            resetDendrogramState()
+            resetClusterState()
             self.isReady = true
             self.statusMessage = "Ready"
         } catch {
@@ -495,7 +518,7 @@ final class DiarizerViewModel: ObservableObject {
             updateTrigger += 1
             spkcachePreds = diarizer.state.spkcachePreds
             fifoPreds = diarizer.state.fifoPreds
-            updateDendrogram()
+            updateClusterVisualization()
             
             // Don't update graph during streaming - it causes lag and isn't visible anyway
             // Graph will be updated when clustering is triggered
@@ -505,233 +528,431 @@ final class DiarizerViewModel: ObservableObject {
         }
     }
 
-    private func resetDendrogramState() {
-        speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig, speakerIndex: 0)
+    private func resetClusterState() {
+        speakerProfile = SpeakerProfile(config: clusteringConfig, speakerIndex: 0)
         streamedFinalizedEmbeddingSegmentCount = 0
+        streamedFinalizedTailSignature = .empty
+        slotBySegmentIDHistory.removeAll(keepingCapacity: false)
+        segmentCentroidDistances = [:]
+        embeddingSegmentCentroidDistances = [:]
         dendrogramModel = .empty
     }
 
-    private func updateDendrogram() {
+    private func updateClusterVisualization() {
         guard let tl = timeline else {
             dendrogramModel = .empty
             streamedFinalizedEmbeddingSegmentCount = 0
+            streamedFinalizedTailSignature = .empty
+            slotBySegmentIDHistory.removeAll(keepingCapacity: false)
+            segmentCentroidDistances = [:]
+            embeddingSegmentCentroidDistances = [:]
+            return
+        }
+        updateSlotHistory(from: tl)
+
+        let currentFinalizedTailSignature = finalizedTailSignature(for: tl.embeddingSegments)
+        if tl.embeddingSegments.count < streamedFinalizedEmbeddingSegmentCount {
+            _ = replayFullClusterState(from: tl)
             return
         }
 
-        if tl.embeddingSegments.count < streamedFinalizedEmbeddingSegmentCount {
-            _ = replayFullDendrogramState(from: tl)
+        let pendingFinalizedCount = tl.embeddingSegments.count - streamedFinalizedEmbeddingSegmentCount
+        if pendingFinalizedCount > clusterMaxFinalizedReplaySegments {
+            print("[Dendrogram] Backlog too large (\(pendingFinalizedCount)); replaying capped window")
+            _ = replayFullClusterState(from: tl)
+            return
         }
 
-        let pendingFinalizedCount = tl.embeddingSegments.count - streamedFinalizedEmbeddingSegmentCount
-        if pendingFinalizedCount > dendrogramMaxFinalizedReplaySegments {
-            print("[Dendrogram] Backlog too large (\(pendingFinalizedCount)); replaying capped window")
-            _ = replayFullDendrogramState(from: tl)
+        // A finalized segment can be extended/absorbed in place without increasing count.
+        // In that case incremental-by-count misses updates, so replay the capped window.
+        if pendingFinalizedCount == 0 && currentFinalizedTailSignature != streamedFinalizedTailSignature {
+            _ = replayFullClusterState(from: tl)
+            return
         }
 
         let newFinalized = Array(tl.embeddingSegments.dropFirst(streamedFinalizedEmbeddingSegmentCount))
-        let tentativeWindow = Array(tl.tentativeEmbeddingSegments.suffix(dendrogramMaxTentativeReplaySegments))
-        speakerProfile.stream(newFinalized: newFinalized, newTentative: tentativeWindow)
+        let tentativeWindow = Array(tl.tentativeEmbeddingSegments.suffix(clusterMaxTentativeReplaySegments))
+        speakerProfile.stream(newFinalized: newFinalized, newTentative: tentativeWindow, updateOutliers: true)
         streamedFinalizedEmbeddingSegmentCount = tl.embeddingSegments.count
+        streamedFinalizedTailSignature = currentFinalizedTailSignature
 
-        let speakerIndexBySegmentId = makeSpeakerIndexBySegmentId(from: tl)
-        var nextModel = makeDendrogramModel(
-            from: speakerProfile,
-            speakerIndexBySegmentId: speakerIndexBySegmentId
-        )
-        if nextModel.nodes.contains(where: { !$0.mergeDistance.isFinite }) {
-            print("[Dendrogram] Invalid merge distance detected; replaying full clustering state")
-            if replayFullDendrogramState(from: tl) {
-                nextModel = makeDendrogramModel(
-                    from: speakerProfile,
-                    speakerIndexBySegmentId: speakerIndexBySegmentId
-                )
-            }
-        }
-        dendrogramModel = nextModel
+        let distanceMaps = makeDistanceMaps(from: speakerProfile, timeline: tl)
+        segmentCentroidDistances = distanceMaps.bySegmentID
+        embeddingSegmentCentroidDistances = distanceMaps.byEmbeddingSegmentID
+        dendrogramModel = makeDendrogramModel(from: speakerProfile, timeline: tl)
     }
 
     @discardableResult
-    private func replayFullDendrogramState(from timeline: SortformerTimeline) -> Bool {
-        speakerProfile = SpeakerProfile(config: dendrogramClusteringConfig, speakerIndex: 0)
-        let finalizedWindow = Array(timeline.embeddingSegments.suffix(dendrogramMaxFinalizedReplaySegments))
-        let tentativeWindow = Array(timeline.tentativeEmbeddingSegments.suffix(dendrogramMaxTentativeReplaySegments))
-        speakerProfile.stream(newFinalized: finalizedWindow, newTentative: tentativeWindow)
+    private func replayFullClusterState(from timeline: SortformerTimeline) -> Bool {
+        speakerProfile = SpeakerProfile(config: clusteringConfig, speakerIndex: 0)
+        updateSlotHistory(from: timeline)
+        let finalizedWindow = timeline.embeddingSegments
+        let tentativeWindow = timeline.tentativeEmbeddingSegments
+        speakerProfile.stream(newFinalized: finalizedWindow, newTentative: tentativeWindow, updateOutliers: true)
         print("[Dendrogram] Full replay succeeded (\(timeline.embeddingSegments.count) finalized segments)")
         streamedFinalizedEmbeddingSegmentCount = timeline.embeddingSegments.count
+        streamedFinalizedTailSignature = finalizedTailSignature(for: timeline.embeddingSegments)
+        let distanceMaps = makeDistanceMaps(from: speakerProfile, timeline: timeline)
+        segmentCentroidDistances = distanceMaps.bySegmentID
+        embeddingSegmentCentroidDistances = distanceMaps.byEmbeddingSegmentID
+        dendrogramModel = makeDendrogramModel(from: speakerProfile, timeline: timeline)
         return true
     }
 
-    private func makeSpeakerIndexBySegmentId(from timeline: SortformerTimeline) -> [UUID: Int] {
-        var lookup: [UUID: Int] = [:]
-        lookup.reserveCapacity(timeline.embeddingSegments.count + timeline.tentativeEmbeddingSegments.count)
-
-        for segment in timeline.embeddingSegments {
-            lookup[segment.id] = segment.slot
+    private func finalizedTailSignature(for segments: [EmbeddingSegment]) -> FinalizedEmbeddingTailSignature {
+        guard let last = segments.last else {
+            return .empty
         }
-        for segment in timeline.tentativeEmbeddingSegments {
-            lookup[segment.id] = segment.slot
-        }
-
-        return lookup
+        return FinalizedEmbeddingTailSignature(
+            count: segments.count,
+            lastID: last.id,
+            lastSlot: last.speakerId,
+            lastStartFrame: last.startFrame,
+            lastEndFrame: last.endFrame
+        )
     }
 
-    private func makeDendrogramModel(
-        from profile: SpeakerProfile,
-        speakerIndexBySegmentId: [UUID: Int]
-    ) -> AHCDendrogramModel {
-        let matrix = profile.matrix
-        let dendrogram = profile.dendrogram
-        let rootIndex = Int(dendrogram.rootId())
-        let nodeCount = Int(dendrogram.nodeCount())
-        let activeLeafCount = max(0, Int(matrix.embeddingCount()))
-
-        guard rootIndex >= 0, rootIndex < nodeCount else {
-            return AHCDendrogramModel(rootIndex: -1, activeLeafCount: activeLeafCount, nodes: [])
+    private func makeDendrogramModel(from profile: SpeakerProfile, timeline: SortformerTimeline?) -> KMeansDendrogramModel {
+        let centroids = visualizationCentroids(from: profile)
+        guard !centroids.isEmpty else {
+            return .empty
         }
 
-        let nodeIds = reachableNodeIds(in: dendrogram, rootIndex: rootIndex, nodeCount: nodeCount)
-        guard !nodeIds.isEmpty else {
-            return AHCDendrogramModel(rootIndex: -1, activeLeafCount: activeLeafCount, nodes: [])
-        }
+        let slotBySegmentID = segmentSlotByID(from: timeline)
+        var nodes: [KMeansDendrogramNodeModel] = []
+        nodes.reserveCapacity(centroids.count * 2)
 
-        let linkagePolicy = profile.config.linkagePolicy
-        let useDynamicWardThreshold = linkagePolicy == .wardLinkage
-        var hasLinkageCutoff = false
-        var linkageCutoff: Float = 0
+        var workingClusters: [DendrogramWorkingCluster] = []
+        workingClusters.reserveCapacity(centroids.count)
 
-        if useDynamicWardThreshold {
-            var internalMergeDistances: [Float] = []
-            internalMergeDistances.reserveCapacity(nodeIds.count)
+        var nextNodeID = 0
+        for (index, centroid) in centroids.enumerated() {
+            let vector = normalizedVector(Array(centroid.buffer))
+            let slot = dominantSlot(for: centroid, slotBySegmentID: slotBySegmentID)
+            let histogram: [Int: Int] = slot >= 0 ? [slot: 1] : [:]
 
-            for nodeId in nodeIds {
-                let node = dendrogram.node(nodeId)
-                let leftChild = Int(node.leftChild)
-                let rightChild = Int(node.rightChild)
-                let isInternalNode = leftChild >= 0 && rightChild >= 0 &&
-                    leftChild < nodeCount && rightChild < nodeCount
-                guard isInternalNode else { continue }
-                internalMergeDistances.append(
-                    transformedLinkageDistance(node.mergeDistance, linkagePolicy: linkagePolicy)
+            let leafNode = KMeansDendrogramNodeModel(
+                id: nextNodeID,
+                matrixIndex: index,
+                leftChild: -1,
+                rightChild: -1,
+                speakerIndex: slot,
+                count: 1,
+                weight: centroid.weight,
+                mergeDistance: 0,
+                mustLink: false,
+                exceedsLinkageThreshold: false
+            )
+            nodes.append(leafNode)
+
+            workingClusters.append(
+                DendrogramWorkingCluster(
+                    nodeId: nextNodeID,
+                    vector: vector,
+                    weight: centroid.weight,
+                    leafCount: 1,
+                    speakerHistogram: histogram
                 )
-            }
-
-            if !internalMergeDistances.isEmpty {
-                let sum = internalMergeDistances.reduce(0, +)
-                let mean = sum / Float(internalMergeDistances.count)
-                let variance = internalMergeDistances.reduce(0) { partial, distance in
-                    let delta = distance - mean
-                    return partial + delta * delta
-                } / Float(internalMergeDistances.count)
-                let stddev = sqrtf(max(variance, 0))
-                linkageCutoff = mean + 2 * stddev
-                hasLinkageCutoff = linkageCutoff.isFinite
-            }
-        } else {
-            linkageCutoff = profile.config.mergeThreshold
-            hasLinkageCutoff = linkageCutoff.isFinite
+            )
+            nextNodeID += 1
         }
 
-        var nodes: [AHCDendrogramNodeModel] = []
-        nodes.reserveCapacity(nodeIds.count)
-        let matrixSize = Int(matrix.size())
-
-        for nodeId in nodeIds {
-            let node = dendrogram.node(nodeId)
-            let matrixIndex = Int(node.matrixIndex)
-            let leftChild = Int(node.leftChild)
-            let rightChild = Int(node.rightChild)
-            let isLeaf = leftChild < 0 || rightChild < 0
-            var speakerIndex = -1
-
-            if isLeaf && matrixIndex >= 0 && matrixIndex < matrixSize {
-                let embedding = matrix.embedding(matrixIndex)
-                if embedding.hasVector() {
-                    speakerIndex = speakerIndexBySegmentId[uuid(from: embedding.id())] ?? -1
-                }
-            }
-
-            let mergeDistance = transformedLinkageDistance(node.mergeDistance, linkagePolicy: linkagePolicy)
-            let isInternalNode = leftChild >= 0 && rightChild >= 0 &&
-                leftChild < nodeCount && rightChild < nodeCount
-            let exceedsLinkageThreshold = isInternalNode && hasLinkageCutoff &&
-                mergeDistance.isFinite && mergeDistance > linkageCutoff
-
-            nodes.append(
-                AHCDendrogramNodeModel(
-                    id: nodeId,
-                    matrixIndex: matrixIndex,
-                    leftChild: leftChild,
-                    rightChild: rightChild,
-                    speakerIndex: speakerIndex,
-                    count: Int(node.count),
-                    weight: node.weight,
-                    mergeDistance: mergeDistance,
-                    mustLink: false,
-                    exceedsLinkageThreshold: exceedsLinkageThreshold
-                )
+        if workingClusters.count == 1 {
+            return KMeansDendrogramModel(
+                rootIndex: workingClusters[0].nodeId,
+                activeLeafCount: 1,
+                nodes: nodes
             )
         }
 
-        return AHCDendrogramModel(
-            rootIndex: rootIndex,
-            activeLeafCount: activeLeafCount,
+        let tieTolerance: Float = 1e-6
+        while workingClusters.count > 1 {
+            var bestPair: (Int, Int)?
+            var bestDistance = Float.greatestFiniteMagnitude
+
+            for i in 0..<(workingClusters.count - 1) {
+                for j in (i + 1)..<workingClusters.count {
+                    let distance = cosineDistance(workingClusters[i].vector, workingClusters[j].vector)
+                    let shouldReplace: Bool
+                    if distance < bestDistance - tieTolerance {
+                        shouldReplace = true
+                    } else if abs(distance - bestDistance) <= tieTolerance {
+                        let candidateIDs = orderedNodeIDs(workingClusters[i].nodeId, workingClusters[j].nodeId)
+                        let currentIDs = bestPair.map {
+                            orderedNodeIDs(workingClusters[$0.0].nodeId, workingClusters[$0.1].nodeId)
+                        }
+                        shouldReplace = currentIDs == nil || candidateIDs.0 < currentIDs!.0 ||
+                            (candidateIDs.0 == currentIDs!.0 && candidateIDs.1 < currentIDs!.1)
+                    } else {
+                        shouldReplace = false
+                    }
+
+                    if shouldReplace {
+                        bestDistance = distance
+                        bestPair = (i, j)
+                    }
+                }
+            }
+
+            guard let bestPair else {
+                return .empty
+            }
+
+            let leftIndex = min(bestPair.0, bestPair.1)
+            let rightIndex = max(bestPair.0, bestPair.1)
+            let right = workingClusters.remove(at: rightIndex)
+            let left = workingClusters.remove(at: leftIndex)
+
+            let mergedHistogram = mergedSpeakerHistogram(left.speakerHistogram, right.speakerHistogram)
+            let dominantSpeaker = dominantSpeakerSlot(from: mergedHistogram)
+            let mergedVector = mergedClusterVector(left: left, right: right)
+            let mergedWeight = max(left.weight + right.weight, 1e-6)
+            let mergedLeafCount = left.leafCount + right.leafCount
+            let exceedsThreshold = bestDistance > clusteringConfig.clusteringThreshold
+
+            let parentNode = KMeansDendrogramNodeModel(
+                id: nextNodeID,
+                matrixIndex: nextNodeID,
+                leftChild: left.nodeId,
+                rightChild: right.nodeId,
+                speakerIndex: dominantSpeaker,
+                count: mergedLeafCount,
+                weight: mergedWeight,
+                mergeDistance: bestDistance,
+                mustLink: false,
+                exceedsLinkageThreshold: exceedsThreshold
+            )
+            nodes.append(parentNode)
+
+            workingClusters.append(
+                DendrogramWorkingCluster(
+                    nodeId: nextNodeID,
+                    vector: mergedVector,
+                    weight: mergedWeight,
+                    leafCount: mergedLeafCount,
+                    speakerHistogram: mergedHistogram
+                )
+            )
+            nextNodeID += 1
+        }
+
+        guard let rootCluster = workingClusters.first else {
+            return .empty
+        }
+
+        return KMeansDendrogramModel(
+            rootIndex: rootCluster.nodeId,
+            activeLeafCount: centroids.count,
             nodes: nodes
         )
     }
 
-    private func reachableNodeIds(in dendrogram: Dendrogram, rootIndex: Int, nodeCount: Int) -> [Int] {
-        guard rootIndex >= 0, rootIndex < nodeCount else {
-            return []
+    private func visualizationCentroids(from profile: SpeakerProfile) -> [SpeakerClusterCentroid] {
+        let tentative = profile.tentativeClusters + profile.tentativeOutliers
+        if !tentative.isEmpty {
+            return tentative
+        }
+        let finalized = profile.finalizedClusters + profile.finalizedOutliers
+        if !finalized.isEmpty {
+            return finalized
+        }
+        return []
+    }
+
+    private func makeDistanceMaps(
+        from profile: SpeakerProfile,
+        timeline: SortformerTimeline
+    ) -> (bySegmentID: [UUID: Float], byEmbeddingSegmentID: [UUID: Float]) {
+        let clusters = visualizationCentroids(from: profile)
+        guard !clusters.isEmpty else {
+            return ([:], [:])
         }
 
-        var visited: Set<Int> = []
-        visited.reserveCapacity(nodeCount)
-        var stack: [Int] = [rootIndex]
-        stack.reserveCapacity(nodeCount)
+        let clusterVectors: [[Float]] = clusters.compactMap { centroid in
+            let vector = normalizedVector(Array(centroid.buffer))
+            return vector.isEmpty ? nil : vector
+        }
+        guard !clusterVectors.isEmpty else {
+            return ([:], [:])
+        }
 
-        while let nodeId = stack.popLast() {
-            guard nodeId >= 0, nodeId < nodeCount, visited.insert(nodeId).inserted else {
+        var bySegmentID: [UUID: Float] = [:]
+        var byEmbeddingSegmentID: [UUID: Float] = [:]
+        let embeddingSegments = timeline.embeddingSegments + timeline.tentativeEmbeddingSegments
+        byEmbeddingSegmentID.reserveCapacity(embeddingSegments.count)
+
+        for embeddingSegment in embeddingSegments {
+            guard let segmentVector = centroidVector(for: embeddingSegment) else {
                 continue
             }
 
-            let node = dendrogram.node(nodeId)
-            let leftChild = Int(node.leftChild)
-            let rightChild = Int(node.rightChild)
-
-            if leftChild >= 0 {
-                stack.append(leftChild)
+            var bestDistance = Float.greatestFiniteMagnitude
+            for clusterVector in clusterVectors {
+                bestDistance = min(bestDistance, cosineDistance(segmentVector, clusterVector))
             }
-            if rightChild >= 0 {
-                stack.append(rightChild)
+            guard bestDistance.isFinite else {
+                continue
+            }
+
+            byEmbeddingSegmentID[embeddingSegment.id] = bestDistance
+            for segmentID in embeddingSegment.segmentIds {
+                if let current = bySegmentID[segmentID] {
+                    bySegmentID[segmentID] = min(current, bestDistance)
+                } else {
+                    bySegmentID[segmentID] = bestDistance
+                }
             }
         }
 
-        return visited.sorted()
+        return (bySegmentID, byEmbeddingSegmentID)
     }
 
-    private func transformedLinkageDistance(_ mergeDistance: Float, linkagePolicy: LinkagePolicyType) -> Float {
-        guard mergeDistance.isFinite else {
-            return 0
+    private func centroidVector(for embeddingSegment: EmbeddingSegment) -> [Float]? {
+        if let centroid = embeddingSegment.centroid {
+            let vector = normalizedVector(Array(centroid.buffer))
+            return vector.isEmpty ? nil : vector
         }
 
-        if linkagePolicy == .wardLinkage {
-            let flooredDistance = max(mergeDistance, wardLogFloor)
-            let loggedDistance = logf(flooredDistance)
-            return loggedDistance.isFinite ? loggedDistance : 0
+        let embeddings = embeddingSegment.embeddings
+        guard let first = embeddings.first else {
+            return nil
         }
 
-        return mergeDistance < 0 ? 0 : mergeDistance
-    }
+        let dimension = first.count
+        guard dimension > 0 else { return nil }
 
-    private func uuid(from wrapper: UUIDWrapper) -> UUID {
-        var uuidTuple: uuid_t = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        var words = (wrapper.data.0, wrapper.data.1)
-        withUnsafeMutableBytes(of: &uuidTuple) { destination in
-            withUnsafeBytes(of: &words) { source in
-                destination.copyBytes(from: source)
+        var accumulator = Array(repeating: Float.zero, count: dimension)
+        var totalWeight: Float = 0
+
+        for embedding in embeddings {
+            guard embedding.count == dimension else { continue }
+            let weight = Float(max(embedding.length, 1))
+            totalWeight += weight
+            let buffer = embedding.bufferView
+            for dim in 0..<dimension {
+                accumulator[dim] += buffer[dim] * weight
             }
         }
-        return UUID(uuid: uuidTuple)
+
+        guard totalWeight > 0 else {
+            return nil
+        }
+
+        for dim in 0..<dimension {
+            accumulator[dim] /= totalWeight
+        }
+
+        let normalized = normalizedVector(accumulator)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private func updateSlotHistory(from timeline: SortformerTimeline) {
+        for segment in timeline.segments.flatMap({ $0 }) {
+            slotBySegmentIDHistory[segment.id] = segment.slot
+        }
+        for segment in timeline.tentativeSegments.flatMap({ $0 }) {
+            slotBySegmentIDHistory[segment.id] = segment.slot
+        }
+    }
+
+    private func segmentSlotByID(from timeline: SortformerTimeline?) -> [UUID: Int] {
+        guard let timeline else { return slotBySegmentIDHistory }
+        var result = slotBySegmentIDHistory
+        let finalized = timeline.segments.flatMap { $0 }
+        let tentative = timeline.tentativeSegments.flatMap { $0 }
+        result.reserveCapacity(max(result.count, finalized.count + tentative.count))
+
+        for segment in finalized {
+            result[segment.id] = segment.slot
+        }
+        for segment in tentative {
+            result[segment.id] = segment.slot
+        }
+        return result
+    }
+
+    private func dominantSlot(for centroid: SpeakerClusterCentroid, slotBySegmentID: [UUID: Int]) -> Int {
+        guard !centroid.segmentIds.isEmpty else {
+            return -1
+        }
+        var histogram: [Int: Int] = [:]
+        for segmentID in centroid.segmentIds {
+            guard let slot = slotBySegmentID[segmentID] else { continue }
+            histogram[slot, default: 0] += 1
+        }
+        return dominantSpeakerSlot(from: histogram)
+    }
+
+    private func dominantSpeakerSlot(from histogram: [Int: Int]) -> Int {
+        guard !histogram.isEmpty else { return -1 }
+        return histogram.max { lhs, rhs in
+            if lhs.value == rhs.value {
+                return lhs.key > rhs.key
+            }
+            return lhs.value < rhs.value
+        }?.key ?? -1
+    }
+
+    private func mergedSpeakerHistogram(_ lhs: [Int: Int], _ rhs: [Int: Int]) -> [Int: Int] {
+        var merged = lhs
+        for (speaker, count) in rhs {
+            merged[speaker, default: 0] += count
+        }
+        return merged
+    }
+
+    private func mergedClusterVector(left: DendrogramWorkingCluster, right: DendrogramWorkingCluster) -> [Float] {
+        let dimension = max(left.vector.count, right.vector.count)
+        guard dimension > 0 else { return [] }
+
+        let leftWeight = max(left.weight, 1e-6)
+        let rightWeight = max(right.weight, 1e-6)
+        let totalWeight = leftWeight + rightWeight
+        var merged = Array(repeating: Float.zero, count: dimension)
+
+        for dim in 0..<dimension {
+            let leftValue = dim < left.vector.count ? left.vector[dim] : 0
+            let rightValue = dim < right.vector.count ? right.vector[dim] : 0
+            merged[dim] = (leftValue * leftWeight + rightValue * rightWeight) / totalWeight
+        }
+        return normalizedVector(merged)
+    }
+
+    private func cosineDistance(_ lhs: [Float], _ rhs: [Float]) -> Float {
+        let dimension = min(lhs.count, rhs.count)
+        guard dimension > 0 else {
+            return 1
+        }
+
+        var dot: Float = 0
+        var lhsNormSq: Float = 0
+        var rhsNormSq: Float = 0
+
+        for dim in 0..<dimension {
+            dot += lhs[dim] * rhs[dim]
+            lhsNormSq += lhs[dim] * lhs[dim]
+            rhsNormSq += rhs[dim] * rhs[dim]
+        }
+
+        let norm = sqrt(max(lhsNormSq, 1e-12) * max(rhsNormSq, 1e-12))
+        guard norm > 0 else { return 1 }
+        return max(0, 1 - dot / norm)
+    }
+
+    private func normalizedVector(_ vector: [Float]) -> [Float] {
+        guard !vector.isEmpty else { return [] }
+
+        var sumSquares: Float = 0
+        for value in vector {
+            sumSquares += value * value
+        }
+        let norm = sqrt(max(sumSquares, 1e-12))
+        guard norm > 0 else { return vector }
+        return vector.map { $0 / norm }
+    }
+
+    private func orderedNodeIDs(_ lhs: Int, _ rhs: Int) -> (Int, Int) {
+        lhs <= rhs ? (lhs, rhs) : (rhs, lhs)
     }
     
     /// Print all segments in CSV format: speaker_id,start_time,end_time

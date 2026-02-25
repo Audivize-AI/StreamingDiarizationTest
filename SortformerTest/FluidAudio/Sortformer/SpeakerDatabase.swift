@@ -7,77 +7,109 @@
 
 import Foundation
 
-class SpeakerDatabase {
+public class SpeakerDatabase {
     public let config: ClusteringConfig
-    public private(set)var speakers: [SpeakerProfile] = []
-    public private(set) var slotToSpeaker: [Int] = []
-    public private(set) var slotsWithOutliers: [Int] = []
+    public private(set) var inactiveSpeakers: [Int : SpeakerProfile] = [:]
+    public private(set) var activeSpeakers: [Int : SpeakerProfile] = [:]
+    public private(set) var isOverflowing: Bool
     
-    public init(config: ClusteringConfig) {
-        self.config = config
+    private var nextSpeakerId: Int = 0
+    
+    public var droppableSpeakerIndices: [Int] {
+        activeSpeakers.filter{ !$1.hasOutliers }.map(\.key)
     }
     
-    public func stream(newFinalized: [EmbeddingSegment], newTentative: [EmbeddingSegment]) {
-        var sortedFinalized: [[EmbeddingSegment]] = Array(repeating: [], count: config.eendSpeakerCapacity)
-        var sortedTentative: [[EmbeddingSegment]] = Array(repeating: [], count: config.eendSpeakerCapacity)
+    public var numSlots: Int {
+        config.numSlots
+    }
+    
+    public var hasVacantSlots: Bool {
+        activeSpeakers[numSlots - 1] == nil
+    }
+    
+    public init(config: SortformerTimelineConfig) {
+        self.config = .init(from: config)
+        self.activeSpeakers.reserveCapacity(numSlots)
+    }
+    
+    public func stream(
+        newFinalized: [EmbeddingSegment],
+        newTentative: [EmbeddingSegment]
+    ) {
+        var binnedSegments: [Int : (finalized: [EmbeddingSegment], tentative: [EmbeddingSegment])] = [:]
+        binnedSegments.reserveCapacity(numSlots)
         
         for segment in newFinalized {
-            sortedFinalized[segment.slot].append(segment)
+            binnedSegments[segment.speakerId, default: ([], [])].finalized
+                .append(segment)
         }
         
         for segment in newTentative {
-            sortedTentative[segment.slot].append(segment)
+            binnedSegments[segment.speakerId, default: ([], [])].tentative
+                .append(segment)
         }
         
-        slotsWithOutliers.removeAll(keepingCapacity: true)
+        isOverflowing = false
         
-        let checkOutliers = slotToSpeaker.count >= config.eendSpeakerCapacity
+        let checkOutliers = !self.hasVacantSlots
         
-        for slot in 0..<config.eendSpeakerCapacity {
-            // Initialize the speaker if they don't exist
-            if slotToSpeaker.count <= slot {
-                slotToSpeaker.append(speakers.count)
-                speakers.append(
-                    SpeakerProfile(config: config, speakerIndex: speakers.count, slot: slot))
+        for (speakerIndex, (finalized, tentative)) in binnedSegments {
+            // Initialize the speaker if needed
+            guard let speaker = activeSpeakers[speakerIndex] else {
+                debugPrint("WARNING: Found a new speaker in the stream, but it was not active.")
+                continue
             }
             
-            // Update speaker embeddings
-            let speaker = speakers[slotToSpeaker[slot]]
-            
             speaker.stream(
-                newFinalized: sortedFinalized[slot],
-                newTentative: sortedTentative[slot],
+                newFinalized: finalized,
+                newTentative: tentative,
                 updateOutliers: checkOutliers
             )
             
             if speaker.hasOutliers {
-                slotsWithOutliers.append(slot)
+                isOverflowing = true
             }
         }
     }
     
-    public func selectSlotToDrop() -> Int? {
-        // Free a slot if outliers are found
-        guard !slotsWithOutliers.isEmpty else {
-            return nil
+    public func freeSlot(_ slot: Int) {
+        // Purge the old slot
+        if let speaker = activeSpeakers[slot] {
+            if let matchIndex = checkInactiveMatches(for: speaker, threshold: config.matchThreshold) {
+                inactiveSpeakers[matchIndex]?.absorb(speaker)
+            }
         }
         
-        // Pick the a slot without outliers with the most embeddings
-        let droppableSlots = (0..<config.eendSpeakerCapacity).filter { !slotsWithOutliers.contains($0)
+        guard let sourceIndex = slotToSpeaker.values.first(where: { speakers[$0].hasOutliers }) else {
+            
+            slotToSpeaker[slot] = nil
+            return
         }
         
-        guard !droppableSlots.isEmpty else {
-            print("All slots have outliers. Can't drop a slot.")
-            return nil
+        let newSpeaker = speakers[sourceIndex].fromOutliers(slot: slot, speakerIndex: speakers.count)
+        if let newIndex = checkInactiveMatches(for: newSpeaker, threshold: config.matchThreshold) {
+            newSpeaker.speakerIndex = newIndex
         }
-        
-        return droppableSlots.max {
-            speakers[$0].weight > speakers[$1].weight
-        }
+        slotToSpeaker[slot] = newSpeaker.speakerIndex
+        speakers.append(newSpeaker)
     }
     
-    public func drop(slot: Int) {
-        let splitSlot = slotsWithOutliers.removeFirst()
-//        slotToSpeaker.remove(at: slot) = -1
+    public func nextSpeakerIndex() -> Int {
+        
+    }
+    
+    private func checkInactiveMatches(for speaker: SpeakerProfile, threshold: Float) -> Int? {
+        var bestDistance: Float = threshold.nextUp
+        var bestMatch: Int? = nil
+        
+        for candidate in speakers where candidate.slot == nil {
+            let distance = speaker.distance(to: candidate)
+            if distance <= bestDistance {
+                bestMatch = candidate.speakerIndex
+                bestDistance = distance
+            }
+        }
+        
+        return bestMatch
     }
 }

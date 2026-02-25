@@ -1,5 +1,8 @@
 import SwiftUI
 import CoreGraphics
+#if os(macOS)
+import AppKit
+#endif
 
 /// Real-time speech diarization heatmap view.
 /// Displays speaker probabilities as a viridis-colored heatmap with 4 speaker rows.
@@ -27,6 +30,12 @@ struct SpeechPlotView: View {
     
     /// Segment annotations dictionary
     let segmentAnnotations: [String: String]
+
+    /// Distance from Sortformer segment centroid to nearest cluster centroid.
+    let segmentCentroidDistances: [UUID: Float]
+
+    /// Distance from embedding segment centroid to nearest cluster centroid.
+    let embeddingSegmentCentroidDistances: [UUID: Float]
     
     
     /// Callback when a segment is clicked (start, end)
@@ -69,6 +78,21 @@ struct SpeechPlotView: View {
     private let speakerColors: [Color] = [
         .red, .green, .blue, .orange
     ]
+
+    private var horizontalScrollbarHeight: CGFloat {
+#if os(macOS)
+        switch NSScroller.preferredScrollerStyle {
+        case .legacy:
+            return NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        case .overlay:
+            return 0
+        @unknown default:
+            return 0
+        }
+#else
+        return 0
+#endif
+    }
     
     var body: some View {
         GeometryReader { geometry in
@@ -107,7 +131,10 @@ struct SpeechPlotView: View {
     // MARK: - Main Heatmap Section
     
     private func mainHeatmapSection(width: CGFloat, height: CGFloat) -> some View {
-        HStack(alignment: .top, spacing: 4) {
+        let contentHeight = max(0, height)
+        let scrollViewportHeight = contentHeight + horizontalScrollbarHeight
+
+        return HStack(alignment: .top, spacing: 4) {
             // Y-axis labels with purge buttons
             VStack(spacing: 0) {
                 ForEach(0..<numSpeakers, id: \.self) { speaker in
@@ -129,7 +156,7 @@ struct SpeechPlotView: View {
                     .frame(maxHeight: .infinity)
                 }
             }
-            .frame(width: 62, height: max(0, height))
+            .frame(width: 62, height: contentHeight)
             
             // Scrollable heatmap - virtualized chunks
             ScrollViewReader { scrollProxy in
@@ -148,10 +175,10 @@ struct SpeechPlotView: View {
                             Canvas { context, size in
                                 drawChunk(context: context, size: size, 
                                          startFrame: startFrame, endFrame: endFrame,
-                                         cellWidth: cellWidth, cellHeight: height / CGFloat(numSpeakers))
+                                         cellWidth: cellWidth, cellHeight: contentHeight / CGFloat(numSpeakers))
                             }
                             .drawingGroup()
-                            .frame(width: chunkWidth, height: max(0, height))
+                            .frame(width: chunkWidth, height: contentHeight)
                             .id("chunk-\(chunkIndex)")
                         }
                         
@@ -160,7 +187,7 @@ struct SpeechPlotView: View {
                         
                         // Stable scroll target at the trailing edge
                         Color.clear
-                            .frame(width: 1, height: max(1, height))
+                            .frame(width: 1, height: max(1, contentHeight))
                             .id("scrollEnd")
                     }
                     .overlay {
@@ -180,17 +207,17 @@ struct SpeechPlotView: View {
                                 return
                             }
 
-                            guard cellWidth > 0 else {
-                                hoveredSegment = nil
-                                hoveredEmbeddingSegment = nil
-                                return
-                            }
+                        guard cellWidth > 0 else {
+                            hoveredSegment = nil
+                            hoveredEmbeddingSegment = nil
+                            return
+                        }
 
-                            let cellHeight = height / CGFloat(numSpeakers)
-                            guard cellHeight > 0 else {
-                                hoveredSegment = nil
-                                hoveredEmbeddingSegment = nil
-                                return
+                        let cellHeight = contentHeight / CGFloat(numSpeakers)
+                        guard cellHeight > 0 else {
+                            hoveredSegment = nil
+                            hoveredEmbeddingSegment = nil
+                            return
                             }
 
                             let totalFrames = max(totalFrameCount, visibleFrames)
@@ -239,9 +266,15 @@ struct SpeechPlotView: View {
                             let endStr = String(format: "%.2f", segment.endTime)
                             let durationStr = String(format: "%.2f", segment.endTime - segment.startTime)
                             let idStr = segment.id.uuidString.prefix(4)
+                            let distanceStr = segmentCentroidDistances[segment.id].map { String(format: "%.3f", $0) }
                             
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Spk \(segment.slot): \(startStr)s - \(endStr)s (\(durationStr)s)")
+                                if let distanceStr {
+                                    Text("centroid d: \(distanceStr)")
+                                        .font(.caption2)
+                                        .foregroundColor(.gray)
+                                }
                                 Text("ID: \(idStr)")
                                     .font(.caption2)
                                     .foregroundColor(.gray)
@@ -256,12 +289,19 @@ struct SpeechPlotView: View {
                         } else if let embSegment = hoveredEmbeddingSegment {
                             let startStr = String(format: "%.2f", Float(embSegment.startFrame) * 0.08)
                             let endStr = String(format: "%.2f", Float(embSegment.endFrame) * 0.08)
+                            let embeddingDistanceStr = embeddingSegmentCentroidDistances[embSegment.id]
+                                .map { String(format: "%.3f", $0) }
                             
                             VStack(alignment: .leading, spacing: 2) {
-                                Text("Spk \(embSegment.slot): \(startStr)s - \(endStr)s")
+                                Text("Spk \(embSegment.speakerId): \(startStr)s - \(endStr)s")
+                                if let embeddingDistanceStr {
+                                    Text("cluster d: \(embeddingDistanceStr)")
+                                        .font(.caption2)
+                                        .foregroundColor(.gray)
+                                }
                                 if !embSegment.segmentIds.isEmpty {
                                     let ids = embSegment.segmentIds.map { $0.uuidString.prefix(4) }.joined(separator: ", ")
-                                    Text("Speaker: \(embSegment.slot), IDs: [\(ids)]")
+                                    Text("Speaker: \(embSegment.speakerId), IDs: [\(ids)]")
                                         .font(.caption2)
                                         .foregroundColor(.gray)
                                 }
@@ -279,7 +319,7 @@ struct SpeechPlotView: View {
                         // DOUBLE CLICK = ANNOTATE
                         guard !isRecording, let tl = timeline else { return }
                         
-                        let cellHeight = height / CGFloat(numSpeakers)
+                        let cellHeight = contentHeight / CGFloat(numSpeakers)
                         guard cellHeight > 0, cellWidth > 0 else { return }
 
                         let totalFrames = max(totalFrameCount, visibleFrames)
@@ -301,7 +341,7 @@ struct SpeechPlotView: View {
                         // SINGLE CLICK - check for embedding stroke first, then segment play
                         guard !isRecording, let tl = timeline else { return }
                         
-                        let cellHeight = height / CGFloat(numSpeakers)
+                        let cellHeight = contentHeight / CGFloat(numSpeakers)
                         guard cellHeight > 0, cellWidth > 0 else { return }
 
                         let totalFrames = max(totalFrameCount, visibleFrames)
@@ -347,7 +387,7 @@ struct SpeechPlotView: View {
                         }
                     }
                 }
-                .frame(height: max(0, height))
+                .frame(height: scrollViewportHeight)
                 .background(Color(cgColor: ViridisColormap.cgColor(for: 0)))  // Purple background
                 .cornerRadius(8)
                 .onChange(of: updateTrigger) { _, _ in
@@ -538,28 +578,32 @@ struct SpeechPlotView: View {
         let totalFrames = max(tl.cursorFrame + tl.numTentative, visibleFrames)
         let cellWidth = size.width / CGFloat(totalFrames)
         let cellHeight = size.height / CGFloat(numSpeakers)
+        let identityBySegmentID = Dictionary(
+            uniqueKeysWithValues: (tl.speakerIdentitySegments + tl.tentativeSpeakerIdentitySegments)
+                .map { ($0.id, $0.speakerID) }
+        )
         
-        // Draw disjoint segments (single-speaker regions) as full-height translucent rectangles
-        // Finalized segments: teal
+        // Draw row-scoped embedding segment bands (avoid full-height overlays).
         for segment in tl.embeddingSegments {
-            let x = CGFloat(segment.startFrame) * cellWidth
-            let segmentWidth = CGFloat(segment.endFrame - segment.startFrame) * cellWidth
-            let rect = CGRect(x: x, y: 0, width: segmentWidth, height: size.height)
-            
-            context.fill(Path(rect), with: .color(Color.white.opacity(0.25)))
-            context.stroke(Path(rect), with: .color(Color.white.opacity(0.6)),
-                          style: StrokeStyle(lineWidth: 3))
+            drawEmbeddingSegmentBand(
+                context: context,
+                segment: segment,
+                cellWidth: cellWidth,
+                cellHeight: cellHeight,
+                tentative: false,
+                distance: embeddingSegmentCentroidDistances[segment.id]
+            )
         }
         
-        // Tentative disjoint segments: orange with dashed border
         for segment in tl.tentativeEmbeddingSegments {
-            let x = CGFloat(segment.startFrame) * cellWidth
-            let segmentWidth = CGFloat(segment.endFrame - segment.startFrame) * cellWidth
-            let rect = CGRect(x: x, y: 0, width: segmentWidth, height: size.height)
-            
-            context.fill(Path(rect), with: .color(Color.orange.opacity(0.15)))
-            context.stroke(Path(rect), with: .color(Color.orange.opacity(0.5)),
-                          style: StrokeStyle(lineWidth: 2, dash: [4, 2]))
+            drawEmbeddingSegmentBand(
+                context: context,
+                segment: segment,
+                cellWidth: cellWidth,
+                cellHeight: cellHeight,
+                tentative: true,
+                distance: embeddingSegmentCentroidDistances[segment.id]
+            )
         }
         
         // Draw finalized segments (solid) with labels
@@ -567,7 +611,8 @@ struct SpeechPlotView: View {
             drawSegmentOutline(context: context, segment: segment, 
                              cellWidth: cellWidth, cellHeight: cellHeight, tentative: false)
             drawSegmentLabel(context: context, segment: segment,
-                           cellWidth: cellWidth, cellHeight: cellHeight)
+                           cellWidth: cellWidth, cellHeight: cellHeight,
+                           identitySpeakerID: identityBySegmentID[segment.id])
         }
         
         // Draw tentative segments (dashed) - no labels for tentative
@@ -584,6 +629,12 @@ struct SpeechPlotView: View {
     /// Strokes are staggered if they overlap in time
     private func drawEmbeddingStrokes(context: GraphicsContext, cellWidth: CGFloat, cellHeight: CGFloat) {
         guard let tl = timeline else { return }
+        guard cellHeight > 0 else { return }
+
+        let strokeLayout = embeddingStrokeLayout(for: cellHeight)
+        let strokeHeight = strokeLayout.strokeHeight
+        let strokeMargin = strokeLayout.strokeMargin
+        let maxStaggerLevels = strokeLayout.maxStaggerLevels
         
         // Collect all embeddings with their info (including tentative flag)
         var allEmbeddings: [(emb: SpeakerEmbedding, speakerIndex: Int, isTentative: Bool)] = []
@@ -591,14 +642,14 @@ struct SpeechPlotView: View {
         // Finalized embeddings
         for segment in tl.embeddingSegments {
             for emb in segment.embeddings {
-                allEmbeddings.append((emb, segment.slot, false))
+                allEmbeddings.append((emb, segment.speakerId, false))
             }
         }
         
         // Tentative embeddings
         for segment in tl.tentativeEmbeddingSegments {
             for emb in segment.embeddings {
-                allEmbeddings.append((emb, segment.slot, true))
+                allEmbeddings.append((emb, segment.speakerId, true))
             }
         }
         
@@ -607,14 +658,10 @@ struct SpeechPlotView: View {
         // Group by speaker
         var embeddingsBySpeaker: [[Int]] = Array(repeating: [], count: numSpeakers)
         for (idx, (_, speakerIndex, _)) in allEmbeddings.enumerated() {
-            if speakerIndex < numSpeakers {
+            if speakerIndex >= 0 && speakerIndex < numSpeakers {
                 embeddingsBySpeaker[speakerIndex].append(idx)
             }
         }
-        
-        let strokeHeight: CGFloat = 6
-        let strokeMargin: CGFloat = 3
-        let maxStaggerLevels = 3
         
         // Draw for each speaker
         for speakerIndex in 0..<numSpeakers {
@@ -648,7 +695,8 @@ struct SpeechPlotView: View {
             // Draw strokes
             let speakerColor = speakerColors[speakerIndex % speakerColors.count]
             let rowY = CGFloat(speakerIndex) * cellHeight
-            let baseY = rowY + (cellHeight - CGFloat(maxStaggerLevels) * (strokeHeight + strokeMargin)) / 2
+            let stackHeight = CGFloat(maxStaggerLevels) * strokeHeight + CGFloat(max(maxStaggerLevels - 1, 0)) * strokeMargin
+            let baseY = rowY + max(0, (cellHeight - stackHeight) * 0.5)
             
             for idx in sortedIndices {
                 let (emb, _, isTentative) = allEmbeddings[idx]
@@ -709,12 +757,12 @@ struct SpeechPlotView: View {
     @inline(__always)
     private func embeddingSegmentAt(frame: Int, preferredSpeaker: Int, timeline: SortformerTimeline) -> EmbeddingSegment? {
         let finalized = segmentContaining(frame: frame, in: timeline.embeddingSegments)
-        if let finalized, finalized.slot == preferredSpeaker {
+        if let finalized, finalized.speakerId == preferredSpeaker {
             return finalized
         }
 
         let tentative = segmentContaining(frame: frame, in: timeline.tentativeEmbeddingSegments)
-        if let tentative, tentative.slot == preferredSpeaker {
+        if let tentative, tentative.speakerId == preferredSpeaker {
             return tentative
         }
 
@@ -777,10 +825,12 @@ struct SpeechPlotView: View {
     /// Returns the embedding UUID if found, nil otherwise
     private func findEmbeddingAtLocation(_ location: CGPoint, cellWidth: CGFloat, cellHeight: CGFloat, height: CGFloat) -> UUID? {
         guard let tl = timeline else { return nil }
+        guard cellHeight > 0 else { return nil }
         
-        let strokeHeight: CGFloat = 6
-        let strokeMargin: CGFloat = 3
-        let maxStaggerLevels = 3
+        let strokeLayout = embeddingStrokeLayout(for: cellHeight)
+        let strokeHeight = strokeLayout.strokeHeight
+        let strokeMargin = strokeLayout.strokeMargin
+        let maxStaggerLevels = strokeLayout.maxStaggerLevels
         
         // Collect all embeddings with their info (including tentative)
         var allEmbeddings: [(emb: SpeakerEmbedding, speakerIndex: Int)] = []
@@ -788,14 +838,14 @@ struct SpeechPlotView: View {
         // Finalized embeddings
         for segment in tl.embeddingSegments {
             for emb in segment.embeddings {
-                allEmbeddings.append((emb, segment.slot))
+                allEmbeddings.append((emb, segment.speakerId))
             }
         }
         
         // Tentative embeddings
         for segment in tl.tentativeEmbeddingSegments {
             for emb in segment.embeddings {
-                allEmbeddings.append((emb, segment.slot))
+                allEmbeddings.append((emb, segment.speakerId))
             }
         }
         
@@ -804,7 +854,7 @@ struct SpeechPlotView: View {
         // Group by speaker
         var embeddingsBySpeaker: [[Int]] = Array(repeating: [], count: numSpeakers)
         for (idx, (_, speakerIndex)) in allEmbeddings.enumerated() {
-            if speakerIndex < numSpeakers {
+            if speakerIndex >= 0 && speakerIndex < numSpeakers {
                 embeddingsBySpeaker[speakerIndex].append(idx)
             }
         }
@@ -837,7 +887,8 @@ struct SpeechPlotView: View {
             }
             
             let rowY = CGFloat(speakerIndex) * cellHeight
-            let baseY = rowY + (cellHeight - CGFloat(maxStaggerLevels) * (strokeHeight + strokeMargin)) / 2
+            let stackHeight = CGFloat(maxStaggerLevels) * strokeHeight + CGFloat(max(maxStaggerLevels - 1, 0)) * strokeMargin
+            let baseY = rowY + max(0, (cellHeight - stackHeight) * 0.5)
             
             // Check each embedding's hit rect
             for idx in sortedIndices {
@@ -858,17 +909,43 @@ struct SpeechPlotView: View {
         
         return nil
     }
+
+    private func embeddingStrokeLayout(for cellHeight: CGFloat) -> (strokeHeight: CGFloat, strokeMargin: CGFloat, maxStaggerLevels: Int) {
+        // Keep embedding strokes fully inside each speaker row, even at short plot heights.
+        let strokeHeight = max(3, min(6, floor(cellHeight * 0.22)))
+        let strokeMargin = max(1, min(3, floor(cellHeight * 0.08)))
+        let slotHeight = strokeHeight + strokeMargin
+        let maxLevelsByHeight = max(1, Int(floor((cellHeight + strokeMargin) / max(slotHeight, 1))))
+        let maxStaggerLevels = min(3, maxLevelsByHeight)
+        return (strokeHeight, strokeMargin, maxStaggerLevels)
+    }
     
     /// Draw label on a segment
     private func drawSegmentLabel(context: GraphicsContext, segment: SortformerSegment,
-                                  cellWidth: CGFloat, cellHeight: CGFloat) {
+                                  cellWidth: CGFloat, cellHeight: CGFloat,
+                                  identitySpeakerID: Int?) {
         let x = CGFloat(segment.startFrame) * cellWidth
         let y = CGFloat(segment.slot) * cellHeight
         let segmentWidth = CGFloat(segment.endFrame - segment.startFrame) * cellWidth
         
-        // Get annotation or use speaker index
+        // Prefer annotation text but always include the resolved speaker ID label.
         let key = DiarizerViewModel.segmentKey(segment)
-        let label = segmentAnnotations[key] ?? String(segment.slot)
+        let identityLabel = identitySpeakerID.map { "ID \($0)" } ?? "Spk \(segment.slot)"
+        let distanceLabel = segmentCentroidDistances[segment.id].map { String(format: "d%.3f", $0) }
+        let label: String
+        if let annotation = segmentAnnotations[key], !annotation.isEmpty {
+            if let distanceLabel {
+                label = "\(annotation) • \(identityLabel) • \(distanceLabel)"
+            } else {
+                label = "\(annotation) • \(identityLabel)"
+            }
+        } else {
+            if let distanceLabel {
+                label = "\(identityLabel) • \(distanceLabel)"
+            } else {
+                label = identityLabel
+            }
+        }
         
         // Only draw if segment is wide enough
         guard segmentWidth > 20 else { return }
@@ -1056,22 +1133,72 @@ struct SpeechPlotView: View {
     private func drawSegmentOutline(context: GraphicsContext, segment: SortformerSegment,
                                     cellWidth: CGFloat, cellHeight: CGFloat, tentative: Bool) {
         let speaker = segment.slot
+        guard speaker >= 0 && speaker < numSpeakers else { return }
         let startFrame = segment.startFrame
         let endFrame = segment.endFrame
         
         let x = CGFloat(startFrame) * cellWidth
         let y = CGFloat(speaker) * cellHeight
         let width = CGFloat(endFrame - startFrame) * cellWidth
-        
-        let rect = CGRect(x: x, y: y, width: width, height: cellHeight)
         let color = speakerColors[speaker % speakerColors.count]
         
         let lineWidth: CGFloat = 2
         let strokeStyle: StrokeStyle = tentative
             ? StrokeStyle(lineWidth: lineWidth, dash: [4, 2])
             : StrokeStyle(lineWidth: lineWidth)
+
+        // Inset so row-0 top border is never clipped at y=0.
+        let yInset = lineWidth * 0.5
+        let xInset = lineWidth * 0.35
+        let rect = CGRect(
+            x: x + xInset,
+            y: y + yInset,
+            width: max(1, width - 2 * xInset),
+            height: max(1, cellHeight - lineWidth)
+        )
         
         context.stroke(Path(rect), with: .color(color.opacity(0.9)), style: strokeStyle)
+    }
+
+    private func drawEmbeddingSegmentBand(
+        context: GraphicsContext,
+        segment: EmbeddingSegment,
+        cellWidth: CGFloat,
+        cellHeight: CGFloat,
+        tentative: Bool,
+        distance: Float?
+    ) {
+        guard segment.speakerId >= 0 && segment.speakerId < numSpeakers else { return }
+
+        let x = CGFloat(segment.startFrame) * cellWidth
+        let width = CGFloat(segment.endFrame - segment.startFrame) * cellWidth
+        guard width > 0 else { return }
+
+        let rowY = CGFloat(segment.speakerId) * cellHeight
+        let yInset: CGFloat = 1.5
+        let rect = CGRect(
+            x: x + 0.8,
+            y: rowY + yInset,
+            width: max(1, width - 1.6),
+            height: max(1, cellHeight - 2 * yInset)
+        )
+
+        let color = speakerColors[segment.speakerId % speakerColors.count]
+        let fillColor = color.opacity(tentative ? 0.09 : 0.16)
+        let strokeStyle = tentative
+            ? StrokeStyle(lineWidth: 1.4, dash: [4, 2])
+            : StrokeStyle(lineWidth: 1.6)
+
+        context.fill(Path(roundedRect: rect, cornerRadius: 2.5), with: .color(fillColor))
+        context.stroke(Path(roundedRect: rect, cornerRadius: 2.5), with: .color(color.opacity(0.72)), style: strokeStyle)
+
+        guard let distance, rect.width > 48 else { return }
+        let distanceText = Text(String(format: "d%.3f", distance))
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .foregroundColor(.white)
+
+        let textY = rect.minY + 2
+        context.draw(distanceText, at: CGPoint(x: rect.minX + 5, y: textY), anchor: .topLeading)
     }
     
     private func drawSpkcacheHeatmap(context: GraphicsContext, size: CGSize) {
@@ -1174,6 +1301,8 @@ struct SpeechPlotView: View {
         isRecording: false,
         updateTrigger: 0,
         segmentAnnotations: [:],
+        segmentCentroidDistances: [:],
+        embeddingSegmentCentroidDistances: [:],
         onPlaySegment: nil,
         onAnnotateSegment: nil,
         onPurgeSpeaker: nil

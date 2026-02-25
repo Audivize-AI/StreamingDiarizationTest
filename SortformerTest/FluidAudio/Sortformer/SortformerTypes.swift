@@ -187,7 +187,7 @@ public struct SortformerConfig: Sendable {
 }
 
 /// Configuration for post-processing Sortformer diarizer predictions
-public struct SortformerPostProcessingConfig {
+public struct SortformerTimelineConfig {
     /// Onset threshold for detecting the beginning and end of a speech
     public var onsetThreshold: Float
 
@@ -206,25 +206,11 @@ public struct SortformerPostProcessingConfig {
     /// Threshold for small non-speech deletion in frames
     public var minFramesOff: Int
     
-    public var numFilteredFrames: Int
+    /// Number of frames in the FIFO queue that should not be used to update predictions
+    public var filterLeftContext: Int
     
-    // MARK: - Embedding Extraction Parameters
-    
-    /// Maximum embedding duration in seconds (TitaNet typically uses 3s)
-    public var maxEmbeddingDurationSeconds: Float
-    
-    /// Maximum embedding duration in frames
-    public var maxEmbeddingFrames: Int {
-        Int(ceil(maxEmbeddingDurationSeconds / frameDurationSeconds))
-    }
-    
-    /// Minimum coverage ratio for embeddings within a segment (0.0-1.0)
-    /// If coverage drops below this, new embeddings must be extracted
-    public var minEmbeddingCoverageRatio: Float
-    
-    /// Maximum proportion of an embedding that can extend outside the segment boundary (0.0-1.0)
-    /// Used to determine if an embedding is valid for a segment that was split
-    public var maxEmbeddingBoundaryOverlapRatio: Float
+    /// Number of tentative frames
+    internal var numFilteredFrames: Int
 
     /// Adding durations before each speech segment
     public var onsetPadSeconds: Float {
@@ -260,28 +246,37 @@ public struct SortformerPostProcessingConfig {
 
     /// Number of speakers
     public let numSpeakers: Int = 4
+    
+    /// Clustering threshold to detect a new speaker
+    public var clusteringThreshold: Float
+    
+    /// Chamfer distance threshold to match with another speaker profile
+    public var matchThreshold: Float
 
-    /// Number of speakers
-    public let frameDurationSeconds: Float = 0.08
+    /// Duration of a frame in seconds
+    public static let frameDurationSeconds: Float = 0.08
+    
+    /// Duration of a frame in seconds
+    public var frameDurationSeconds: Float { Self.frameDurationSeconds }
 
     /// Default configurations
-    public static func `default`(for config: SortformerConfig) -> SortformerPostProcessingConfig {
-        SortformerPostProcessingConfig(
+    public static func `default`(for config: SortformerConfig) -> SortformerTimelineConfig {
+        SortformerTimelineConfig(
+            for: config,
             onsetThreshold: 0.5,
             offsetThreshold: 0.5,
             onsetPadFrames: 0,
             offsetPadFrames: 0,
             minFramesOn: 1,
             minFramesOff: 1,
-            numFilteredFrames: config.fifoLen,
-            maxEmbeddingDurationSeconds: 3.0,
-            minEmbeddingCoverageRatio: 0.7,
-            maxEmbeddingBoundaryOverlapRatio: 0.3
+            filterLeftContext: 1,
+            clusteringThreshold: 0.25,
+            matchThreshold: 0.3
         )
-        
     }
     
     public init(
+        for config: SortformerConfig,
         onsetThreshold: Float = 0.5,
         offsetThreshold: Float = 0.5,
         onsetPadSeconds: Float = 0,
@@ -289,10 +284,9 @@ public struct SortformerPostProcessingConfig {
         minDurationOn: Float = 0,
         minDurationOff: Float = 0,
         maxStoredFrames: Int? = nil,
-        numFilteredFrames: Int = 0,
-        maxEmbeddingDurationSeconds: Float = 3.0,
-        minEmbeddingCoverageRatio: Float = 0.7,
-        maxEmbeddingBoundaryOverlapRatio: Float = 0.3
+        filterLeftContext: Int = 1,
+        clusteringThreshold: Float = 0.25,
+        matchThreshold: Float = 0.3
     ) {
         self.onsetThreshold = onsetThreshold
         self.offsetThreshold = offsetThreshold
@@ -301,13 +295,15 @@ public struct SortformerPostProcessingConfig {
         self.minFramesOn = Int(round(minDurationOn / frameDurationSeconds))
         self.minFramesOff = Int(round(minDurationOff / frameDurationSeconds))
         self.maxStoredFrames = maxStoredFrames
-        self.numFilteredFrames = numFilteredFrames
-        self.maxEmbeddingDurationSeconds = maxEmbeddingDurationSeconds
-        self.minEmbeddingCoverageRatio = minEmbeddingCoverageRatio
-        self.maxEmbeddingBoundaryOverlapRatio = maxEmbeddingBoundaryOverlapRatio
+        self.clusteringThreshold = clusteringThreshold
+        self.matchThreshold = matchThreshold
+        
+        self.filterLeftContext = min(filterLeftContext, config.fifoLen - config.spkcacheUpdatePeriod)
+        self.numFilteredFrames = config.fifoLen + config.chunkRightContext - self.filterLeftContext
     }
 
     public init(
+        for config: SortformerConfig,
         onsetThreshold: Float = 0.5,
         offsetThreshold: Float = 0.5,
         onsetPadFrames: Int = 0,
@@ -315,10 +311,9 @@ public struct SortformerPostProcessingConfig {
         minFramesOn: Int = 0,
         minFramesOff: Int = 0,
         maxStoredFrames: Int? = nil,
-        numFilteredFrames: Int = 0,
-        maxEmbeddingDurationSeconds: Float = 3.0,
-        minEmbeddingCoverageRatio: Float = 0.7,
-        maxEmbeddingBoundaryOverlapRatio: Float = 0.3
+        filterLeftContext: Int = 1,
+        clusteringThreshold: Float = 0.25,
+        matchThreshold: Float = 0.3
     ) {
         self.onsetThreshold = onsetThreshold
         self.offsetThreshold = offsetThreshold
@@ -327,10 +322,11 @@ public struct SortformerPostProcessingConfig {
         self.minFramesOn = minFramesOn
         self.minFramesOff = minFramesOff
         self.maxStoredFrames = maxStoredFrames
-        self.numFilteredFrames = numFilteredFrames
-        self.maxEmbeddingDurationSeconds = maxEmbeddingDurationSeconds
-        self.minEmbeddingCoverageRatio = minEmbeddingCoverageRatio
-        self.maxEmbeddingBoundaryOverlapRatio = maxEmbeddingBoundaryOverlapRatio
+        self.clusteringThreshold = clusteringThreshold
+        self.matchThreshold = matchThreshold
+        
+        self.filterLeftContext = max(filterLeftContext, config.fifoLen - config.spkcacheUpdatePeriod)
+        self.numFilteredFrames = config.fifoLen + config.chunkRightContext - self.filterLeftContext
     }
 }
 
@@ -579,7 +575,7 @@ public protocol SortformerFrameRange {
 
 public protocol SpeakerFrameRange: SortformerFrameRange {
     /// Speaker index in Sortformer's output
-    var slot: Int { get }
+    var speakerId: Int { get }
 
     /// Check if the ranges overlap or touch
     func isContiguous<T>(with other: T, ensuringSameSpeaker: Bool) -> Bool
@@ -596,7 +592,7 @@ public protocol SpeakerFrameRange: SortformerFrameRange {
 
 internal struct SortformerFrameRangeHelpers {
     static func overlaps<L, R>(_ lhs: L, _ rhs: R, ensuringSameSpeaker: Bool) -> Bool where L: SpeakerFrameRange, R: SpeakerFrameRange {
-        let sameSpeaker = !ensuringSameSpeaker || lhs.slot == rhs.slot
+        let sameSpeaker = !ensuringSameSpeaker || lhs.speakerId == rhs.speakerId
         return sameSpeaker && lhs.frames.overlaps(rhs.frames)
     }
     
@@ -605,7 +601,7 @@ internal struct SortformerFrameRangeHelpers {
     }
     
     static func isContiguous<L, R>(_ lhs: L, _ rhs: R, ensuringSameSpeaker: Bool) -> Bool where L: SpeakerFrameRange, R: SpeakerFrameRange {
-        let sameSpeaker = !ensuringSameSpeaker || lhs.slot == rhs.slot
+        let sameSpeaker = !ensuringSameSpeaker || lhs.speakerId == rhs.speakerId
         return sameSpeaker && lhs.startFrame <= rhs.endFrame && lhs.endFrame >= rhs.startFrame
     }
     
@@ -616,7 +612,7 @@ internal struct SortformerFrameRangeHelpers {
     }
     
     static func overlapLength<L, R>(_ lhs: L, _ rhs: R, ensuringSameSpeaker: Bool) -> Int where L: SpeakerFrameRange, R: SpeakerFrameRange {
-        guard !ensuringSameSpeaker || lhs.slot == rhs.slot else { return 0 }
+        guard !ensuringSameSpeaker || lhs.speakerId == rhs.speakerId else { return 0 }
         let overlapStart = max(lhs.startFrame, rhs.startFrame)
         let overlapEnd = min(lhs.endFrame, rhs.endFrame)
         return max(0, overlapEnd - overlapStart)
@@ -627,7 +623,7 @@ internal struct SortformerFrameRangeHelpers {
     }
     
     static func checkEqual<L, R>(_ lhs: L, _ rhs: R) -> Bool where L: SpeakerFrameRange, R: SpeakerFrameRange {
-        return lhs.slot == rhs.slot && lhs.startFrame == rhs.startFrame && lhs.endFrame == rhs.endFrame
+        return lhs.speakerId == rhs.speakerId && lhs.startFrame == rhs.startFrame && lhs.endFrame == rhs.endFrame
     }
     
     static func checkLessThan<L, R>(_ lhs: L, _ rhs: R) -> Bool where L: SortformerFrameRange, R: SortformerFrameRange {

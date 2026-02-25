@@ -183,15 +183,181 @@ public struct SortformerStateUpdater {
     /// - Parameters:
     ///   - speakerIndex: The speaker slot to remove (0..<numSpeakers)
     ///   - state: Streaming state (mutated in place)
+//    public func removeSpeaker(
+//        at speakerIndex: Int,
+//        from state: inout SortformerStreamingState
+//    ) {
+//        let D = config.preEncoderDims
+//        let S = config.numSpeakers
+//        let threshold = config.speechThreshold
+//
+//        guard speakerIndex >= 0, speakerIndex < S else { return }
+//
+//        // Concatenate spkcache + fifo into a single buffer so solo frames in
+//        // either region can serve as sources for overlap frames in the other.
+//        let spkLen = state.spkcacheLength
+//        let fifoLen = state.fifoLength
+//        let hasSpkcachePreds = !state.spkcachePreds.isEmpty && spkLen > 0
+//
+//        let totalFrames: Int
+//        var embs: [Float]
+//        var preds: [Float]
+//
+//        if hasSpkcachePreds {
+//            totalFrames = spkLen + fifoLen
+//            embs = state.spkcache + state.fifo
+//            preds = state.spkcachePreds + state.fifoPreds
+//        } else {
+//            totalFrames = fifoLen
+//            embs = state.fifo
+//            preds = state.fifoPreds
+//        }
+//
+//        guard totalFrames > 0, !preds.isEmpty else { return }
+//
+//        // --- Pass 1: Collect solo frame indices per speaker ---
+//        var soloFrames = [[Int]](repeating: [], count: S)
+//
+//        preds.withUnsafeBufferPointer { predsBuf in
+//            let p = predsBuf.baseAddress!
+//            for frame in 0..<totalFrames {
+//                let base = frame &* S
+//                var activeCount = 0
+//                var activeSpeaker = -1
+//                for spk in 0..<S {
+//                    if p[base &+ spk] >= threshold {
+//                        activeCount &+= 1
+//                        activeSpeaker = spk
+//                    }
+//                }
+//                if activeCount == 1 {
+//                    soloFrames[activeSpeaker].append(frame)
+//                }
+//            }
+//        }
+//
+//        var loopPos = [Int](repeating: 0, count: S)
+//
+//        // --- Pass 2: Scrub frames ---
+//        // Solo frames of other speakers only have their target pred zeroed
+//        // (embedding untouched), so reading from them for overlap copy is safe.
+//        embs.withUnsafeMutableBufferPointer { embsBuf in
+//            preds.withUnsafeMutableBufferPointer { predsBuf in
+//                state.meanSilenceEmbedding.withUnsafeBufferPointer { silBuf in
+//                    let e = embsBuf.baseAddress!
+//                    let p = predsBuf.baseAddress!
+//                    let sil = silBuf.baseAddress!
+//
+//                    for frame in 0..<totalFrames {
+//                        let predBase = frame &* S
+//                        let embBase = frame &* D
+//                        let targetActive = p[predBase &+ speakerIndex] >= threshold
+//
+//                        // Count other active speakers without heap allocation
+//                        var otherCount = 0
+//                        var firstOtherSpk = 0
+//                        if targetActive {
+//                            for spk in 0..<S where spk != speakerIndex {
+//                                if p[predBase &+ spk] >= threshold {
+//                                    otherCount &+= 1
+//                                    if otherCount == 1 { firstOtherSpk = spk }
+//                                }
+//                            }
+//                        }
+//
+//                        if targetActive && otherCount == 0 {
+//                            // Solo target → bulk-copy silence embedding, zero preds
+//                            (e + embBase).update(from: sil, count: D)
+//                            vDSP_vclr(p + predBase, 1, vDSP_Length(S))
+//
+//                        } else if targetActive && otherCount == 1 {
+//                            // Overlap with one speaker → cycle their solo frames
+//                            let soloCount = soloFrames[firstOtherSpk].count
+//                            if soloCount > 0 {
+//                                let srcFrame = soloFrames[firstOtherSpk][loopPos[firstOtherSpk] % soloCount]
+//                                loopPos[firstOtherSpk] &+= 1
+//                                let srcBase = srcFrame &* D
+//                                (e + embBase).update(from: e + srcBase, count: D)
+//                            }
+//                            p[predBase &+ speakerIndex] = 0
+//
+//                        } else {
+//                            // Multi-overlap or inactive → zero target pred only
+//                            p[predBase &+ speakerIndex] = 0
+//                        }
+//                    }
+//                }
+//            }
+//        }
+//
+//        // --- Pass 3: Compact prediction columns (vectorized) ---
+//        // Each speaker slot is a strided column (stride = S).  Use cblas_scopy
+//        // to shift entire columns in one BLAS call, then vDSP_vclr with stride
+//        // to zero the vacated last column.
+//        // e.g. remove slot 1 → [spk0, spk2, spk3, 0]
+//        let slotsToMove = S - speakerIndex - 1
+//        if slotsToMove > 0 {
+//            preds.withUnsafeMutableBufferPointer { predsBuf in
+//                let p = predsBuf.baseAddress!
+//                let n = Int32(totalFrames)
+//                let stride = Int32(S)
+//
+//                // Shift each column left by one (process in ascending order so
+//                // column k-1 is already saved before column k overwrites it).
+//                for k in speakerIndex + 1..<S {
+//                    cblas_scopy(n, p + k, stride, p + k - 1, stride)
+//                }
+//
+//                // Zero the vacated last column
+//                vDSP_vclr(p + (S - 1), vDSP_Stride(S), vDSP_Length(totalFrames))
+//            }
+//        }
+//
+//        // --- Split back into spkcache + fifo ---
+//        if hasSpkcachePreds {
+//            let spkEmbEnd = spkLen &* D
+//            let spkPredEnd = spkLen &* S
+//            state.spkcache = Array(embs[..<spkEmbEnd])
+//            state.spkcachePreds = Array(preds[..<spkPredEnd])
+//            state.fifo = Array(embs[spkEmbEnd...])
+//            state.fifoPreds = Array(preds[spkPredEnd...])
+//        } else {
+//            state.fifo = embs
+//            state.fifoPreds = preds
+//        }
+//    }
+    
+    /// Remove a speaker from the FIFO and speaker cache.
+    ///
+    /// This erases all trace of a speaker slot from the streaming state:
+    /// - **Solo frames** (speaker is the only one active above `silenceThreshold`):
+    ///   The embedding is replaced with `meanSilenceEmbedding` and all speaker
+    ///   predictions for that frame are zeroed, effectively converting it to silence.
+    /// - **Overlap frames** (speaker is active alongside one other speaker):
+    ///   The target speaker's prediction is zeroed, and the embedding is
+    ///   replaced by cycling through the other speaker's solo-frame embeddings,
+    ///   preserving the acoustic temporal structure. Falls back to leaving the
+    ///   embedding unchanged if the other speaker has no solo frames.
+    /// - **Multi-overlap frames** (speaker is active alongside 2+ others):
+    ///   Only the target prediction is zeroed. No clean substitute embedding
+    ///   exists for this case; the entangled embedding still serves the others.
+    /// - **Inactive frames**: The target speaker's prediction column is zeroed everywhere
+    ///   to ensure full suppression even for sub-threshold activations.
+    ///
+    /// - Parameters:
+    ///   - speakerIndex: The speaker slot to remove (0..<numSpeakers)
+    ///   - state: Streaming state (mutated in place)
+    /// - Returns: The removed solo embeddings
+    @discardableResult
     public func removeSpeaker(
         at speakerIndex: Int,
         from state: inout SortformerStreamingState
-    ) {
+    ) -> [Float] {
         let D = config.preEncoderDims
         let S = config.numSpeakers
         let threshold = config.speechThreshold
 
-        guard speakerIndex >= 0, speakerIndex < S else { return }
+        guard speakerIndex >= 0, speakerIndex < S else { return [] }
 
         // Concatenate spkcache + fifo into a single buffer so solo frames in
         // either region can serve as sources for overlap frames in the other.
@@ -213,83 +379,167 @@ public struct SortformerStateUpdater {
             preds = state.fifoPreds
         }
 
-        guard totalFrames > 0, !preds.isEmpty else { return }
+        guard totalFrames > 0, !preds.isEmpty else { return [] }
 
-        // --- Pass 1: Collect solo frame indices per speaker ---
-        var soloFrames = [[Int]](repeating: [], count: S)
+        // Pass 1: Build powerset
+        var powersetFrames = [[Int]](repeating: [], count: 1 << S)
 
         preds.withUnsafeBufferPointer { predsBuf in
             let p = predsBuf.baseAddress!
             for frame in 0..<totalFrames {
                 let base = frame &* S
-                var activeCount = 0
-                var activeSpeaker = -1
+                var powersetIndex = 0
+                
                 for spk in 0..<S {
                     if p[base &+ spk] >= threshold {
-                        activeCount &+= 1
-                        activeSpeaker = spk
+                        powersetIndex |= 1 << spk
                     }
                 }
-                if activeCount == 1 {
-                    soloFrames[activeSpeaker].append(frame)
-                }
+                powersetFrames[powersetIndex].append(frame)
             }
         }
 
-        var loopPos = [Int](repeating: 0, count: S)
-
-        // --- Pass 2: Scrub frames ---
-        // Solo frames of other speakers only have their target pred zeroed
-        // (embedding untouched), so reading from them for overlap copy is safe.
+        var removedEmbeddings: [Float] = []
         embs.withUnsafeMutableBufferPointer { embsBuf in
-            preds.withUnsafeMutableBufferPointer { predsBuf in
-                state.meanSilenceEmbedding.withUnsafeBufferPointer { silBuf in
-                    let e = embsBuf.baseAddress!
-                    let p = predsBuf.baseAddress!
-                    let sil = silBuf.baseAddress!
-
-                    for frame in 0..<totalFrames {
-                        let predBase = frame &* S
-                        let embBase = frame &* D
-                        let targetActive = p[predBase &+ speakerIndex] >= threshold
-
-                        // Count other active speakers without heap allocation
-                        var otherCount = 0
-                        var firstOtherSpk = 0
-                        if targetActive {
-                            for spk in 0..<S where spk != speakerIndex {
-                                if p[predBase &+ spk] >= threshold {
-                                    otherCount &+= 1
-                                    if otherCount == 1 { firstOtherSpk = spk }
+            guard let embsBase = embsBuf.baseAddress else { return }
+            
+            // Replace the removed speaker with silence embeddings
+            let removedIndex: Int = 1 << speakerIndex
+            removedEmbeddings.reserveCapacity(D * powersetFrames[removedIndex].count)
+            
+            for frame in powersetFrames[removedIndex] {
+                let startIndex = frame * D
+                removedEmbeddings.append(contentsOf: embsBuf[startIndex..<(startIndex + D)])
+                
+                memcpy(embsBase + startIndex,
+                       &state.meanSilenceEmbedding,
+                       MemoryLayout<Float>.stride * D)
+            }
+            
+            // Fill the remainder of frames that intersected with the removed speaker using the powerset embeddings where possible. Loop-pad them if needed
+            for powersetIndex in powersetFrames.indices where powersetIndex & removedIndex != 0 {
+                let dstFrames = powersetFrames[powersetIndex]
+                guard !dstFrames.isEmpty else { continue }
+                guard powersetIndex != removedIndex else { continue }
+                
+                let srcIndex = powersetIndex ^ removedIndex
+                let srcFrames = powersetFrames[srcIndex]
+                let srcCount = srcFrames.count
+                
+                if !srcFrames.isEmpty {
+                    for (i, frame) in dstFrames.enumerated() {
+                        memcpy(embsBase + frame * D,
+                               embsBase + srcFrames[i % srcCount] * D,
+                               MemoryLayout<Float>.stride * D)
+                    }
+                } else {
+                    // 1. Pick the smallest subset of the powerset whose union makes the source
+                    var availableMasks: [Int] = []
+                    for m in 1..<powersetFrames.count {
+                        if (m & srcIndex) == m && !powersetFrames[m].isEmpty {
+                            availableMasks.append(m)
+                        }
+                    }
+                    
+                    // DP to find the minimum components required to form each subset
+                    var dp: [Int: [Int]] = [0: []]
+                    for mask in availableMasks {
+                        var updates: [Int: [Int]] = [:]
+                        for (existingMask, components) in dp {
+                            let newMask = existingMask | mask
+                            let newComponents = components + [mask]
+                            
+                            if let current = dp[newMask] ?? updates[newMask] {
+                                if newComponents.count < current.count {
+                                    updates[newMask] = newComponents
+                                }
+                            } else {
+                                updates[newMask] = newComponents
+                            }
+                        }
+                        for (k, v) in updates {
+                            if let current = dp[k] {
+                                if v.count < current.count { dp[k] = v }
+                            } else {
+                                dp[k] = v
+                            }
+                        }
+                    }
+                    
+                    var bestCombo = dp[srcIndex]
+                    
+                    // 2. If no such subset is found, then just try to get as many of the speakers as possible
+                    if bestCombo == nil {
+                        var bestMask = 0
+                        for (mask, components) in dp {
+                            // Maximize coverage (number of bits set). If tied, minimize the number of subsets used.
+                            if mask.nonzeroBitCount > bestMask.nonzeroBitCount {
+                                bestMask = mask
+                                bestCombo = components
+                            } else if mask.nonzeroBitCount == bestMask.nonzeroBitCount {
+                                if components.count < (dp[bestMask]?.count ?? Int.max) {
+                                    bestMask = mask
+                                    bestCombo = components
                                 }
                             }
                         }
-
-                        if targetActive && otherCount == 0 {
-                            // Solo target → bulk-copy silence embedding, zero preds
-                            (e + embBase).update(from: sil, count: D)
-                            vDSP_vclr(p + predBase, 1, vDSP_Length(S))
-
-                        } else if targetActive && otherCount == 1 {
-                            // Overlap with one speaker → cycle their solo frames
-                            let soloCount = soloFrames[firstOtherSpk].count
-                            if soloCount > 0 {
-                                let srcFrame = soloFrames[firstOtherSpk][loopPos[firstOtherSpk] % soloCount]
-                                loopPos[firstOtherSpk] &+= 1
-                                let srcBase = srcFrame &* D
-                                (e + embBase).update(from: e + srcBase, count: D)
+                    }
+                    
+                    // 3. Use the sum of the embeddings to replace the embeddings
+                    guard let combo = bestCombo, !combo.isEmpty else {
+                        // Absolute fallback: Silence if no overlap source components exist whatsoever
+                        for frame in dstFrames {
+                            memcpy(embsBase + frame * D,
+                                   &state.meanSilenceEmbedding,
+                                   MemoryLayout<Float>.stride * D)
+                        }
+                        continue
+                    }
+                    
+                    var interpBuffer = [Float](repeating: 0, count: D)
+                    interpBuffer.withUnsafeMutableBufferPointer { interpBuffer in
+                        guard let interpBase = interpBuffer.baseAddress else {
+                            return
+                        }
+                        
+                        for (i, frame) in dstFrames.enumerated() {
+                            vDSP_vclr(interpBase, 1, vDSP_Length(D))
+                            
+                            // Generate random weights from a uniform distribution [0, 1]
+                            // Yes, this is apparently the best way to blend it.
+                            var weights = combo.map { _ in Float.random(in: 0...1) }
+                            let totalWeight = weights.reduce(0, +)
+                            
+                            // Normalize weights so they sum to exactly 1.0
+                            if totalWeight > 0 {
+                                weights = weights.map { $0 / totalWeight }
+                            } else {
+                                let equalWeight = 1.0 / Float(combo.count)
+                                weights = weights.map { _ in equalWeight }
                             }
-                            p[predBase &+ speakerIndex] = 0
-
-                        } else {
-                            // Multi-overlap or inactive → zero target pred only
-                            p[predBase &+ speakerIndex] = 0
+                            
+                            for (j, srcMask) in combo.enumerated() {
+                                let targetSrcFrames = powersetFrames[srcMask]
+                                let srcFrame = targetSrcFrames[i % targetSrcFrames.count]
+                                var weight = weights[j]
+                                
+                                // Vectorized scalar multiply and add: interpBuffer += srcEmbedding * weight
+                                vDSP_vsma(embsBase + srcFrame * D, 1,
+                                          &weight,
+                                          interpBase, 1,
+                                          interpBase, 1,
+                                          vDSP_Length(D))
+                            }
+                            
+                            memcpy(embsBase + frame * D,
+                                   interpBase,
+                                   MemoryLayout<Float>.stride * D)
                         }
                     }
                 }
             }
         }
-
+        
         // --- Pass 3: Compact prediction columns (vectorized) ---
         // Each speaker slot is a strided column (stride = S).  Use cblas_scopy
         // to shift entire columns in one BLAS call, then vDSP_vclr with stride
@@ -325,6 +575,8 @@ public struct SortformerStateUpdater {
             state.fifo = embs
             state.fifoPreds = preds
         }
+        
+        return removedEmbeddings
     }
 
     // MARK: - Silence Profile
