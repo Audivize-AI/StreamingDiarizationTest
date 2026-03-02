@@ -171,7 +171,7 @@ public final class SortformerDiarizer {
         lock.lock()
         defer { lock.unlock() }
         stateUpdater.removeSpeaker(at: speakerIndex, from: &_state)
-        _timeline.removeSpeaker(speakerIndex)
+        _timeline.freeSlot(speakerIndex)
     }
 
     /// Cleanup resources.

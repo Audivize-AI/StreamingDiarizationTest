@@ -10,7 +10,7 @@ public class SortformerTimeline {
     private struct StreamingState {
         var starts: [Int]
         var isSpeaking: [Bool]
-        var lastSegments: [SpeakerSegment]
+        var lastSegments: [AnonymousSpeakerSegment]
         
         init(numSpeakers: Int) {
             self.starts = Array(repeating: 0, count: numSpeakers)
@@ -63,9 +63,13 @@ public class SortformerTimeline {
     /// Finalized segments
     public private(set) var speakers: SpeakerDatabase
     
-    public var activeSpeakers: [Int : SpeakerProfile] { speakers.activeSpeakers }
+    public var activeSpeakers: [Int : SpeakerProfile] {
+        speakers.activeSpeakers
+    }
     
-    public var inactiveSpeakers: [Int : SpeakerProfile] { speakers.inactiveSpeakers }
+    public var inactiveSpeakers: [SpeakerProfile] {
+        speakers.inactiveSpeakers
+    }
     
     /// Finalized single-speaker segments with embedding tracking
     public internal(set) var embeddingSegments: [EmbeddingSegment] = []
@@ -166,17 +170,17 @@ public class SortformerTimeline {
             }
             
             // Now safe to clear tentative segments
-            for (slot, speaker) in activeSpeakers {
+            for (_, speaker) in activeSpeakers {
                 speaker.clearTentativeSegments()
             }
             
             // Append new predictions BEFORE extracting segments
             // This ensures segments that span the boundary are properly extracted
             let predsToFinalize = chunk.finalizedFrameCount * config.numSpeakers
-            var newSegments: [SpeakerSegment] = []
-            let oldTentative = tentativeSegments
+            var newSegments: [AnonymousSpeakerSegment] = []
+            let oldTentative = activeSpeakers.values.flatMap(\.tentativeSegments)
             
-            let oldFinalizedSegmentCounts = speakers.activeSpeakers.map(\.count)
+            let oldFinalizedSegmentCounts = activeSpeakers.values.map(\.finalizedSegmentCount)
             
             // Add finalized preds if there are new ones
             tentativePredictions.append(contentsOf: chunk.newPredictions)
@@ -205,15 +209,26 @@ public class SortformerTimeline {
                 accumulator: &newSegments
             )
             
-            try updateEmbeddingSegments(from: newSegments, finalizedCutoffs: oldFinalizedSegmentCounts, dropEmbeddingFrames: dropOldEmbeddingFrames)
+            let newEmbeddingsStart = embeddingSegments.endIndex
+            try updateEmbeddingSegments(
+                from: newSegments,
+                finalizedCutoffs: oldFinalizedSegmentCounts,
+                dropEmbeddingFrames: dropOldEmbeddingFrames
+            )
+            
+            speakers.stream(
+                newFinalized: embeddingSegments.suffix(from: newEmbeddingsStart),
+                newTentative: tentativeEmbeddingSegments,
+                onSlotFreed: self.freeSlot
+            )
             
             // Trim predictions
             trimPredictions()
             
             // Compute difference
             let diff = SortformerTimelineDifference(
-                old: oldTentative.flatMap(\.self),
-                new: newSegments
+                old: oldTentative.map(\.speakerSegment),
+                new: newSegments.map(\.speakerSegment)
             )
             return diff
         }
@@ -238,9 +253,9 @@ public class SortformerTimeline {
     }
     
     /// Remove the speaker at a given index
-    public func removeSpeaker(_ speakerIndex: Int) {
+    public func freeSlot(_ slot: Int) {
         queue.sync(flags: .barrier) {
-            let slotsToMove = config.numSpeakers - speakerIndex - 1
+            let slotsToMove = config.numSpeakers - slot - 1
             guard slotsToMove > 0 else {
                 func clearPreds(preds: inout [Float], totalFrames: Int, speakerIndex: Int) {
                     preds.withUnsafeMutableBufferPointer { predsBuf in
@@ -249,13 +264,12 @@ public class SortformerTimeline {
                     }
                 }
                 
-                clearPreds(preds: &framePredictions, totalFrames: numFinalized, speakerIndex: speakerIndex)
-                clearPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: speakerIndex)
-                segments[speakerIndex].removeAll()
-                tentativeSegments[speakerIndex].removeAll()
-                embeddingSegments.removeAll(where: { $0.speakerId == speakerIndex })
-                tentativeEmbeddingSegments.removeAll(where: { $0.speakerId == speakerIndex })
-                state.resetSlot(at: speakerIndex)
+                clearPreds(preds: &framePredictions, totalFrames: numFinalized, speakerIndex: slot)
+                clearPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: slot)
+                speakers.freeSlot(slot)
+                embeddingSegments.removeAll(where: { $0.speakerId == slot })
+                tentativeEmbeddingSegments.removeAll(where: { $0.speakerId == slot })
+                state.resetSlot(at: slot)
                 return
             }
             
@@ -277,16 +291,6 @@ public class SortformerTimeline {
                 }
             }
             
-            func shiftSegments(segments: inout [[SpeakerSegment]], after index: Int) {
-                for speakerIndex in index+1..<config.numSpeakers {
-                    for i in 0..<segments[speakerIndex].count {
-                        segments[speakerIndex][i].speakerId -= 1
-                    }
-                    segments[speakerIndex - 1] = segments[speakerIndex]
-                }
-                segments[config.numSpeakers - 1].removeAll()
-            }
-            
             func shiftEmbeddingSegments(segments: inout [EmbeddingSegment], after index: Int) {
                 segments.removeAll(where: { $0.speakerId == index })
                 for i in 0..<segments.count where segments[i].speakerId > index {
@@ -294,14 +298,13 @@ public class SortformerTimeline {
                 }
             }
             
-            shiftPreds(preds: &framePredictions, totalFrames: numFinalized, speakerIndex: speakerIndex)
-            shiftPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: speakerIndex)
-            shiftSegments(segments: &segments, after: speakerIndex)
-            shiftSegments(segments: &tentativeSegments, after: speakerIndex)
-            shiftEmbeddingSegments(segments: &embeddingSegments, after: speakerIndex)
-            shiftEmbeddingSegments(segments: &tentativeEmbeddingSegments, after: speakerIndex)
+            shiftPreds(preds: &framePredictions, totalFrames: numFinalized, speakerIndex: slot)
+            shiftPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: slot)
+            shiftEmbeddingSegments(segments: &embeddingSegments, after: slot)
+            shiftEmbeddingSegments(segments: &tentativeEmbeddingSegments, after: slot)
+            speakers.freeSlot(slot)
             
-            for i in speakerIndex + 1..<config.numSpeakers {
+            for i in slot + 1..<config.numSpeakers {
                 state.shiftBackSlot(at: i)
             }
             state.resetSlot(at: config.numSpeakers - 1)
@@ -322,7 +325,7 @@ public class SortformerTimeline {
         numFrames: Int,
         isFinalized: Bool,
         addTrailingTentative: Bool,
-        accumulator: inout [SpeakerSegment],
+        accumulator: inout [AnonymousSpeakerSegment],
     ) where T: Sequence & Collection, T.Element == Float, T.Index == Int {
         let numSpeakers = config.numSpeakers
         let onset = config.onsetThreshold
@@ -343,14 +346,14 @@ public class SortformerTimeline {
             tentativeStartFrame = 0
         }
         
-        for speakerIndex in 0..<numSpeakers {
+        for slot in 0..<numSpeakers {
             var segmentsAdded: Int = 0
-            var start = state.starts[speakerIndex]
-            var speaking = state.isSpeaking[speakerIndex]
-            var lastSegment = state.lastSegments[speakerIndex]
+            var start = state.starts[slot]
+            var speaking = state.isSpeaking[slot]
+            var lastSegment = state.lastSegments[slot]
             
             for i in 0..<numFrames {
-                let index = i * numSpeakers + speakerIndex
+                let index = i * numSpeakers + slot
                 
                 if speaking { // Await segment end
                     guard predictions[index] < offset else {
@@ -370,8 +373,8 @@ public class SortformerTimeline {
                     // This ensures gap-closer can still merge it with future segments
                     let isFinalized = isFinalized && (end <= tentativeStartFrame)
                     
-                    let newSegment = SpeakerSegment(
-                        speakerId: speakerIndex,
+                    let newSegment = AnonymousSpeakerSegment(
+                        speakerId: slot,
                         startFrame: start,
                         endFrame: end,
                         isFinalized: isFinalized
@@ -379,12 +382,8 @@ public class SortformerTimeline {
                     
                     accumulator.append(newSegment)
                     segmentsAdded += 1
-                    if isFinalized {
-                        speakers.activeSpeakers[speakerIndex, default: .init(config: config, speakerIndex: <#T##Int#>)].append(newSegment)
-                    } else {
-                        tentativeSegments[speakerIndex].append(newSegment)
-                    }
-                    lastSegment = (start, end, isFinalized)
+                    speakers.getSpeaker(atSlot: slot).appendSegment(newSegment)
+                    lastSegment = newSegment
                     
                 } else if predictions[index] > onset { // Await segment start
                     // Not speaking -> speaking
@@ -392,15 +391,11 @@ public class SortformerTimeline {
                     speaking = true
                     
                     if segmentsAdded > 0,
-                       start - lastSegment.end <= minFramesOff {
+                       start - lastSegment.endFrame <= minFramesOff {
                         // Extend last segment to avoid overlap, effectively merging it with the new one
-                        start = lastSegment.start
+                        start = lastSegment.startFrame
                         
-                        if lastSegment.isFinalized {
-                            segments[speakerIndex].removeLast()
-                        } else {
-                            tentativeSegments[speakerIndex].removeLast()
-                        }
+                        speakers.activeSpeakers[slot]?.popSegment(finalized: lastSegment.isFinalized)
                         
                         accumulator.removeLast()
                         segmentsAdded -= 1
@@ -409,9 +404,9 @@ public class SortformerTimeline {
             }
             
             if isFinalized {
-                state.isSpeaking[speakerIndex] = speaking
-                state.starts[speakerIndex] = start
-                state.lastSegments[speakerIndex] = lastSegment
+                state.isSpeaking[slot] = speaking
+                state.starts[slot] = start
+                state.lastSegments[slot] = lastSegment
             }
             
             // Add still-speaking segment as tentative when requested
@@ -420,13 +415,13 @@ public class SortformerTimeline {
             if addTrailingTentative {
                 let end = cursorFrame + numFrames + padOffset
                 if speaking && (end > start) {
-                    let newSegment = SpeakerSegment(
-                        speakerId: speakerIndex,
+                    let newSegment = AnonymousSpeakerSegment(
+                        speakerId: slot,
                         startFrame: start,
                         endFrame: end,
                         isFinalized: false
                     )
-                    tentativeSegments[speakerIndex].append(newSegment)
+                    speakers.getSpeaker(atSlot: slot).appendTentativeSegment(newSegment)
                     accumulator.append(newSegment)
                 }
             }
@@ -435,7 +430,7 @@ public class SortformerTimeline {
     
     /// Note: call this AFTER `self.numFrames` has been updated
     private func updateEmbeddingSegments(
-        from segments: [SpeakerSegment],
+        from segments: [AnonymousSpeakerSegment],
         finalizedCutoffs oldFinalizedSegmentCounts: [Int],
         dropEmbeddingFrames: Bool
     ) throws {
@@ -593,8 +588,9 @@ public class SortformerTimeline {
         tentativePredictions.removeAll()
         cursorFrame = 0
         state = StreamingState(numSpeakers: config.numSpeakers)
-        segments = Array(repeating: [], count: config.numSpeakers)
-        tentativeSegments = Array(repeating: [], count: config.numSpeakers)
+        speakers.clear()
+//        segments = Array(repeating: [], count: config.numSpeakers)
+//        tentativeSegments = Array(repeating: [], count: config.numSpeakers)
         embeddingSegments.removeAll()
         tentativeEmbeddingSegments.removeAll()
         embeddingManager.reset()
@@ -609,15 +605,16 @@ public class SortformerTimeline {
         tentativePredictions.removeAll()
         
         for i in 0..<config.numSpeakers {
-            for j in 0..<tentativeSegments[i].count {
-                tentativeSegments[i][j].isFinalized = true
-            }
-            segments[i].append(contentsOf: tentativeSegments[i])
-            tentativeSegments[i].removeAll()
-            
-            if let lastSegment = segments[i].last, lastSegment.length < config.minFramesOn {
-                segments[i].removeLast()
-            }
+            speakers.finalizeAll()
+//            for j in 0..<tentativeSegments[i].count {
+//                tentativeSegments[i][j].isFinalized = true
+//            }
+//            segments[i].append(contentsOf: tentativeSegments[i])
+//            tentativeSegments[i].removeAll()
+//            
+//            if let lastSegment = segments[i].last, lastSegment.length < config.minFramesOn {
+//                segments[i].removeLast()
+//            }
         }
         
         // Finalize tentative embedding segments
@@ -659,15 +656,6 @@ public class SortformerTimeline {
     }
 }
 
-extension SortformerTimeline {
-    var speakerIdentitySegments: [SpeakerSegment] {
-        segments.flatMap { $0 }
-    }
-
-    var tentativeSpeakerIdentitySegments: [SpeakerSegment] {
-        tentativeSegments.flatMap { $0 }
-    }
-}
 
 public enum SortformerTimelineError: Error, LocalizedError {
     case mismatchedPredSizes
@@ -677,227 +665,5 @@ public enum SortformerTimelineError: Error, LocalizedError {
         case .mismatchedPredSizes:
             return "Preds and filtered preds should be the same size"   
         }
-    }
-}
-
-// MARK: - Segment ID
-public struct SpeakerSegment:
-    SpeakerFrameRange,
-    Identifiable,
-    ExpressibleByIntegerLiteral,
-    Hashable,
-    Comparable,
-    Equatable
-{
-    public typealias IntegerLiteralType = UInt64
-    
-    /*
-     * MEMORY LAYOUT:
-     *     | speaker ID | is finalized | segment length | start frame |
-     * LSB |   0 - 11   |      12      |     13 - 33    |   34 - 63   | MSB
-     */
-    
-    // Sizes
-    private static let startBits:   Int = 31    // About 5.5 years
-    private static let lengthBits:  Int = 20    // About 1 day
-    private static let speakerBits: Int = 12    // 4096 speaker slots
-    
-    // Offsets
-    private static let finalizedOffset: Int = speakerBits
-    private static let lengthOffset: Int = finalizedOffset + 1
-    private static let startOffset: Int = lengthBits + lengthOffset
-    
-    // Bit masks
-    private static let startMaskInv: UInt64 = (1 << (UInt64.bitWidth - startBits)) - 1
-    private static let lengthFieldMask: UInt64 = (1 << lengthBits) - 1
-    private static let lengthMaskInv: UInt64 = ~(lengthFieldMask << lengthOffset)
-    private static let finalizedMask: UInt64 = 1 << finalizedOffset
-    private static let finalizedMaskInv: UInt64 = ~finalizedMask
-    private static let speakerFieldMask: UInt64 = (1 << speakerBits) - 1
-    private static let speakerMaskInv: UInt64 = ~speakerFieldMask
-    
-    /// The segment's actual contents
-    public private(set) var bits: UInt64
-    
-    // - MARK: - Attribute retrieval
-    
-    /// Sortable segment identifier
-    @inline(__always)
-    public var id: UInt64 {
-        bits & Self.finalizedMaskInv
-    }
-    
-    /// Copy of the segment with the speaker identity removed
-    @inline(__always)
-    public var anonymized: SpeakerSegment { .init(integerLiteral: bits | Self.speakerFieldMask) }
-    
-    /// Copy of the segment with the finalized flag set to `true`
-    @inline(__always)
-    public var finalized: SpeakerSegment { .init(integerLiteral: bits | Self.finalizedMask) }
-    
-    /// Copy of the segment with the finalized flag set to `false`
-    @inline(__always)
-    public var unfinalized: SpeakerSegment { .init(integerLiteral: bits & Self.finalizedMaskInv) }
-    
-    /// Segment start frame
-    @inline(__always)
-    public var startFrame: Int {
-        get {
-            Int(truncatingIfNeeded: bits >> Self.startOffset)
-        }
-        set {
-            let v = UInt64(truncatingIfNeeded: newValue)
-            bits = (bits & Self.startMaskInv) | (v << Self.startOffset)
-        }
-    }
-    
-    /// Segment end frame
-    @inline(__always)
-    public var endFrame: Int {
-        get { startFrame + length }
-        set { length = newValue - startFrame }
-    }
-    
-    /// Segment length
-    @inline(__always)
-    public var length: Int {
-        get {
-            Int(truncatingIfNeeded: (bits >> Self.lengthOffset) & Self.lengthFieldMask)
-        }
-        set {
-            let v = UInt64(truncatingIfNeeded: newValue) & Self.lengthFieldMask
-            bits = (bits & Self.lengthMaskInv) | (v << Self.lengthOffset)
-        }
-    }
-    
-    /// Speaker ID
-    @inline(__always)
-    public var speakerId: Int {
-        get {
-            Int(truncatingIfNeeded: bits & Self.speakerFieldMask)
-        }
-        set {
-            let v = UInt64(truncatingIfNeeded: newValue) & Self.speakerFieldMask
-            bits = (bits & Self.speakerMaskInv) | v
-        }
-    }
-    
-    /// Whether the segment is finalized
-    @inline(__always)
-    public var isFinalized: Bool {
-        get {
-            (bits & Self.finalizedMask) != 0
-        }
-        set {
-            let v = newValue ? 1 : 0 as UInt64
-            bits = (bits & Self.finalizedMaskInv) | (v << Self.finalizedOffset)
-        }
-    }
-    
-    /// Whether the segment is tentative
-    @inline(__always)
-    public var isTentative: Bool {
-        get { !isFinalized }
-        set { isFinalized = !newValue }
-    }
-    
-    /// Frame range
-    @inline(__always)
-    public var frames: Range<Int> { startFrame..<endFrame }
-    
-    /// Start time in seconds
-    public var startTime: Float { Float(startFrame) * SortformerTimelineConfig.frameDurationSeconds }
-
-    /// End time in seconds
-    public var endTime: Float { Float(endFrame) * SortformerTimelineConfig.frameDurationSeconds }
-    
-    // MARK: - Init
-    @inline(__always)
-    public init(speakerId: Int, startFrame: Int, length: Int, isFinalized: Bool = true) {
-        let startU64 = UInt64(truncatingIfNeeded: startFrame)
-        let lengthU64 = UInt64(truncatingIfNeeded: length) & Self.lengthFieldMask
-        let slotU64 = UInt64(truncatingIfNeeded: speakerId) & Self.speakerFieldMask
-        let isFinalU64 = isFinalized ? 1 : 0 as UInt64
-        
-        self.bits = (  startU64 << Self.startOffset     | lengthU64 << Self.lengthOffset |
-                     isFinalU64 << Self.finalizedOffset | slotU64)
-    }
-    
-    @inline(__always)
-    public init(speakerId: Int, startFrame: Int, endFrame: Int, isFinalized: Bool = true) {
-        self.init(speakerId: speakerId, startFrame: startFrame, length: endFrame - startFrame, isFinalized: isFinalized)
-    }
-    
-    @inline(__always)
-    public init<T>(from segment: T, isFinalized: Bool = true)
-    where T: SpeakerFrameRange {
-        self.init(speakerId: segment.speakerId, startFrame: segment.startFrame, length: segment.length, isFinalized: isFinalized)
-    }
-    
-    @inline(__always)
-    public init(integerLiteral value: UInt64) {
-        self.bits = value
-    }
-    
-    // MARK: - Operators
-    
-    @inline(__always)
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(bits)
-    }
-    
-    @inline(__always)
-    public static func < (lhs: Self, rhs: Self) -> Bool {
-        return lhs.bits < rhs.bits
-    }
-    
-    // MARK: - Speaker Frame Range
-    
-    /// Check if the segment contains a frame
-    @inline(__always)
-    public func contains(_ frame: Int) -> Bool {
-        return frames.contains(frame)
-    }
-
-    /// Check if this segment overlaps or touches another segment
-    @inline(__always)
-    public func isContiguous<T>(with other: T) -> Bool
-    where T: SortformerFrameRange {
-        return SortformerFrameRangeHelpers.isContiguous(self, other)
-    }
-    
-    /// Check if this segment part of the same segment as another one
-    @inline(__always)
-    public func isContiguous<T>(with other: T, ensuringSameSpeaker: Bool = true) -> Bool
-    where T: SpeakerFrameRange {
-        return SortformerFrameRangeHelpers.isContiguous(self, other, ensuringSameSpeaker: ensuringSameSpeaker)
-    }
-    
-    /// Check if this overlaps with another segment
-    @inline(__always)
-    public func overlaps<T>(with other: T) -> Bool
-    where T: SortformerFrameRange {
-        return frames.overlaps(other.frames)
-    }
-    
-    /// Check if this overlaps with another segment
-    @inline(__always)
-    public func overlaps<T>(with other: T, ensuringSameSpeaker: Bool = true) -> Bool
-    where T: SpeakerFrameRange {
-        SortformerFrameRangeHelpers.overlaps(self, other, ensuringSameSpeaker: ensuringSameSpeaker)
-    }
-    
-    /// Check if this overlaps with another segment
-    @inline(__always)
-    public func overlapLength<T>(with other: T) -> Int
-    where T: SortformerFrameRange {
-        return SortformerFrameRangeHelpers.overlapLength(self, other)
-    }
-    
-    /// Check if this overlaps with another segment
-    @inline(__always)
-    public func overlapLength<T>(with other: T, ensuringSameSpeaker: Bool = true) -> Int
-    where T: SpeakerFrameRange {
-        return SortformerFrameRangeHelpers.overlapLength(self, other, ensuringSameSpeaker: ensuringSameSpeaker)
     }
 }

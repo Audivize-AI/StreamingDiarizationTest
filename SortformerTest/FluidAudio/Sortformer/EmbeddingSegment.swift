@@ -8,8 +8,23 @@ import Accelerate
 import CoreML
 
 
+public protocol EmbeddingVector: Identifiable, Hashable {
+    var id: UUID { get }
+    var bufferView: UnsafeBufferPointer<Float> { get }
+    var baseAddress: UnsafePointer<Float>? { get }
+    var magnitude: Float { get }
+    
+    func withUnsafeBufferPointer<R>(_ body: (UnsafeBufferPointer<Float>) throws -> R) rethrows -> R
+    
+    func withUnsafeMutableBufferPointer<R>(_ body: (UnsafeMutableBufferPointer<Float>) throws -> R) rethrows -> R
+    
+    func cosineDistance<E>(to other: E) -> Float where E: EmbeddingVector
+}
+
+
+
 /// Represents a region where an embedding was extracted
-public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFrameRange {
+public class SpeakerEmbedding: EmbeddingVector, SortformerFrameRange, Comparable {
     /// Embedding ID
     public let id: UUID
     
@@ -72,12 +87,13 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
     }
     
     /// Get the cosine distance to another embedding
-    public func cosineDistance(to other: SpeakerEmbedding) -> Float {
+    public func cosineDistance<E>(to other: E) -> Float
+    where E: EmbeddingVector {
         let length = vDSP_Length(buffer.count)
         var dot: Float = 0
         vDSP_dotpr(
             self.buffer.baseAddress!, 1,
-            other.buffer.baseAddress!, 1,
+            other.bufferView.baseAddress!, 1,
             &dot, length
         )
         return 1.0 - dot / (self.magnitude * other.magnitude)
@@ -92,13 +108,21 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
         cachedMagnitude = newMagnitude
     }
     
+    /// Set cached magnitude. Only use this if you normalized know the resulting magnitude after
+    /// manipulating the mutable buffer pointer.
+    /// - Parameter newMagnitude: The new magnitude to cache
+    @inline(__always)
+    public func setMagnitudeUnsafe(to newMagnitude: Float) {
+        self.cachedMagnitude = newMagnitude
+    }
+    
     /// Get the embedding buffer (non-mutable)
     public func withUnsafeBufferPointer<R>(_ body: (UnsafeBufferPointer<Float>) throws -> R) rethrows -> R {
         return try body(bufferView)
     }
     
     /// Get the embedding buffer (mutable)
-    public func withUnsafeMutableBufferPointer<R>(_ body: (UnsafeMutableBufferPointer<Float>) throws -> R) rethrows -> R {
+    public func withUnsafeMutableBufferPointer<R>(_ body: ( UnsafeMutableBufferPointer<Float>) throws -> R) rethrows -> R {
         self.cachedMagnitude = nil
         return try body(buffer)
     }
@@ -143,6 +167,10 @@ public class SpeakerEmbedding: Identifiable, Hashable, Comparable, SortformerFra
     
     public static func == (lhs: SpeakerEmbedding, rhs: SpeakerEmbedding) -> Bool {
         lhs.id == rhs.id
+    }
+    
+    public static func === (lhs: SpeakerEmbedding, rhs: SpeakerEmbedding) -> Bool {
+        lhs.buffer.baseAddress == rhs.buffer.baseAddress
     }
 }
 

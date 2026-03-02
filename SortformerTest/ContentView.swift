@@ -10,7 +10,7 @@ struct ContentView: View {
     
     // Annotation dialog state
     @State private var showingAnnotationDialog = false
-    @State private var selectedSegment: SortformerSegment?
+    @State private var selectedSegment: SpeakerSegment?
     @State private var annotationText = ""
     
     

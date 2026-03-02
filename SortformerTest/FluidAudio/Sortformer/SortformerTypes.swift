@@ -290,10 +290,10 @@ public struct SortformerTimelineConfig {
     ) {
         self.onsetThreshold = onsetThreshold
         self.offsetThreshold = offsetThreshold
-        self.onsetPadFrames = Int(round(onsetPadSeconds / frameDurationSeconds))
-        self.offsetPadFrames = Int(round(offsetPadSeconds / frameDurationSeconds))
-        self.minFramesOn = Int(round(minDurationOn / frameDurationSeconds))
-        self.minFramesOff = Int(round(minDurationOff / frameDurationSeconds))
+        self.onsetPadFrames = Int(round(onsetPadSeconds / Self.frameDurationSeconds))
+        self.offsetPadFrames = Int(round(offsetPadSeconds / Self.frameDurationSeconds))
+        self.minFramesOn = Int(round(minDurationOn / Self.frameDurationSeconds))
+        self.minFramesOff = Int(round(minDurationOff / Self.frameDurationSeconds))
         self.maxStoredFrames = maxStoredFrames
         self.clusteringThreshold = clusteringThreshold
         self.matchThreshold = matchThreshold
