@@ -3,8 +3,7 @@ import SwiftUI
 import AppKit
 #endif
 
-/// Segment-only timeline driven by variable speaker identities
-/// (`speakerID` is not bound to the fixed EEND slot count).
+/// Segment-only timeline driven by variable speaker identities.
 struct SpeakerIdentityTimelineView: View {
     let timeline: SortformerTimeline?
     let isRecording: Bool
@@ -20,16 +19,16 @@ struct SpeakerIdentityTimelineView: View {
         globalConfig.spkcacheLen
     )
 
-    private var finalizedSegments: [SpeakerIdentitySegment] {
-        timeline?.speakerIdentitySegments ?? []
+    private var finalizedSegments: [SpeakerSegment] {
+        timeline?.finalizedSpeakerSegments ?? []
     }
 
-    private var tentativeSegments: [SpeakerIdentitySegment] {
-        timeline?.tentativeSpeakerIdentitySegments ?? []
+    private var tentativeSegments: [SpeakerSegment] {
+        timeline?.tentativeSpeakerSegments ?? []
     }
 
     private var speakerIDs: [Int] {
-        Array(Set((finalizedSegments + tentativeSegments).map(\.speakerID))).sorted()
+        Array(Set((finalizedSegments + tentativeSegments).map(\.speakerId))).sorted()
     }
 
     private var rowCount: Int {
@@ -167,7 +166,7 @@ struct SpeakerIdentityTimelineView: View {
         }
 
         for segment in finalizedSegments {
-            guard let row = rowIndexBySpeakerID[segment.speakerID] else { continue }
+            guard let row = rowIndexBySpeakerID[segment.speakerId] else { continue }
             drawIdentitySegment(
                 segment,
                 row: row,
@@ -178,7 +177,7 @@ struct SpeakerIdentityTimelineView: View {
         }
 
         for segment in tentativeSegments {
-            guard let row = rowIndexBySpeakerID[segment.speakerID] else { continue }
+            guard let row = rowIndexBySpeakerID[segment.speakerId] else { continue }
             drawIdentitySegment(
                 segment,
                 row: row,
@@ -189,22 +188,22 @@ struct SpeakerIdentityTimelineView: View {
         }
     }
 
-    private func identitySegmentAt(frame: Int, speakerID: Int) -> SpeakerIdentitySegment? {
+    private func identitySegmentAt(frame: Int, speakerID: Int) -> SpeakerSegment? {
         guard frame >= 0 else { return nil }
 
         if let finalized = finalizedSegments.first(where: {
-            $0.speakerID == speakerID && frame >= $0.startFrame && frame < $0.endFrame
+            $0.speakerId == speakerID && frame >= $0.startFrame && frame < $0.endFrame
         }) {
             return finalized
         }
 
         return tentativeSegments.first(where: {
-            $0.speakerID == speakerID && frame >= $0.startFrame && frame < $0.endFrame
+            $0.speakerId == speakerID && frame >= $0.startFrame && frame < $0.endFrame
         })
     }
 
     private func drawIdentitySegment(
-        _ segment: SpeakerIdentitySegment,
+        _ segment: SpeakerSegment,
         row: Int,
         cellWidth: CGFloat,
         tentative: Bool,
@@ -214,7 +213,7 @@ struct SpeakerIdentityTimelineView: View {
         let width = max(1, CGFloat(segment.endFrame - segment.startFrame) * cellWidth)
         let y = CGFloat(row) * rowHeight + 2
         let rect = CGRect(x: x, y: y, width: width, height: rowHeight - 4)
-        let color = speakerColor(for: segment.speakerID)
+        let color = speakerColor(for: segment.speakerId)
         let path = Path(roundedRect: rect, cornerRadius: 3)
 
         if tentative {

@@ -32,7 +32,7 @@ struct SpeechPlotView: View {
     let segmentAnnotations: [String: String]
 
     /// Distance from Sortformer segment centroid to nearest cluster centroid.
-    let segmentCentroidDistances: [UUID: Float]
+    let segmentCentroidDistances: [UInt64: Float]
 
     /// Distance from embedding segment centroid to nearest cluster centroid.
     let embeddingSegmentCentroidDistances: [UUID: Float]
@@ -42,7 +42,7 @@ struct SpeechPlotView: View {
     let onPlaySegment: ((Float, Float) -> Void)?
     
     /// Callback when a segment is clicked for annotation
-    let onAnnotateSegment: ((SortformerSegment) -> Void)?
+    let onAnnotateSegment: ((SpeakerSegment) -> Void)?
     
     /// Callback when purge button is tapped for a speaker
     let onPurgeSpeaker: ((Int) -> Void)?
@@ -70,7 +70,7 @@ struct SpeechPlotView: View {
     @State private var scrollOffset: CGFloat = 0
     
     /// Hovered segment info for tooltip
-    @State private var hoveredSegment: SortformerSegment?
+    @State private var hoveredSegment: SpeakerSegment?
     @State private var hoveredEmbeddingSegment: EmbeddingSegment?
     @State private var hoverLocation: CGPoint = .zero
     
@@ -265,7 +265,7 @@ struct SpeechPlotView: View {
                             let startStr = String(format: "%.2f", segment.startTime)
                             let endStr = String(format: "%.2f", segment.endTime)
                             let durationStr = String(format: "%.2f", segment.endTime - segment.startTime)
-                            let idStr = segment.id.uuidString.prefix(4)
+                            let idStr = String(segment.id, radix: 16).uppercased()
                             let distanceStr = segmentCentroidDistances[segment.id].map { String(format: "%.3f", $0) }
                             
                             VStack(alignment: .leading, spacing: 2) {
@@ -300,7 +300,9 @@ struct SpeechPlotView: View {
                                         .foregroundColor(.gray)
                                 }
                                 if !embSegment.segmentIds.isEmpty {
-                                    let ids = embSegment.segmentIds.map { $0.uuidString.prefix(4) }.joined(separator: ", ")
+                                    let ids = embSegment.segmentIds
+                                        .map { String($0, radix: 16).uppercased() }
+                                        .joined(separator: ", ")
                                     Text("Speaker: \(embSegment.speakerId), IDs: [\(ids)]")
                                         .font(.caption2)
                                         .foregroundColor(.gray)
@@ -503,7 +505,7 @@ struct SpeechPlotView: View {
         let elapsedSeconds = Float(totalFrames) * 0.08
         return String(format: "Live Diarization - Confirmed: %d | Tentative: %d | Segments: %d + %d | (%.1fs)",
                       tl.cursorFrame, tl.numTentative,
-                      tl.segments.flatMap(\.self).count, tl.tentativeSegments.flatMap(\.self).count,
+                      tl.finalizedSegments.flatMap(\.self).count, tl.tentativeSegments.flatMap(\.self).count,
                       elapsedSeconds)
     }
     
@@ -578,10 +580,20 @@ struct SpeechPlotView: View {
         let totalFrames = max(tl.cursorFrame + tl.numTentative, visibleFrames)
         let cellWidth = size.width / CGFloat(totalFrames)
         let cellHeight = size.height / CGFloat(numSpeakers)
-        let identityBySegmentID = Dictionary(
-            uniqueKeysWithValues: (tl.speakerIdentitySegments + tl.tentativeSpeakerIdentitySegments)
-                .map { ($0.id, $0.speakerID) }
-        )
+        var identityBySegmentID: [UInt64: Int] = [:]
+        for profile in tl.activeSpeakers.values {
+            for segment in profile.finalizedSegments {
+                identityBySegmentID[segment.id] = profile.speakerId
+            }
+            for segment in profile.tentativeSegments {
+                identityBySegmentID[segment.id] = profile.speakerId
+            }
+        }
+        for profile in tl.inactiveSpeakers {
+            for segment in profile.finalizedSegments {
+                identityBySegmentID[segment.id] = profile.speakerId
+            }
+        }
         
         // Draw row-scoped embedding segment bands (avoid full-height overlays).
         for segment in tl.embeddingSegments {
@@ -607,7 +619,7 @@ struct SpeechPlotView: View {
         }
         
         // Draw finalized segments (solid) with labels
-        for segment in tl.segments.flatMap({ $0 }) {
+        for segment in tl.finalizedSegments.flatMap({ $0 }) {
             drawSegmentOutline(context: context, segment: segment, 
                              cellWidth: cellWidth, cellHeight: cellHeight, tentative: false)
             drawSegmentLabel(context: context, segment: segment,
@@ -741,14 +753,14 @@ struct SpeechPlotView: View {
     }
 
     @inline(__always)
-    private func sortformerSegmentAt(frame: Int, speakerIndex: Int, timeline: SortformerTimeline) -> SortformerSegment? {
+    private func sortformerSegmentAt(frame: Int, speakerIndex: Int, timeline: SortformerTimeline) -> SpeakerSegment? {
         guard speakerIndex >= 0,
-              speakerIndex < timeline.segments.count,
+              speakerIndex < timeline.finalizedSegments.count,
               speakerIndex < timeline.tentativeSegments.count else {
             return nil
         }
 
-        if let segment = segmentContaining(frame: frame, in: timeline.segments[speakerIndex]) {
+        if let segment = segmentContaining(frame: frame, in: timeline.finalizedSegments[speakerIndex]) {
             return segment
         }
         return segmentContaining(frame: frame, in: timeline.tentativeSegments[speakerIndex])
@@ -770,7 +782,7 @@ struct SpeechPlotView: View {
     }
 
     @inline(__always)
-    private func segmentContaining(frame: Int, in segments: [SortformerSegment]) -> SortformerSegment? {
+    private func segmentContaining(frame: Int, in segments: [SpeakerSegment]) -> SpeakerSegment? {
         guard !segments.isEmpty else { return nil }
 
         var low = 0
@@ -921,7 +933,7 @@ struct SpeechPlotView: View {
     }
     
     /// Draw label on a segment
-    private func drawSegmentLabel(context: GraphicsContext, segment: SortformerSegment,
+    private func drawSegmentLabel(context: GraphicsContext, segment: SpeakerSegment,
                                   cellWidth: CGFloat, cellHeight: CGFloat,
                                   identitySpeakerID: Int?) {
         let x = CGFloat(segment.startFrame) * cellWidth
@@ -1012,7 +1024,7 @@ struct SpeechPlotView: View {
         }
         
         // Draw segment outlines - finalized segments (solid)
-        let segments = tl.segments.flatMap { $0 }
+        let segments = tl.finalizedSegments.flatMap { $0 }
         let tentativeSegments = tl.tentativeSegments.flatMap { $0 }
         for segment in segments {
             drawSegmentOutline(context: context, segment: segment, cellWidth: cellWidth,
@@ -1130,7 +1142,7 @@ struct SpeechPlotView: View {
         context.draw(image, in: CGRect(origin: .zero, size: size))
     }
     
-    private func drawSegmentOutline(context: GraphicsContext, segment: SortformerSegment,
+    private func drawSegmentOutline(context: GraphicsContext, segment: SpeakerSegment,
                                     cellWidth: CGFloat, cellHeight: CGFloat, tentative: Bool) {
         let speaker = segment.slot
         guard speaker >= 0 && speaker < numSpeakers else { return }

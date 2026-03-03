@@ -118,7 +118,7 @@ struct ContentView: View {
                 .layoutPriority(1)
                 .frame(minWidth: 400, maxWidth: .infinity, maxHeight: .infinity)
 
-                KMeansDendrogramView(model: viewModel.dendrogramModel)
+                KMeansPCA3DView(model: viewModel.kmeansPCAPlotModel)
                     .frame(minWidth: 320, maxWidth: 440, maxHeight: .infinity)
                     .padding(.leading, 12)
             }
@@ -310,7 +310,7 @@ struct ContentView: View {
         var output = "speaker_id,start_time,end_time\n"
         
         // Collect all segments and sort by start time
-        let allSegments = tl.segments.flatMap { $0 }.sorted { $0.startTime < $1.startTime }
+        let allSegments = tl.finalizedSegments.flatMap { $0 }.sorted { $0.startTime < $1.startTime }
         
         for segment in allSegments {
             // Use annotation if available, otherwise use original speaker index
