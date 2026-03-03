@@ -52,9 +52,6 @@ final class DiarizerViewModel: ObservableObject {
 
     /// Distance from each embedding segment centroid to its nearest live cluster centroid.
     @Published private(set) var embeddingSegmentCentroidDistances: [UUID: Float] = [:]
-
-    /// Latest live K-means grouping dendrogram built from SpeakerProfile clustering
-    @Published private(set) var dendrogramModel: KMeansDendrogramModel = .empty
     
     /// 3D PCA visualization built directly from timeline embeddings/clusters.
     @Published private(set) var kmeansPCAPlotModel: KMeansPCAPlotModel = .empty
@@ -80,6 +77,10 @@ final class DiarizerViewModel: ObservableObject {
     // Rebuilding PCA from all embeddings every 100ms can saturate the main thread while recording.
     private let streamingPCARefreshInterval: TimeInterval = 0.45
     private var lastStreamingPCARefreshTime: TimeInterval = 0
+    private let pcaBuildQueue = DispatchQueue(label: "SortformerTest.PCA.Build", qos: .utility)
+    private var pendingPCARawPoints: [PCAPointRaw]?
+    private var isPCABuildInFlight = false
+    private var pcaBuildGeneration: UInt64 = 0
 
     private struct DendrogramWorkingCluster {
         let nodeId: Int
@@ -422,7 +423,11 @@ final class DiarizerViewModel: ObservableObject {
         statusMessage = "Loading models from HuggingFace..."
         
         do {
-            let newDiarizer = SortformerDiarizer(config: globalConfig)
+            let newDiarizer = SortformerDiarizer(
+                config: globalConfig,
+                postProcessingConfig: globalTimelineConfig,
+                embeddingConfig: globalEmbeddingConfig
+            )
             let models = try await SortformerModels.loadFromHuggingFace(config: globalConfig)
             newDiarizer.initialize(models: models)
             
@@ -536,6 +541,7 @@ final class DiarizerViewModel: ObservableObject {
     }
 
     private func resetClusterState() {
+        cancelPendingPCAWork()
         speakerProfile = SpeakerProfile(config: clusteringConfig, speakerIndex: 0)
         streamedFinalizedEmbeddingSegmentCount = 0
         streamedFinalizedTailSignature = .empty
@@ -543,13 +549,12 @@ final class DiarizerViewModel: ObservableObject {
         lastStreamingPCARefreshTime = 0
         segmentCentroidDistances = [:]
         embeddingSegmentCentroidDistances = [:]
-        dendrogramModel = .empty
         kmeansPCAPlotModel = .empty
     }
 
     private func updateClusterVisualization(forcePlotRefresh: Bool = false) {
         guard let tl = timeline else {
-            dendrogramModel = .empty
+            cancelPendingPCAWork()
             streamedFinalizedEmbeddingSegmentCount = 0
             streamedFinalizedTailSignature = .empty
             slotBySegmentIDHistory.removeAll(keepingCapacity: false)
@@ -589,9 +594,8 @@ final class DiarizerViewModel: ObservableObject {
         let distanceMaps = makeDistanceMaps(from: speakerProfile, timeline: tl)
         segmentCentroidDistances = distanceMaps.bySegmentID
         embeddingSegmentCentroidDistances = distanceMaps.byEmbeddingSegmentID
-        dendrogramModel = makeDendrogramModel(from: speakerProfile, timeline: tl)
         if shouldRefreshPCAPlot(force: forcePlotRefresh) {
-            kmeansPCAPlotModel = makeKMeansPCAPlotModel(from: tl)
+            schedulePCAPlotRefresh(from: tl)
         }
     }
 
@@ -608,9 +612,8 @@ final class DiarizerViewModel: ObservableObject {
         let distanceMaps = makeDistanceMaps(from: speakerProfile, timeline: timeline)
         segmentCentroidDistances = distanceMaps.bySegmentID
         embeddingSegmentCentroidDistances = distanceMaps.byEmbeddingSegmentID
-        dendrogramModel = makeDendrogramModel(from: speakerProfile, timeline: timeline)
         if shouldRefreshPCAPlot(force: forcePlotRefresh) {
-            kmeansPCAPlotModel = makeKMeansPCAPlotModel(from: timeline)
+            schedulePCAPlotRefresh(from: timeline)
         }
         return true
     }
@@ -641,140 +644,6 @@ final class DiarizerViewModel: ObservableObject {
         )
     }
 
-    private func makeDendrogramModel(from profile: SpeakerProfile, timeline: SortformerTimeline?) -> KMeansDendrogramModel {
-        let centroids = visualizationCentroids(from: profile)
-        guard !centroids.isEmpty else {
-            return .empty
-        }
-
-        let slotBySegmentID = segmentSlotByID(from: timeline)
-        var nodes: [KMeansDendrogramNodeModel] = []
-        nodes.reserveCapacity(centroids.count * 2)
-
-        var workingClusters: [DendrogramWorkingCluster] = []
-        workingClusters.reserveCapacity(centroids.count)
-
-        var nextNodeID = 0
-        for (index, centroid) in centroids.enumerated() {
-            let vector = normalizedVector(Array(centroid.buffer))
-            let slot = dominantSlot(for: centroid, slotBySegmentID: slotBySegmentID)
-            let histogram: [Int: Int] = slot >= 0 ? [slot: 1] : [:]
-
-            let leafNode = KMeansDendrogramNodeModel(
-                id: nextNodeID,
-                matrixIndex: index,
-                leftChild: -1,
-                rightChild: -1,
-                speakerIndex: slot,
-                count: 1,
-                weight: centroid.weight,
-                mergeDistance: 0,
-                mustLink: false,
-                exceedsLinkageThreshold: false
-            )
-            nodes.append(leafNode)
-
-            workingClusters.append(
-                DendrogramWorkingCluster(
-                    nodeId: nextNodeID,
-                    vector: vector,
-                    weight: centroid.weight,
-                    leafCount: 1,
-                    speakerHistogram: histogram
-                )
-            )
-            nextNodeID += 1
-        }
-
-        if workingClusters.count == 1 {
-            return KMeansDendrogramModel(
-                rootIndex: workingClusters[0].nodeId,
-                activeLeafCount: 1,
-                nodes: nodes
-            )
-        }
-
-        let tieTolerance: Float = 1e-6
-        while workingClusters.count > 1 {
-            var bestPair: (Int, Int)?
-            var bestDistance = Float.greatestFiniteMagnitude
-
-            for i in 0..<(workingClusters.count - 1) {
-                for j in (i + 1)..<workingClusters.count {
-                    let distance = cosineDistance(workingClusters[i].vector, workingClusters[j].vector)
-                    let shouldReplace: Bool
-                    if distance < bestDistance - tieTolerance {
-                        shouldReplace = true
-                    } else if abs(distance - bestDistance) <= tieTolerance {
-                        let candidateIDs = orderedNodeIDs(workingClusters[i].nodeId, workingClusters[j].nodeId)
-                        let currentIDs = bestPair.map {
-                            orderedNodeIDs(workingClusters[$0.0].nodeId, workingClusters[$0.1].nodeId)
-                        }
-                        shouldReplace = currentIDs == nil || candidateIDs.0 < currentIDs!.0 ||
-                            (candidateIDs.0 == currentIDs!.0 && candidateIDs.1 < currentIDs!.1)
-                    } else {
-                        shouldReplace = false
-                    }
-
-                    if shouldReplace {
-                        bestDistance = distance
-                        bestPair = (i, j)
-                    }
-                }
-            }
-
-            guard let bestPair else {
-                return .empty
-            }
-
-            let leftIndex = min(bestPair.0, bestPair.1)
-            let rightIndex = max(bestPair.0, bestPair.1)
-            let right = workingClusters.remove(at: rightIndex)
-            let left = workingClusters.remove(at: leftIndex)
-
-            let mergedHistogram = mergedSpeakerHistogram(left.speakerHistogram, right.speakerHistogram)
-            let dominantSpeaker = dominantSpeakerSlot(from: mergedHistogram)
-            let mergedVector = mergedClusterVector(left: left, right: right)
-            let mergedWeight = max(left.weight + right.weight, 1e-6)
-            let mergedLeafCount = left.leafCount + right.leafCount
-            let exceedsThreshold = bestDistance > clusteringConfig.clusteringThreshold
-
-            let parentNode = KMeansDendrogramNodeModel(
-                id: nextNodeID,
-                matrixIndex: nextNodeID,
-                leftChild: left.nodeId,
-                rightChild: right.nodeId,
-                speakerIndex: dominantSpeaker,
-                count: mergedLeafCount,
-                weight: mergedWeight,
-                mergeDistance: bestDistance,
-                mustLink: false,
-                exceedsLinkageThreshold: exceedsThreshold
-            )
-            nodes.append(parentNode)
-
-            workingClusters.append(
-                DendrogramWorkingCluster(
-                    nodeId: nextNodeID,
-                    vector: mergedVector,
-                    weight: mergedWeight,
-                    leafCount: mergedLeafCount,
-                    speakerHistogram: mergedHistogram
-                )
-            )
-            nextNodeID += 1
-        }
-
-        guard let rootCluster = workingClusters.first else {
-            return .empty
-        }
-
-        return KMeansDendrogramModel(
-            rootIndex: rootCluster.nodeId,
-            activeLeafCount: centroids.count,
-            nodes: nodes
-        )
-    }
 
     private func visualizationCentroids(from profile: SpeakerProfile) -> [SpeakerClusterCentroid] {
         let tentative = profile.tentativeClusters + profile.tentativeOutliers
@@ -995,20 +864,24 @@ final class DiarizerViewModel: ObservableObject {
         let speakerID: Int
         let slot: Int
         let clusterID: Int
+        let isInactive: Bool
     }
     
     private struct PCAClusterSeed {
+        let id: UUID
         let clusterID: Int
         let speakerID: Int
         let centerVector: [Float]
         let segmentIDs: Set<UInt64>
     }
     
-    private func makeKMeansPCAPlotModel(from timeline: SortformerTimeline) -> KMeansPCAPlotModel {
+    private func makePCARawPoints(from timeline: SortformerTimeline) -> [PCAPointRaw] {
         let embeddingSegments = timeline.embeddingSegments + timeline.tentativeEmbeddingSegments
-        guard !embeddingSegments.isEmpty else {
-            return .empty
-        }
+        let clusterSeeds = makeClusterSeeds(from: timeline)
+        guard !embeddingSegments.isEmpty || !clusterSeeds.isEmpty else { return [] }
+        
+        let activeSpeakerIDs = Set(timeline.activeSpeakers.values.map(\.speakerId))
+        let slotMap = segmentSlotByID(from: timeline)
         
         var identityBySegmentID: [UInt64: Int] = [:]
         for profile in timeline.activeSpeakers.values {
@@ -1025,7 +898,6 @@ final class DiarizerViewModel: ObservableObject {
             }
         }
         
-        let clusterSeeds = makeClusterSeeds(from: timeline)
         var segmentToClusterID: [UInt64: Int] = [:]
         for seed in clusterSeeds {
             for segmentID in seed.segmentIDs where segmentToClusterID[segmentID] == nil {
@@ -1048,12 +920,30 @@ final class DiarizerViewModel: ObservableObject {
                         vector: Array(embedding.bufferView),
                         speakerID: speakerID,
                         slot: slot,
-                        clusterID: clusterID
+                        clusterID: clusterID,
+                        isInactive: !activeSpeakerIDs.contains(speakerID)
                     )
                 )
             }
         }
         
+        for seed in clusterSeeds where !activeSpeakerIDs.contains(seed.speakerID) {
+            rawPoints.append(
+                PCAPointRaw(
+                    id: seed.id,
+                    vector: seed.centerVector,
+                    speakerID: seed.speakerID,
+                    slot: dominantSlot(for: seed.segmentIDs, map: slotMap),
+                    clusterID: seed.clusterID,
+                    isInactive: true
+                )
+            )
+        }
+        
+        return rawPoints
+    }
+
+    nonisolated private static func makeKMeansPCAPlotModel(from rawPoints: [PCAPointRaw]) -> KMeansPCAPlotModel {
         guard !rawPoints.isEmpty else {
             return .empty
         }
@@ -1066,12 +956,54 @@ final class DiarizerViewModel: ObservableObject {
                 position: project(point.vector, with: projection),
                 speakerID: point.speakerID,
                 slot: point.slot,
-                clusterID: point.clusterID
+                clusterID: point.clusterID,
+                isInactive: point.isInactive
             )
         }
-
+        
         normalizeScale(points: &points)
         return KMeansPCAPlotModel(points: points)
+    }
+
+    private func schedulePCAPlotRefresh(from timeline: SortformerTimeline) {
+        let rawPoints = makePCARawPoints(from: timeline)
+        guard !rawPoints.isEmpty else {
+            cancelPendingPCAWork()
+            kmeansPCAPlotModel = .empty
+            return
+        }
+        
+        pcaBuildGeneration &+= 1
+        pendingPCARawPoints = rawPoints
+        startNextPCABuildIfNeeded()
+    }
+    
+    private func cancelPendingPCAWork() {
+        pendingPCARawPoints = nil
+        pcaBuildGeneration &+= 1
+    }
+    
+    private func startNextPCABuildIfNeeded() {
+        guard !isPCABuildInFlight,
+              let rawPoints = pendingPCARawPoints else {
+            return
+        }
+        
+        pendingPCARawPoints = nil
+        isPCABuildInFlight = true
+        let generation = pcaBuildGeneration
+        
+        pcaBuildQueue.async { [rawPoints] in
+            let plotModel = Self.makeKMeansPCAPlotModel(from: rawPoints)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if generation == self.pcaBuildGeneration {
+                    self.kmeansPCAPlotModel = plotModel
+                }
+                self.isPCABuildInFlight = false
+                self.startNextPCABuildIfNeeded()
+            }
+        }
     }
     
     private func makeClusterSeeds(from timeline: SortformerTimeline) -> [PCAClusterSeed] {
@@ -1088,6 +1020,7 @@ final class DiarizerViewModel: ObservableObject {
                 
                 results.append(
                     PCAClusterSeed(
+                        id: cluster.id,
                         clusterID: nextClusterID,
                         speakerID: profile.speakerId,
                         centerVector: vector,
@@ -1135,7 +1068,20 @@ final class DiarizerViewModel: ObservableObject {
         }?.key ?? -1
     }
     
-    private func computePCAProjection(vectors: [[Float]], components k: Int) -> PCAProjection {
+    private func dominantSlot(for segmentIDs: Set<UInt64>, map: [UInt64: Int]) -> Int {
+        guard !segmentIDs.isEmpty else { return -1 }
+        var histogram: [Int: Int] = [:]
+        
+        for segmentID in segmentIDs {
+            guard let slot = map[segmentID] else { continue }
+            histogram[slot, default: 0] += 1
+        }
+        
+        guard !histogram.isEmpty else { return -1 }
+        return dominantSpeakerSlot(from: histogram)
+    }
+    
+    nonisolated private static func computePCAProjection(vectors: [[Float]], components k: Int) -> PCAProjection {
         guard let first = vectors.first, !first.isEmpty else {
             return PCAProjection(mean: [], components: [])
         }
@@ -1222,7 +1168,7 @@ final class DiarizerViewModel: ObservableObject {
         return PCAProjection(mean: mean, components: principalComponents)
     }
     
-    private func matrixVectorMultiply(matrix: [Float], vector: [Float], dimension: Int) -> [Float] {
+    nonisolated private static func matrixVectorMultiply(matrix: [Float], vector: [Float], dimension: Int) -> [Float] {
         guard vector.count == dimension, matrix.count == dimension * dimension else {
             return Array(repeating: Float.zero, count: dimension)
         }
@@ -1238,7 +1184,7 @@ final class DiarizerViewModel: ObservableObject {
         return result
     }
     
-    private func dot(_ lhs: [Float], _ rhs: [Float]) -> Float {
+    nonisolated private static func dot(_ lhs: [Float], _ rhs: [Float]) -> Float {
         let count = min(lhs.count, rhs.count)
         guard count > 0 else { return 0 }
         var result: Float = 0
@@ -1248,7 +1194,7 @@ final class DiarizerViewModel: ObservableObject {
         return result
     }
     
-    private func project(_ vector: [Float], with projection: PCAProjection) -> SIMD3<Float> {
+    nonisolated private static func project(_ vector: [Float], with projection: PCAProjection) -> SIMD3<Float> {
         guard !projection.components.isEmpty, !projection.mean.isEmpty else {
             return SIMD3<Float>(0, 0, 0)
         }
@@ -1269,7 +1215,7 @@ final class DiarizerViewModel: ObservableObject {
         return SIMD3<Float>(x, y, z)
     }
     
-    private func normalizeScale(points: inout [KMeansPCAPlotPoint]) {
+    nonisolated private static func normalizeScale(points: inout [KMeansPCAPlotPoint]) {
         var maxAbs: Float = 0
         
         for point in points {
@@ -1286,9 +1232,22 @@ final class DiarizerViewModel: ObservableObject {
                 position: point.position / scale,
                 speakerID: point.speakerID,
                 slot: point.slot,
-                clusterID: point.clusterID
+                clusterID: point.clusterID,
+                isInactive: point.isInactive
             )
         }
+    }
+
+    nonisolated private static func normalizedVector(_ vector: [Float]) -> [Float] {
+        guard !vector.isEmpty else { return [] }
+        
+        var sumSquares: Float = 0
+        for value in vector {
+            sumSquares += value * value
+        }
+        let norm = sqrt(max(sumSquares, 1e-12))
+        guard norm > 0 else { return vector }
+        return vector.map { $0 / norm }
     }
     
     /// Print all segments in CSV format: speaker_id,start_time,end_time

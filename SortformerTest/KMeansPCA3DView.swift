@@ -26,7 +26,12 @@ struct KMeansPCA3DView: View {
     let model: KMeansPCAPlotModel
 
     @State private var scene: SCNScene = SCNScene()
-    @State private var sceneUpdateTask: Task<Void, Never>?
+    @State private var sceneDebounceTask: Task<Void, Never>?
+    @State private var pendingSceneSnapshot: (generation: UInt64, snapshot: KMeansPCAPlotModel)?
+    @State private var isSceneBuildInFlight = false
+    @State private var sceneBuildGeneration: UInt64 = 0
+
+    private static let sceneBuildQueue = DispatchQueue(label: "SortformerTest.SceneKit.Build", qos: .utility)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -84,7 +89,10 @@ struct KMeansPCA3DView: View {
             scheduleSceneUpdate(immediate: false)
         }
         .onDisappear {
-            sceneUpdateTask?.cancel()
+            sceneDebounceTask?.cancel()
+            sceneDebounceTask = nil
+            pendingSceneSnapshot = nil
+            sceneBuildGeneration &+= 1
         }
     }
 
@@ -169,18 +177,50 @@ struct KMeansPCA3DView: View {
     }
 
     private func scheduleSceneUpdate(immediate: Bool) {
-        sceneUpdateTask?.cancel()
+        sceneDebounceTask?.cancel()
         let snapshot = model
-        sceneUpdateTask = Task { @MainActor in
-            if !immediate {
-                try? await Task.sleep(nanoseconds: 120_000_000)
-            }
+        sceneBuildGeneration &+= 1
+        let generation = sceneBuildGeneration
+
+        if immediate {
+            queueSceneBuild(snapshot: snapshot, generation: generation)
+            return
+        }
+        
+        sceneDebounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000)
             guard !Task.isCancelled else { return }
-            scene = makeScene(for: snapshot)
+            queueSceneBuild(snapshot: snapshot, generation: generation)
+        }
+    }
+    
+    private func queueSceneBuild(snapshot: KMeansPCAPlotModel, generation: UInt64) {
+        pendingSceneSnapshot = (generation: generation, snapshot: snapshot)
+        startNextSceneBuildIfNeeded()
+    }
+    
+    private func startNextSceneBuildIfNeeded() {
+        guard !isSceneBuildInFlight,
+              let next = pendingSceneSnapshot else {
+            return
+        }
+        
+        pendingSceneSnapshot = nil
+        isSceneBuildInFlight = true
+        
+        Self.sceneBuildQueue.async {
+            let builtScene = Self.makeScene(for: next.snapshot)
+            Task { @MainActor in
+                if next.generation == sceneBuildGeneration {
+                    scene = builtScene
+                }
+                isSceneBuildInFlight = false
+                startNextSceneBuildIfNeeded()
+            }
         }
     }
 
-    private func makeScene(for snapshot: KMeansPCAPlotModel) -> SCNScene {
+    private static func makeScene(for snapshot: KMeansPCAPlotModel) -> SCNScene {
         let newScene = SCNScene()
 
         let cameraNode = SCNNode()
@@ -202,7 +242,7 @@ struct KMeansPCA3DView: View {
         return newScene
     }
 
-    private func addAxes(to scene: SCNScene) {
+    private static func addAxes(to scene: SCNScene) {
         let axisLength: CGFloat = 1.3
         let axisRadius: CGFloat = 0.003
 
@@ -246,7 +286,7 @@ struct KMeansPCA3DView: View {
         )
     }
 
-    private func addPoints(to scene: SCNScene, points: [KMeansPCAPlotPoint]) {
+    private static func addPoints(to scene: SCNScene, points: [KMeansPCAPlotPoint]) {
         let brightnessLookup = brightnessLookup(for: points)
         var geometryCache: [PointStyleKey: SCNGeometry] = [:]
 
@@ -273,7 +313,7 @@ struct KMeansPCA3DView: View {
         }
     }
 
-    private func brightnessLookup(for points: [KMeansPCAPlotPoint]) -> [SpeakerClusterKey: CGFloat] {
+    private static func brightnessLookup(for points: [KMeansPCAPlotPoint]) -> [SpeakerClusterKey: CGFloat] {
         var clusterIDsBySpeaker: [Int: Set<Int>] = [:]
         for point in points where point.clusterID >= 0 {
             clusterIDsBySpeaker[point.speakerID, default: []].insert(point.clusterID)
@@ -302,7 +342,7 @@ struct KMeansPCA3DView: View {
         return result
     }
 
-    private func pointColor(_ point: KMeansPCAPlotPoint, lookup: [SpeakerClusterKey: CGFloat]) -> NSColor {
+    private static func pointColor(_ point: KMeansPCAPlotPoint, lookup: [SpeakerClusterKey: CGFloat]) -> NSColor {
         guard point.speakerID >= 0 else {
             return NSColor.systemGray.withAlphaComponent(0.90)
         }
@@ -310,10 +350,13 @@ struct KMeansPCA3DView: View {
         let hue = CGFloat((point.speakerID * 53).quotientAndRemainder(dividingBy: 360).remainder) / 360.0
         let key = SpeakerClusterKey(speakerID: point.speakerID, clusterID: point.clusterID)
         let brightness = lookup[key] ?? (point.clusterID < 0 ? 0.30 : 0.86)
-        return NSColor(calibratedHue: hue, saturation: 0.82, brightness: brightness, alpha: 0.96)
+        let saturation: CGFloat = point.isInactive ? 0.22 : 0.82
+        let adjustedBrightness: CGFloat = point.isInactive ? brightness * 0.88 : brightness
+        let alpha: CGFloat = point.isInactive ? 0.80 : 0.96
+        return NSColor(calibratedHue: hue, saturation: saturation, brightness: adjustedBrightness, alpha: alpha)
     }
 
-    private func geometryForSlot(_ slot: Int) -> SCNGeometry {
+    private static func geometryForSlot(_ slot: Int) -> SCNGeometry {
         let size: CGFloat = 0.026
 
         switch normalizedSlot(slot) {
@@ -341,7 +384,7 @@ struct KMeansPCA3DView: View {
         }
     }
 
-    private func normalizedSlot(_ slot: Int) -> Int {
+    private static func normalizedSlot(_ slot: Int) -> Int {
         ((slot % 6) + 6) % 6
     }
 }

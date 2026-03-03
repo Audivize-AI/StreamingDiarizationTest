@@ -1,15 +1,16 @@
 import Foundation
 import simd
 
-struct KMeansPCAPlotPoint: Identifiable, Equatable {
+struct KMeansPCAPlotPoint: Identifiable, Equatable, Sendable {
     let id: UUID
     let position: SIMD3<Float>
     let speakerID: Int
     let slot: Int
     let clusterID: Int
+    let isInactive: Bool
 }
 
-struct KMeansPCAPlotModel: Equatable {
+struct KMeansPCAPlotModel: Equatable, Sendable {
     let points: [KMeansPCAPlotPoint]
     let updatedAt: Date
 
