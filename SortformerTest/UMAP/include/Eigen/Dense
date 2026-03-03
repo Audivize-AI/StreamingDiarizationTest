@@ -1,9 +1,0 @@
-#ifndef EIGEN_DENSE_H
-#define EIGEN_DENSE_H
-namespace Eigen {
-    template<typename T, int R, int C> class Matrix {};
-    template<typename T> class VectorX {};
-    typedef double VectorXd; // Used in Options.hpp
-    typedef int Index;
-}
-#endif

@@ -1,4 +1,0 @@
-module UMAP {
-    header "umappp_wrapper.h"
-    export *
-}
