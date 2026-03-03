@@ -37,7 +37,8 @@ public class SpeakerDatabase {
     public func stream<F, T>(
         newFinalized: F,
         newTentative: T,
-        onSlotFreed: ((Int) -> Void)?
+        onSlotFreed: ((Int) -> Void)?,
+        onSlotsReordered: (([Int : Int]) -> Void)? = nil
     ) where F: Sequence, F.Element == EmbeddingSegment,
             T: Sequence, T.Element == EmbeddingSegment
     {
@@ -93,6 +94,10 @@ public class SpeakerDatabase {
             freeSlot(droppedSlot)
             onSlotFreed?(droppedSlot)
         }
+        
+        if let slotRemap = reorderActiveSlotsByFirstActiveFrame() {
+            onSlotsReordered?(slotRemap)
+        }
     }
     
     public func finalizeAll() {
@@ -117,6 +122,8 @@ public class SpeakerDatabase {
         
         let newSpeaker = SpeakerProfile(config: config, speakerId: inactiveSpeakers.count + slot)
         
+        activeSpeakers[slot] = newSpeaker
+
         return newSpeaker
     }
     
@@ -232,11 +239,50 @@ public class SpeakerDatabase {
         activeSpeakers[config.numSlots - 1] = nil
     }
     
+    /// Keep occupied slots sorted by the oldest active segment start while preserving
+    /// the occupied slot set itself (including any skipped slots).
+    private func reorderActiveSlotsByFirstActiveFrame() -> [Int : Int]? {
+        guard activeSpeakers.count > 1 else {
+            return nil
+        }
+        
+        let slotProfilePairs = activeSpeakers.map { (slot: $0.key, speaker: $0.value) }
+        let occupiedSlots = slotProfilePairs.map(\.slot).sorted()
+        
+        let sortedSpeakers = slotProfilePairs.sorted {
+            let t0 = $0.speaker.firstActiveFrame
+            let t1 = $1.speaker.firstActiveFrame
+            if t0 != t1 {
+                return t0 < t1
+            }
+            return $0.slot < $1.slot
+        }
+        
+        var oldToNew: [Int : Int] = [:]
+        oldToNew.reserveCapacity(sortedSpeakers.count)
+        
+        var reordered: [Int : SpeakerProfile] = [:]
+        reordered.reserveCapacity(sortedSpeakers.count)
+        
+        for (index, pair) in sortedSpeakers.enumerated() {
+            let newSlot = occupiedSlots[index]
+            oldToNew[pair.slot] = newSlot
+            reordered[newSlot] = pair.speaker
+        }
+        
+        guard oldToNew.contains(where: { $0.key != $0.value }) else {
+            return nil
+        }
+        
+        activeSpeakers = reordered
+        return oldToNew
+    }
+    
     // TODO: I might need a better ID selection mechanism to minimize ID swaps
     private func updateSpeakerIds() {
         guard !inactiveSpeakers.isEmpty else { return }
         
-        let threshold = config.clusteringThreshold
+        let threshold = config.matchThreshold
 
         var numRows = activeSpeakers.count
         var numCols = inactiveSpeakers.count
@@ -260,6 +306,8 @@ public class SpeakerDatabase {
                     costMatrix.append(.infinity)
                     continue
                 }
+                
+                costMatrix.append(distance)
                 
                 foundMatch = true
                 isColumnMatched[i] = true
@@ -306,8 +354,7 @@ public class SpeakerDatabase {
             let slot = rowToSlot[row]
             let inactiveIndex = columnToIndex[col]
             isSlotMatched[slot] = true
-            
-            activeSpeakers[row]?.speakerId = inactiveSpeakers[inactiveIndex].speakerId
+            activeSpeakers[slot]?.speakerId = inactiveSpeakers[inactiveIndex].speakerId
         }
         
         for (slot, speaker) in activeSpeakers where !isSlotMatched[slot] {

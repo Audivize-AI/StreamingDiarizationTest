@@ -223,7 +223,8 @@ public class SortformerTimeline {
             speakers.stream(
                 newFinalized: embeddingSegments.suffix(from: newEmbeddingsStart),
                 newTentative: tentativeEmbeddingSegments,
-                onSlotFreed: self.freeSlotLocked
+                onSlotFreed: self.freeSlotLocked,
+                onSlotsReordered: self.remapSlotsLocked
             )
             
             // Trim predictions
@@ -260,6 +261,7 @@ public class SortformerTimeline {
     public func freeSlot(_ slot: Int) {
         queue.sync(flags: .barrier) {
             freeSlotLocked(slot)
+            speakers.freeSlot(slot)
         }
     }
     
@@ -275,7 +277,6 @@ public class SortformerTimeline {
             
             clearPreds(preds: &framePredictions, totalFrames: numFinalized, speakerIndex: slot)
             clearPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: slot)
-            speakers.freeSlot(slot)
             embeddingSegments.removeAll(where: { $0.speakerId == slot })
             tentativeEmbeddingSegments.removeAll(where: { $0.speakerId == slot })
             state.resetSlot(at: slot)
@@ -311,12 +312,70 @@ public class SortformerTimeline {
         shiftPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: slot)
         shiftEmbeddingSegments(segments: &embeddingSegments, after: slot)
         shiftEmbeddingSegments(segments: &tentativeEmbeddingSegments, after: slot)
-        speakers.freeSlot(slot)
         
         for i in slot + 1..<config.numSpeakers {
             state.shiftBackSlot(at: i)
         }
         state.resetSlot(at: config.numSpeakers - 1)
+    }
+    
+    /// Remap slot-indexed buffers after the active speaker profiles are reordered.
+    /// The mapping is from old slot index to new slot index.
+    private func remapSlotsLocked(_ oldToNew: [Int : Int]) {
+        guard !oldToNew.isEmpty else { return }
+        
+        let S = config.numSpeakers
+        
+        func remapPredColumns(preds: inout [Float], totalFrames: Int) {
+            guard totalFrames > 0 else { return }
+            
+            var remapped = [Float](repeating: 0, count: preds.count)
+            remapped.withUnsafeMutableBufferPointer { dstBuf in
+                preds.withUnsafeBufferPointer { srcBuf in
+                    guard let src = srcBuf.baseAddress, let dst = dstBuf.baseAddress else { return }
+                    
+                    let n = Int32(totalFrames)
+                    let stride = Int32(S)
+                    
+                    for (oldSlot, newSlot) in oldToNew {
+                        guard oldSlot >= 0, oldSlot < S, newSlot >= 0, newSlot < S else { continue }
+                        cblas_scopy(n, src + oldSlot, stride, dst + newSlot, stride)
+                    }
+                }
+            }
+            preds = remapped
+        }
+        
+        func remapSegmentSlots(_ segments: inout [EmbeddingSegment]) {
+            for i in segments.indices {
+                if let newSlot = oldToNew[segments[i].speakerId] {
+                    segments[i].speakerId = newSlot
+                }
+            }
+        }
+        
+        remapPredColumns(preds: &framePredictions, totalFrames: numFinalized)
+        remapPredColumns(preds: &tentativePredictions, totalFrames: numTentative)
+        remapSegmentSlots(&embeddingSegments)
+        remapSegmentSlots(&tentativeEmbeddingSegments)
+        
+        var newStarts = Array(repeating: 0, count: S)
+        var newIsSpeaking = Array(repeating: false, count: S)
+        var newLastSegments = Array(repeating: TimelineSegment(integerLiteral: 0), count: S)
+        
+        for (oldSlot, newSlot) in oldToNew {
+            guard oldSlot >= 0, oldSlot < S, newSlot >= 0, newSlot < S else { continue }
+            newStarts[newSlot] = state.starts[oldSlot]
+            newIsSpeaking[newSlot] = state.isSpeaking[oldSlot]
+            
+            var lastSegment = state.lastSegments[oldSlot]
+            lastSegment.speakerId = newSlot
+            newLastSegments[newSlot] = lastSegment
+        }
+        
+        state.starts = newStarts
+        state.isSpeaking = newIsSpeaking
+        state.lastSegments = newLastSegments
     }
     
     /// Helper to update segments from predictions

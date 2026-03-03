@@ -10,9 +10,9 @@ class Dendrogram;
 
 class EmbeddingDistanceMatrix {
 private:
-    float* _matrixStart;
-    float* _matrixEnd;
-    SpeakerEmbeddingWrapper* _embeddings;
+    float* _matrixStart{nullptr};
+    float* _matrixEnd{nullptr};
+    SpeakerEmbeddingWrapper* _embeddings{nullptr};
     long _size{0};
     long _capacity{0};
     const LinkagePolicy* _linkagePolicy{nullptr};

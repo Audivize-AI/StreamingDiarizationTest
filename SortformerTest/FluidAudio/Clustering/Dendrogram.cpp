@@ -20,7 +20,9 @@ Dendrogram::Dendrogram(EmbeddingDistanceMatrix const& distMat) {
         .matrixToNode           = std::make_unique<long[]>(distMat._size),
         .size                   = distMat._size,
         .numClustersRemaining   = distMat._size,
-        .firstActiveMatrixIndex = 0
+        .firstActiveMatrixIndex = 0,
+        .numMerged              = 0,
+        .maxGap                 = 0
     };
     
     // Fill nodes and aux

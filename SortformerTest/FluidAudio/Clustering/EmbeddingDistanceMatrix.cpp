@@ -7,20 +7,21 @@
 
 EmbeddingDistanceMatrix::EmbeddingDistanceMatrix(const LinkagePolicy* linkagePolicy): 
         _matrixStart(nullptr),
+        _matrixEnd(nullptr),
         _embeddings(nullptr),
         _linkagePolicy(linkagePolicy) {}
 
 EmbeddingDistanceMatrix::EmbeddingDistanceMatrix(EmbeddingDistanceMatrix&& other) noexcept :
         _matrixStart(other._matrixStart),
+        _matrixEnd(other._matrixEnd),
         _embeddings(other._embeddings),
         _size(other._size),
         _capacity(other._capacity),
-        _matrixEnd(other._matrixEnd),
         _linkagePolicy(other._linkagePolicy)
 {
     other._matrixStart = nullptr;
-    other._embeddings = nullptr;
     other._matrixEnd = nullptr;
+    other._embeddings = nullptr;
     other._size = 0;
     other._capacity = 0;
 }
@@ -45,14 +46,16 @@ void EmbeddingDistanceMatrix::reserve(long newCapacity) {
     _embeddings = newEmbeddings;
 
     // Copy matrix
+    auto matrixSize = 0L;
     auto newMatrixCapacity = newCapacity * (newCapacity - 1) / 2;
     auto newMatrix = new float[newMatrixCapacity];
-    if (_matrixStart != nullptr) {
+    if (_matrixStart) {
+        matrixSize = _matrixEnd - _matrixStart;
         std::copy(_matrixStart, _matrixEnd, newMatrix);
         delete[] _matrixStart;
     }
-    _matrixEnd = newMatrix + (_matrixEnd - _matrixStart);
     _matrixStart = newMatrix;
+    _matrixEnd = newMatrix + matrixSize;
     
     _capacity = newCapacity;
 }
