@@ -34,6 +34,10 @@ public class SpeakerProfile: Hashable {
     /// Set of speaker IDs with which this profile cannot link
     public var cannotLink: Set<Int> = []
     
+    /// The speaker's original ID, assigned at creation. Used as a fallback
+    /// when no inactive speaker profile matches.
+    public let defaultSpeakerId: Int
+    
     /// Speaker ID
     public var speakerId: Int {
         didSet {
@@ -112,6 +116,7 @@ public class SpeakerProfile: Hashable {
     
     init(config: ClusteringConfig, speakerId: Int) {
         self.config = config
+        self.defaultSpeakerId = speakerId
         self.speakerId = speakerId
     }
     
@@ -130,6 +135,7 @@ public class SpeakerProfile: Hashable {
         cannotLink: Set<Int>
     ) {
         self.config = config
+        self.defaultSpeakerId = speakerId
         self.finalizedClusters = finalizedClusters
         self.tentativeClusters = tentativeClusters
         self.finalizedSegments = finalizedSegments
@@ -206,8 +212,11 @@ public class SpeakerProfile: Hashable {
             }
             
             // Find the best match
-            if let (cluster, _) = findCluster(for: centroid, in: finalizedClusters) {
-                cluster.update(with: segment)
+            if let (cluster, distance) = findCluster(for: centroid, in: finalizedClusters) {
+                cluster.update(
+                    with: centroid,
+                    updateVector: distance <= config.updateThreshold
+                )
             } else if !updateOutliers {
                 finalizedClusters.append(centroid.deepCopy())
             } else {
@@ -238,20 +247,28 @@ public class SpeakerProfile: Hashable {
             }
             
             // Find the best match
-            if let (cluster, _) = findCluster(for: centroid, in: tentativeClusters) {
-                cluster.update(with: segment)
+            if let (cluster, distance) = findCluster(for: centroid, in: tentativeClusters) {
+                cluster.update(
+                    with: centroid,
+                    updateVector: distance <= config.updateThreshold
+                )
                 continue
             }
             
             // Create a new cluster if we aren't checking for outliers
-            if !updateOutliers || hasMatchingCluster(for: centroid, in: oldClusters) {
+            if (!updateOutliers || oldClusters.isEmpty ||
+                hasMatchingCluster(for: centroid, in: oldClusters))
+            {
                 tentativeClusters.append(centroid.deepCopy())
                 continue
             }
             
             // Create an outlier cluster
-            if let (cluster, _) = findCluster(for: centroid, in: outliers) {
-                cluster.update(with: segment)
+            if let (cluster, distance) = findCluster(for: centroid, in: outliers) {
+                cluster.update(
+                    with: centroid,
+                    updateVector: distance <= config.updateThreshold
+                )
             } else {
                 outliers.append(centroid.deepCopy())
             }
@@ -439,6 +456,8 @@ public class SpeakerProfile: Hashable {
         if !tentativeClusters.isEmpty {
             finalizedClusters = tentativeClusters
             tentativeClusters.removeAll()
+            finalizedClusters.sort { $0.weight > $1.weight }
+            debugPrint("Cluster weights for speaker \(speakerId): \(finalizedClusters.map(\.weight))")
         }
         
         if !tentativeSegments.isEmpty {
@@ -645,22 +664,24 @@ public class SpeakerClusterCentroid: EmbeddingVector {
         isOutlierResult = embeddingView.isOutlier()
     }
     
-    public func update(with centroid: SpeakerClusterCentroid) {
-        self.weight += centroid.weight
-        var alpha = centroid.weight / self.weight
-        
-        self.withUnsafeMutableBufferPointer { muPtr in
-            // µ_n = µ_{n-1} + w/W_n (x - µ_{n-1})
-            vDSP_vintb(
-                muPtr.baseAddress!, 1,
-                centroid.baseAddress!, 1,
-                &alpha,
-                muPtr.baseAddress!, 1,
-                vDSP_Length(muPtr.count)
-            )
-        }
-        
+    public func update(with centroid: SpeakerClusterCentroid, updateVector: Bool = true) {
         self.segments.append(contentsOf: centroid.segments)
+        self.weight += centroid.weight
+        
+        if updateVector {
+            var alpha = centroid.weight / self.weight
+            
+            self.withUnsafeMutableBufferPointer { muPtr in
+                // µ_n = µ_{n-1} + w/W_n (x - µ_{n-1})
+                vDSP_vintb(
+                    muPtr.baseAddress!, 1,
+                    centroid.baseAddress!, 1,
+                    &alpha,
+                    muPtr.baseAddress!, 1,
+                    vDSP_Length(muPtr.count)
+                )
+            }
+        }
     }
     
     /// Update the centroid in place

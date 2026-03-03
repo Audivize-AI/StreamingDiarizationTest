@@ -112,7 +112,7 @@ public class SortformerTimeline {
         self.embeddingManager = embeddingManager
         self.state = StreamingState(numSpeakers: config.numSpeakers)
         self.speakers = .init(config: config)
-        let weights = [Float](repeating: 0.25, count: config.numFilteredFrames)
+        let weights = [Float](repeating: 0.8, count: config.numFilteredFrames)
         self.filter = SortformerFilter(weights: weights, numSpeakers: config.numSpeakers)
     }
     
@@ -151,11 +151,11 @@ public class SortformerTimeline {
         try queue.sync(flags: .barrier) {
             // Apply EMA filter to existing predictions using FIFO as reference
             // This smooths the tail of framePredictions before appending new data
-            let updatedFrameCount = min(
+            let updatedFrameCount = max(0, min(
                 numTentative - config.filterLeftContext,
                 chunk.oldFrameCount - config.filterLeftContext,
                 filter.windowSize
-            )
+            ))
             
             let updatedPredCount = updatedFrameCount * config.numSpeakers
             
@@ -220,11 +220,17 @@ public class SortformerTimeline {
                 dropEmbeddingFrames: dropOldEmbeddingFrames
             )
             
+            for segment in tentativeEmbeddingSegments {
+                assert(segment.centroid != nil)
+            }
+            for segment in embeddingSegments {
+                assert(segment.centroid != nil)
+            }
+            
             speakers.stream(
                 newFinalized: embeddingSegments.suffix(from: newEmbeddingsStart),
                 newTentative: tentativeEmbeddingSegments,
-                onSlotFreed: self.freeSlotLocked,
-                onSlotsReordered: self.remapSlotsLocked
+                onSlotFreed: self.freeSlotLocked
             )
             
             // Trim predictions
@@ -237,24 +243,6 @@ public class SortformerTimeline {
             )
             return diff
         }
-    }
-    
-    private func leastActiveSlot() -> Int {
-        var lowestEnergy: Float = .infinity
-        var lowestEnergyIndex: Int = 0
-        
-        let stride = vDSP_Stride(config.numSpeakers)
-        let length = vDSP_Length(numTentative)
-        for i in (0..<config.numSpeakers) {
-            var totalEnergy: Float = 0
-            vDSP_sve(tentativePredictions, stride, &totalEnergy, length)
-            if totalEnergy < lowestEnergy {
-                lowestEnergy = totalEnergy
-                lowestEnergyIndex = i
-            }
-        }
-        
-        return lowestEnergyIndex
     }
     
     /// Remove the speaker at a given index
@@ -277,13 +265,13 @@ public class SortformerTimeline {
             
             clearPreds(preds: &framePredictions, totalFrames: numFinalized, speakerIndex: slot)
             clearPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: slot)
-            embeddingSegments.removeAll(where: { $0.speakerId == slot })
-            tentativeEmbeddingSegments.removeAll(where: { $0.speakerId == slot })
+            embeddingSegments.removeAll { $0.speakerId == slot }
+            tentativeEmbeddingSegments.removeAll { $0.speakerId == slot }
             state.resetSlot(at: slot)
             return
         }
         
-        func shiftPreds(preds: inout [Float], totalFrames: Int, speakerIndex: Int) {
+        func shiftPreds(in preds: inout [Float], totalFrames: Int, slot: Int) {
             let S = config.numSpeakers
             preds.withUnsafeMutableBufferPointer { predsBuf in
                 guard let p = predsBuf.baseAddress else { return }
@@ -292,7 +280,7 @@ public class SortformerTimeline {
                 
                 // Shift each column left by one (process in ascending order so
                 // column k-1 is already saved before column k overwrites it).
-                for k in speakerIndex + 1..<S {
+                for k in slot + 1..<S {
                     cblas_scopy(n, p + k, stride, p + k - 1, stride)
                 }
                 
@@ -301,81 +289,26 @@ public class SortformerTimeline {
             }
         }
         
-        func shiftEmbeddingSegments(segments: inout [EmbeddingSegment], after index: Int) {
-            segments.removeAll(where: { $0.speakerId == index })
-            for i in 0..<segments.count where segments[i].speakerId > index {
-                segments[i].speakerId -= 1
+        func shiftEmbeddingSegments(in segments: inout [EmbeddingSegment], after slot: Int) {
+            segments.removeAll(where: { $0.speakerId == slot })
+            for segment in segments where segment.speakerId > slot {
+                segment.speakerId -= 1
+                
+                for i in segment.segments.indices {
+                    segment.segments[i].speakerId -= 1
+                }
             }
         }
         
-        shiftPreds(preds: &framePredictions, totalFrames: numFinalized, speakerIndex: slot)
-        shiftPreds(preds: &tentativePredictions, totalFrames: numTentative, speakerIndex: slot)
-        shiftEmbeddingSegments(segments: &embeddingSegments, after: slot)
-        shiftEmbeddingSegments(segments: &tentativeEmbeddingSegments, after: slot)
+        shiftPreds(in: &framePredictions, totalFrames: numFinalized, slot: slot)
+        shiftPreds(in: &tentativePredictions, totalFrames: numTentative, slot: slot)
+        shiftEmbeddingSegments(in: &embeddingSegments, after: slot)
+        shiftEmbeddingSegments(in: &tentativeEmbeddingSegments, after: slot)
         
         for i in slot + 1..<config.numSpeakers {
             state.shiftBackSlot(at: i)
         }
         state.resetSlot(at: config.numSpeakers - 1)
-    }
-    
-    /// Remap slot-indexed buffers after the active speaker profiles are reordered.
-    /// The mapping is from old slot index to new slot index.
-    private func remapSlotsLocked(_ oldToNew: [Int : Int]) {
-        guard !oldToNew.isEmpty else { return }
-        
-        let S = config.numSpeakers
-        
-        func remapPredColumns(preds: inout [Float], totalFrames: Int) {
-            guard totalFrames > 0 else { return }
-            
-            var remapped = [Float](repeating: 0, count: preds.count)
-            remapped.withUnsafeMutableBufferPointer { dstBuf in
-                preds.withUnsafeBufferPointer { srcBuf in
-                    guard let src = srcBuf.baseAddress, let dst = dstBuf.baseAddress else { return }
-                    
-                    let n = Int32(totalFrames)
-                    let stride = Int32(S)
-                    
-                    for (oldSlot, newSlot) in oldToNew {
-                        guard oldSlot >= 0, oldSlot < S, newSlot >= 0, newSlot < S else { continue }
-                        cblas_scopy(n, src + oldSlot, stride, dst + newSlot, stride)
-                    }
-                }
-            }
-            preds = remapped
-        }
-        
-        func remapSegmentSlots(_ segments: inout [EmbeddingSegment]) {
-            for i in segments.indices {
-                if let newSlot = oldToNew[segments[i].speakerId] {
-                    segments[i].speakerId = newSlot
-                }
-            }
-        }
-        
-        remapPredColumns(preds: &framePredictions, totalFrames: numFinalized)
-        remapPredColumns(preds: &tentativePredictions, totalFrames: numTentative)
-        remapSegmentSlots(&embeddingSegments)
-        remapSegmentSlots(&tentativeEmbeddingSegments)
-        
-        var newStarts = Array(repeating: 0, count: S)
-        var newIsSpeaking = Array(repeating: false, count: S)
-        var newLastSegments = Array(repeating: TimelineSegment(integerLiteral: 0), count: S)
-        
-        for (oldSlot, newSlot) in oldToNew {
-            guard oldSlot >= 0, oldSlot < S, newSlot >= 0, newSlot < S else { continue }
-            newStarts[newSlot] = state.starts[oldSlot]
-            newIsSpeaking[newSlot] = state.isSpeaking[oldSlot]
-            
-            var lastSegment = state.lastSegments[oldSlot]
-            lastSegment.speakerId = newSlot
-            newLastSegments[newSlot] = lastSegment
-        }
-        
-        state.starts = newStarts
-        state.isSpeaking = newIsSpeaking
-        state.lastSegments = newLastSegments
     }
     
     /// Helper to update segments from predictions
@@ -566,6 +499,15 @@ public class SortformerTimeline {
             ($0.frame == $1.frame && !$0.isStart)
         }
         
+        func initializeLastCentroid(
+            in segments: inout [EmbeddingSegment],
+            withCache centroidCache: [UUID : SpeakerClusterCentroid]
+        ) {
+            guard let lastSegment = segments.last else { return }
+            lastSegment.initializeCentroid(withCache: centroidCache)
+            if lastSegment.centroid == nil { segments.removeLast() }
+        }
+        
         func appendSegment(_ segment: EmbeddingSegment) throws {
             guard segment.isValid else { return }
             
@@ -575,18 +517,18 @@ public class SortformerTimeline {
                 streamingHorizonFrame: streamingHorizonFrame
             )
             
-            guard !segment.embeddings.isEmpty else {
-                return
-            }
+            guard !segment.embeddings.isEmpty else { return }
             
             // Append the embedding segment
             if segment.isFinalized {
                 if embeddingSegments.last?.successfullyAbsorbed(segment) != true {
-                    embeddingSegments.last?.initializeCentroid(withCache: centroidCache)
+                    initializeLastCentroid(in: &embeddingSegments,
+                                           withCache: centroidCache)
                     embeddingSegments.append(segment)
                 }
             } else if tentativeEmbeddingSegments.last?.successfullyAbsorbed(segment) != true {
-                tentativeEmbeddingSegments.last?.initializeCentroid(withCache: centroidCache)
+                initializeLastCentroid(in: &tentativeEmbeddingSegments,
+                                       withCache: centroidCache)
                 tentativeEmbeddingSegments.append(segment)
             }
         }
@@ -602,7 +544,7 @@ public class SortformerTimeline {
             // If exactly one speaker was active, this interval is a single-speaker segment
             if activeSegments.count == 1,
                frame > startFrame,
-               let (activeSlot, activeSegment) = activeSegments.first
+               let activeSegment = activeSegments.first?.value
             {
                 let isFinalized = activeSegment.isFinalized && frame <= firstTentativeFrame
                 
@@ -612,7 +554,9 @@ public class SortformerTimeline {
                 {
                     // Merge with the previous segment
                     currentEmbeddingSegment.endFrame = frame
-                    if isFinalized { currentEmbeddingSegment.isFinalized = true }
+                    if !isFinalized {
+                        currentEmbeddingSegment.isFinalized = false
+                    }
                     if currentEmbeddingSegment.segments.last != activeSegment {
                         currentEmbeddingSegment.segments.append(activeSegment)
                     }
@@ -624,30 +568,22 @@ public class SortformerTimeline {
                         slot: activeSegment.speakerId,
                         startFrame: startFrame,
                         endFrame: frame,
-                        finalized: activeSegment.isFinalized,
-                        segment: activeSegment.finalized
+                        finalized: activeSegment.isFinalized && isFinalized,
+                        segment: activeSegment
                     )
                 }
             }
             
             // Update state for next interval
             startFrame = frame
-            
-            if isStart {
-                activeSegments[segment.speakerId] = segment
-            } else {
-                activeSegments.removeValue(forKey: segment.speakerId)
-            }
+            activeSegments[segment.speakerId] = isStart ? segment : nil
         }
         
         // Initialize embeddings for the remaining active segment
         try appendSegment(currentEmbeddingSegment)
         
-        if !currentEmbeddingSegment.isFinalized {
-            tentativeEmbeddingSegments.last?.initializeCentroid(withCache: centroidCache)
-        } else {
-            embeddingSegments.last?.initializeCentroid(withCache: centroidCache)
-        }
+        initializeLastCentroid(in: &embeddingSegments, withCache: centroidCache)
+        initializeLastCentroid(in: &tentativeEmbeddingSegments, withCache: centroidCache)
         
         // Clean up spare embeddings
         if dropEmbeddingFrames {
@@ -679,7 +615,7 @@ public class SortformerTimeline {
         cursorFrame += numTentative
         tentativePredictions.removeAll()
         
-        for i in 0..<config.numSpeakers {
+        for _ in 0..<config.numSpeakers {
             speakers.finalizeAll()
 //            for j in 0..<tentativeSegments[i].count {
 //                tentativeSegments[i][j].isFinalized = true

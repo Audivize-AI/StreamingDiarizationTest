@@ -250,6 +250,9 @@ public struct SortformerTimelineConfig {
     /// Clustering threshold to detect a new speaker
     public var clusteringThreshold: Float
     
+    /// Clustering threshold to detect a new speaker
+    public var updateThreshold: Float
+    
     /// Chamfer distance threshold to match with another speaker profile
     public var matchThreshold: Float
 
@@ -271,7 +274,8 @@ public struct SortformerTimelineConfig {
             minFramesOff: 1,
             filterLeftContext: 1,
             clusteringThreshold: 0.25,
-            matchThreshold: 0.3
+            updateThreshold: 0.2,
+            matchThreshold: 0.25
         )
     }
     
@@ -286,6 +290,7 @@ public struct SortformerTimelineConfig {
         maxStoredFrames: Int? = nil,
         filterLeftContext: Int = 1,
         clusteringThreshold: Float = 0.25,
+        updateThreshold: Float = 0.2,
         matchThreshold: Float = 0.3
     ) {
         self.onsetThreshold = onsetThreshold
@@ -296,6 +301,7 @@ public struct SortformerTimelineConfig {
         self.minFramesOff = Int(round(minDurationOff / Self.frameDurationSeconds))
         self.maxStoredFrames = maxStoredFrames
         self.clusteringThreshold = clusteringThreshold
+        self.updateThreshold = updateThreshold
         self.matchThreshold = matchThreshold
         
         self.filterLeftContext = min(filterLeftContext, config.fifoLen - config.spkcacheUpdatePeriod)
@@ -313,6 +319,7 @@ public struct SortformerTimelineConfig {
         maxStoredFrames: Int? = nil,
         filterLeftContext: Int = 1,
         clusteringThreshold: Float = 0.25,
+        updateThreshold: Float = 0.2,
         matchThreshold: Float = 0.3
     ) {
         self.onsetThreshold = onsetThreshold
@@ -323,6 +330,7 @@ public struct SortformerTimelineConfig {
         self.minFramesOff = minFramesOff
         self.maxStoredFrames = maxStoredFrames
         self.clusteringThreshold = clusteringThreshold
+        self.updateThreshold = updateThreshold
         self.matchThreshold = matchThreshold
         
         self.filterLeftContext = max(filterLeftContext, config.fifoLen - config.spkcacheUpdatePeriod)

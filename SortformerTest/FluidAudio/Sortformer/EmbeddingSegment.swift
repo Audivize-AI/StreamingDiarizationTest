@@ -596,14 +596,16 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     }
     
     // MARK: - Centroid computation
+    /// Initialize centroid
     public func initializeCentroid(withCache cache: [UUID : SpeakerClusterCentroid] = [:]) {
-        guard !embeddings.isEmpty else { return }
-
+        guard self.centroid == nil else { return }
+        
         if let cached = cache[id] {
             self.centroid = cached
             return
         }
         
+        guard !embeddings.isEmpty else { return }
         guard embeddings.count > 1 else {
             self.centroid = SpeakerClusterCentroid(
                 id: id,
