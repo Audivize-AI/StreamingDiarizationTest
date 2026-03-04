@@ -5,6 +5,13 @@ import AppKit
 
 /// Segment-only timeline driven by variable speaker identities.
 struct SpeakerIdentityTimelineView: View {
+    private struct SpeakerRow: Identifiable {
+        let speakerID: Int
+        let slot: Int?
+
+        var id: Int { speakerID }
+    }
+
     let timeline: SortformerTimeline?
     let isRecording: Bool
     let updateTrigger: Int
@@ -27,12 +34,35 @@ struct SpeakerIdentityTimelineView: View {
         timeline?.tentativeSpeakerSegments ?? []
     }
 
-    private var speakerIDs: [Int] {
-        Array(Set((finalizedSegments + tentativeSegments).map(\.speakerId))).sorted()
+    private var activeSlotBySpeakerID: [Int: Int] {
+        guard let timeline else { return [:] }
+        var result: [Int: Int] = [:]
+        for (slot, profile) in timeline.activeSpeakers {
+            result[profile.speakerId] = slot
+        }
+        return result
+    }
+
+    private var speakerRows: [SpeakerRow] {
+        let segmentSpeakerIDs = Set((finalizedSegments + tentativeSegments).map(\.speakerId))
+        let sortedActive = activeSlotBySpeakerID.sorted { $0.value < $1.value }
+        let activeRows = sortedActive.map { SpeakerRow(speakerID: $0.key, slot: $0.value) }
+
+        let activeIDs = Set(sortedActive.map(\.key))
+        let inactiveRows = segmentSpeakerIDs
+            .subtracting(activeIDs)
+            .sorted()
+            .map { SpeakerRow(speakerID: $0, slot: nil) }
+
+        let rows = activeRows + inactiveRows
+        if rows.isEmpty {
+            return [SpeakerRow(speakerID: -1, slot: nil)]
+        }
+        return rows
     }
 
     private var rowCount: Int {
-        max(1, speakerIDs.count)
+        speakerRows.count
     }
 
     private var rowHeightTotal: CGFloat {
@@ -60,36 +90,37 @@ struct SpeakerIdentityTimelineView: View {
     }
 
     var body: some View {
-        let scrollViewportHeight = rowHeightTotal + horizontalScrollbarHeight
-
         VStack(alignment: .leading, spacing: 6) {
             Text(headerText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-            HStack(alignment: .top, spacing: 4) {
-                VStack(alignment: .trailing, spacing: 0) {
-                    ForEach(0..<rowCount, id: \.self) { row in
-                        if row < speakerIDs.count {
-                            Text("ID \(speakerIDs[row])")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        } else {
-                            Text("No data")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                }
-                .frame(width: labelWidth, height: rowHeightTotal, alignment: .topTrailing)
+            GeometryReader { geometry in
+                let timelineViewportWidth = max(0, geometry.size.width - labelWidth - 4)
+                let cellWidth = timelineViewportWidth / CGFloat(max(visibleFrames, 1))
+                let framesToDraw = max(totalFrames, visibleFrames)
+                let contentWidth = max(CGFloat(framesToDraw) * cellWidth, timelineViewportWidth)
+                let timelineContentHeight = rowHeightTotal + horizontalScrollbarHeight
 
-                GeometryReader { geometry in
-                    let viewportWidth = geometry.size.width
-                    let cellWidth = viewportWidth / CGFloat(max(visibleFrames, 1))
-                    let framesToDraw = max(totalFrames, visibleFrames)
-                    let contentWidth = max(CGFloat(framesToDraw) * cellWidth, viewportWidth)
+                ScrollView(.vertical, showsIndicators: true) {
+                    HStack(alignment: .top, spacing: 4) {
+                        VStack(alignment: .trailing, spacing: 0) {
+                            ForEach(0..<rowCount, id: \.self) { row in
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(labelColor(for: row))
+                                        .frame(width: 8, height: 8)
+                                    Text(labelText(for: row))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                                .padding(.trailing, 2)
+                                .frame(height: rowHeight)
+                            }
+                        }
+                        .frame(width: labelWidth, height: rowHeightTotal, alignment: .topTrailing)
 
                         ScrollViewReader { proxy in
                             ScrollView(.horizontal, showsIndicators: true) {
@@ -97,42 +128,46 @@ struct SpeakerIdentityTimelineView: View {
                                     drawRows(
                                         context: &context,
                                         size: size,
-                                        cellWidth: cellWidth
+                                        cellWidth: cellWidth,
+                                        slotBySpeakerID: activeSlotBySpeakerID
                                     )
                                 }
-                            .contentShape(Rectangle())
-                            .onTapGesture(count: 1) { location in
-                                guard !isRecording, cellWidth > 0 else { return }
-                                let row = Int(location.y / rowHeight)
-                                guard row >= 0, row < speakerIDs.count else { return }
-                                let frame = Int(location.x / cellWidth)
-                                let speakerID = speakerIDs[row]
-                                guard let segment = identitySegmentAt(frame: frame, speakerID: speakerID) else {
-                                    return
+                                .contentShape(Rectangle())
+                                .onTapGesture(count: 1) { location in
+                                    guard !isRecording, cellWidth > 0 else { return }
+                                    let row = Int(location.y / rowHeight)
+                                    guard row >= 0, row < speakerRows.count else { return }
+                                    let speakerID = speakerRows[row].speakerID
+                                    guard speakerID >= 0 else { return }
+                                    let frame = Int(location.x / cellWidth)
+                                    guard let segment = identitySegmentAt(frame: frame, speakerID: speakerID) else {
+                                        return
+                                    }
+                                    onPlaySegment?(segment.startTime, segment.endTime)
                                 }
-                                onPlaySegment?(segment.startTime, segment.endTime)
+                                .frame(width: contentWidth, height: rowHeightTotal)
+                                .background(Color.black.opacity(0.30))
+                                .cornerRadius(6)
+                                .overlay(alignment: .bottomTrailing) {
+                                    Color.clear
+                                        .frame(width: 1, height: 1)
+                                        .id("identity-scroll-end")
+                                }
                             }
-                            .frame(width: contentWidth, height: rowHeightTotal)
-                            .background(Color.black.opacity(0.30))
-                            .cornerRadius(6)
-                            .overlay(alignment: .bottomTrailing) {
-                                Color.clear
-                                    .frame(width: 1, height: 1)
-                                    .id("identity-scroll-end")
+                            .frame(width: timelineViewportWidth, height: timelineContentHeight, alignment: .topLeading)
+                            .onChange(of: updateTrigger) { _, _ in
+                                if isRecording && isFollowingLive {
+                                    proxy.scrollTo("identity-scroll-end", anchor: .trailing)
+                                }
                             }
-                        }
-                        .onChange(of: updateTrigger) { _, _ in
-                            if isRecording && isFollowingLive {
+                            .onAppear {
                                 proxy.scrollTo("identity-scroll-end", anchor: .trailing)
+                                isFollowingLive = true
                             }
-                        }
-                        .onAppear {
-                            proxy.scrollTo("identity-scroll-end", anchor: .trailing)
-                            isFollowingLive = true
                         }
                     }
+                    .frame(height: timelineContentHeight, alignment: .topLeading)
                 }
-                .frame(height: scrollViewportHeight)
             }
         }
         .padding(10)
@@ -143,18 +178,33 @@ struct SpeakerIdentityTimelineView: View {
     private var headerText: String {
         let finalizedCount = finalizedSegments.count
         let tentativeCount = tentativeSegments.count
-        let speakerCount = speakerIDs.count
+        let speakerCount = Set((finalizedSegments + tentativeSegments).map(\.speakerId)).count
         return "Identity Timeline - Speakers: \(speakerCount) | Segments: \(finalizedCount) + \(tentativeCount)"
+    }
+
+    private func labelText(for row: Int) -> String {
+        guard row < speakerRows.count else { return "No data" }
+        let rowInfo = speakerRows[row]
+        guard rowInfo.speakerID >= 0 else { return "No data" }
+        return "ID \(rowInfo.speakerID)"
+    }
+
+    private func labelColor(for row: Int) -> Color {
+        guard row < speakerRows.count else { return .gray.opacity(0.45) }
+        let rowInfo = speakerRows[row]
+        guard rowInfo.speakerID >= 0 else { return .gray.opacity(0.45) }
+        return speakerColor(for: rowInfo.speakerID, slotBySpeakerID: activeSlotBySpeakerID)
     }
 
     private func drawRows(
         context: inout GraphicsContext,
         size: CGSize,
-        cellWidth: CGFloat
+        cellWidth: CGFloat,
+        slotBySpeakerID: [Int: Int]
     ) {
         guard size.width > 0, size.height > 0 else { return }
-
-        let rowIndexBySpeakerID = Dictionary(uniqueKeysWithValues: speakerIDs.enumerated().map { ($1, $0) })
+        let validRows = speakerRows.enumerated().filter { $0.element.speakerID >= 0 }
+        let rowIndexBySpeakerID = Dictionary(uniqueKeysWithValues: validRows.map { ($0.element.speakerID, $0.offset) })
         let rowDivider = Color.white.opacity(0.08)
 
         for row in 0...rowCount {
@@ -172,6 +222,7 @@ struct SpeakerIdentityTimelineView: View {
                 row: row,
                 cellWidth: cellWidth,
                 tentative: false,
+                slotBySpeakerID: slotBySpeakerID,
                 context: &context
             )
         }
@@ -183,6 +234,7 @@ struct SpeakerIdentityTimelineView: View {
                 row: row,
                 cellWidth: cellWidth,
                 tentative: true,
+                slotBySpeakerID: slotBySpeakerID,
                 context: &context
             )
         }
@@ -207,13 +259,14 @@ struct SpeakerIdentityTimelineView: View {
         row: Int,
         cellWidth: CGFloat,
         tentative: Bool,
+        slotBySpeakerID: [Int: Int],
         context: inout GraphicsContext
     ) {
         let x = CGFloat(segment.startFrame) * cellWidth
         let width = max(1, CGFloat(segment.endFrame - segment.startFrame) * cellWidth)
         let y = CGFloat(row) * rowHeight + 2
         let rect = CGRect(x: x, y: y, width: width, height: rowHeight - 4)
-        let color = speakerColor(for: segment.speakerId)
+        let color = speakerColor(for: segment.speakerId, slotBySpeakerID: slotBySpeakerID)
         let path = Path(roundedRect: rect, cornerRadius: 3)
 
         if tentative {
@@ -229,8 +282,10 @@ struct SpeakerIdentityTimelineView: View {
         }
     }
 
-    private func speakerColor(for speakerID: Int) -> Color {
-        let hue = Double((speakerID * 53).quotientAndRemainder(dividingBy: 360).remainder) / 360.0
-        return Color(hue: hue, saturation: 0.72, brightness: 0.93)
+    private func speakerColor(for speakerID: Int, slotBySpeakerID: [Int: Int]) -> Color {
+        if let slot = slotBySpeakerID[speakerID] {
+            return SpeakerTimelinePalette.slotColor(for: slot)
+        }
+        return SpeakerTimelinePalette.slotColor(for: speakerID)
     }
 }

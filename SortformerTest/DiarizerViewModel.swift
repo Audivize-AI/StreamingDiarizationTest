@@ -70,12 +70,13 @@ final class DiarizerViewModel: ObservableObject {
     private var speakerProfile: SpeakerProfile
     private var streamedFinalizedEmbeddingSegmentCount = 0
     private var streamedFinalizedTailSignature = FinalizedEmbeddingTailSignature.empty
-    private var slotBySegmentIDHistory: [UInt64: Int] = [:]
     // Keep replay traffic bounded so replay/incremental catch-up cannot explode memory.
     private let clusterMaxFinalizedReplaySegments = 3000
     private let clusterMaxTentativeReplaySegments = 1500
-    // Rebuilding PCA from all embeddings every 100ms can saturate the main thread while recording.
-    private let streamingPCARefreshInterval: TimeInterval = 0.45
+    // Keep live updates responsive while recording.
+    private let streamingPCARefreshInterval: TimeInterval = 0.2
+    private let streamingPCAPointLimit = 900
+    private let finalizedPCAPointLimit = 2600
     private var lastStreamingPCARefreshTime: TimeInterval = 0
     private let pcaBuildQueue = DispatchQueue(label: "SortformerTest.PCA.Build", qos: .utility)
     private var pendingPCARawPoints: [PCAPointRaw]?
@@ -545,7 +546,6 @@ final class DiarizerViewModel: ObservableObject {
         speakerProfile = SpeakerProfile(config: clusteringConfig, speakerIndex: 0)
         streamedFinalizedEmbeddingSegmentCount = 0
         streamedFinalizedTailSignature = .empty
-        slotBySegmentIDHistory.removeAll(keepingCapacity: false)
         lastStreamingPCARefreshTime = 0
         segmentCentroidDistances = [:]
         embeddingSegmentCentroidDistances = [:]
@@ -557,13 +557,11 @@ final class DiarizerViewModel: ObservableObject {
             cancelPendingPCAWork()
             streamedFinalizedEmbeddingSegmentCount = 0
             streamedFinalizedTailSignature = .empty
-            slotBySegmentIDHistory.removeAll(keepingCapacity: false)
             segmentCentroidDistances = [:]
             embeddingSegmentCentroidDistances = [:]
             kmeansPCAPlotModel = .empty
             return
         }
-        updateSlotHistory(from: tl)
 
         let currentFinalizedTailSignature = finalizedTailSignature(for: tl.embeddingSegments)
         if tl.embeddingSegments.count < streamedFinalizedEmbeddingSegmentCount {
@@ -602,7 +600,6 @@ final class DiarizerViewModel: ObservableObject {
     @discardableResult
     private func replayFullClusterState(from timeline: SortformerTimeline, forcePlotRefresh: Bool = false) -> Bool {
         speakerProfile = SpeakerProfile(config: clusteringConfig, speakerIndex: 0)
-        updateSlotHistory(from: timeline)
         let finalizedWindow = timeline.embeddingSegments
         let tentativeWindow = timeline.tentativeEmbeddingSegments
         speakerProfile.stream(newFinalized: finalizedWindow, newTentative: tentativeWindow, updateOutliers: true)
@@ -646,11 +643,11 @@ final class DiarizerViewModel: ObservableObject {
 
 
     private func visualizationCentroids(from profile: SpeakerProfile) -> [SpeakerClusterCentroid] {
-        let tentative = profile.tentativeClusters + profile.tentativeOutliers
+        let tentative = profile.tentativeClusters
         if !tentative.isEmpty {
             return tentative
         }
-        let finalized = profile.finalizedClusters + profile.finalizedOutliers
+        let finalized = profile.finalizedClusters
         if !finalized.isEmpty {
             return finalized
         }
@@ -678,6 +675,14 @@ final class DiarizerViewModel: ObservableObject {
         var byEmbeddingSegmentID: [UUID: Float] = [:]
         let embeddingSegments = timeline.embeddingSegments + timeline.tentativeEmbeddingSegments
         byEmbeddingSegmentID.reserveCapacity(embeddingSegments.count)
+        
+        var timelineSegmentsBySlot: [Int: [SpeakerSegment]] = [:]
+        for (slot, segments) in timeline.finalizedSegments.enumerated() where !segments.isEmpty {
+            timelineSegmentsBySlot[slot, default: []].append(contentsOf: segments)
+        }
+        for (slot, segments) in timeline.tentativeSegments.enumerated() where !segments.isEmpty {
+            timelineSegmentsBySlot[slot, default: []].append(contentsOf: segments)
+        }
 
         for embeddingSegment in embeddingSegments {
             guard let segmentVector = centroidVector(for: embeddingSegment) else {
@@ -693,11 +698,17 @@ final class DiarizerViewModel: ObservableObject {
             }
 
             byEmbeddingSegmentID[embeddingSegment.id] = bestDistance
-            for segmentID in embeddingSegment.segmentIds {
-                if let current = bySegmentID[segmentID] {
-                    bySegmentID[segmentID] = min(current, bestDistance)
+            
+            guard let candidates = timelineSegmentsBySlot[embeddingSegment.speakerId] else {
+                continue
+            }
+            for segment in candidates
+            where segment.endFrame > embeddingSegment.startFrame
+                && segment.startFrame < embeddingSegment.endFrame {
+                if let current = bySegmentID[segment.id] {
+                    bySegmentID[segment.id] = min(current, bestDistance)
                 } else {
-                    bySegmentID[segmentID] = bestDistance
+                    bySegmentID[segment.id] = bestDistance
                 }
             }
         }
@@ -742,43 +753,6 @@ final class DiarizerViewModel: ObservableObject {
 
         let normalized = normalizedVector(accumulator)
         return normalized.isEmpty ? nil : normalized
-    }
-
-    private func updateSlotHistory(from timeline: SortformerTimeline) {
-        for segment in timeline.finalizedSegments.flatMap({ $0 }) {
-            slotBySegmentIDHistory[segment.id] = segment.slot
-        }
-        for segment in timeline.tentativeSegments.flatMap({ $0 }) {
-            slotBySegmentIDHistory[segment.id] = segment.slot
-        }
-    }
-
-    private func segmentSlotByID(from timeline: SortformerTimeline?) -> [UInt64: Int] {
-        guard let timeline else { return slotBySegmentIDHistory }
-        var result = slotBySegmentIDHistory
-        let finalized = timeline.finalizedSegments.flatMap { $0 }
-        let tentative = timeline.tentativeSegments.flatMap { $0 }
-        result.reserveCapacity(max(result.count, finalized.count + tentative.count))
-
-        for segment in finalized {
-            result[segment.id] = segment.slot
-        }
-        for segment in tentative {
-            result[segment.id] = segment.slot
-        }
-        return result
-    }
-
-    private func dominantSlot(for centroid: SpeakerClusterCentroid, slotBySegmentID: [UInt64: Int]) -> Int {
-        guard !centroid.segmentIds.isEmpty else {
-            return -1
-        }
-        var histogram: [Int: Int] = [:]
-        for segmentID in centroid.segmentIds {
-            guard let slot = slotBySegmentID[segmentID] else { continue }
-            histogram[slot, default: 0] += 1
-        }
-        return dominantSpeakerSlot(from: histogram)
     }
 
     private func dominantSpeakerSlot(from histogram: [Int: Int]) -> Int {
@@ -871,47 +845,77 @@ final class DiarizerViewModel: ObservableObject {
         let id: UUID
         let clusterID: Int
         let speakerID: Int
+        let slot: Int
         let centerVector: [Float]
-        let segmentIDs: Set<UInt64>
+        let isInactive: Bool
     }
     
-    private func makePCARawPoints(from timeline: SortformerTimeline) -> [PCAPointRaw] {
+    private enum PCAPlotDetail {
+        case streaming
+        case full
+    }
+    
+    private func makePCARawPoints(from timeline: SortformerTimeline, detail: PCAPlotDetail) -> [PCAPointRaw] {
         let embeddingSegments = timeline.embeddingSegments + timeline.tentativeEmbeddingSegments
         let clusterSeeds = makeClusterSeeds(from: timeline)
         guard !embeddingSegments.isEmpty || !clusterSeeds.isEmpty else { return [] }
         
-        let activeSpeakerIDs = Set(timeline.activeSpeakers.values.map(\.speakerId))
-        let slotMap = segmentSlotByID(from: timeline)
-        
-        var identityBySegmentID: [UInt64: Int] = [:]
-        for profile in timeline.activeSpeakers.values {
-            for segment in profile.finalizedSegments {
-                identityBySegmentID[segment.id] = profile.speakerId
-            }
-            for segment in profile.tentativeSegments {
-                identityBySegmentID[segment.id] = profile.speakerId
-            }
-        }
-        for profile in timeline.inactiveSpeakers {
-            for segment in profile.finalizedSegments {
-                identityBySegmentID[segment.id] = profile.speakerId
-            }
-        }
-        
-        var segmentToClusterID: [UInt64: Int] = [:]
-        for seed in clusterSeeds {
-            for segmentID in seed.segmentIDs where segmentToClusterID[segmentID] == nil {
-                segmentToClusterID[segmentID] = seed.clusterID
-            }
-        }
+        let activeSpeakerIDBySlot = Dictionary(
+            uniqueKeysWithValues: timeline.activeSpeakers.map { ($0.key, $0.value.speakerId) }
+        )
+        let activeSpeakerIDs = Set(activeSpeakerIDBySlot.values)
+        let seedsBySpeakerID = Dictionary(grouping: clusterSeeds, by: \.speakerID)
         
         var rawPoints: [PCAPointRaw] = []
-        rawPoints.reserveCapacity(embeddingSegments.reduce(0) { $0 + $1.embeddings.count })
+        if detail == .streaming {
+            rawPoints.reserveCapacity(embeddingSegments.count + clusterSeeds.count)
+        } else {
+            rawPoints.reserveCapacity(embeddingSegments.reduce(0) { $0 + max(1, $1.embeddings.count) } + clusterSeeds.count)
+        }
+        var speakersWithLivePoints: Set<Int> = []
         
         for segment in embeddingSegments {
             let slot = segment.speakerId
-            let speakerID = speakerID(for: segment, timeline: timeline, identityBySegmentID: identityBySegmentID)
-            let clusterID = dominantClusterID(for: segment.segmentIds, map: segmentToClusterID)
+            let speakerID = activeSpeakerIDBySlot[slot] ?? slot
+            let clusterCandidates = seedsBySpeakerID[speakerID] ?? []
+            let isInactive = !activeSpeakerIDs.contains(speakerID)
+            speakersWithLivePoints.insert(speakerID)
+            
+            if detail == .streaming {
+                guard let vector = centroidVector(for: segment) else {
+                    continue
+                }
+                let clusterID = nearestClusterID(for: vector, clusters: clusterCandidates)
+                rawPoints.append(
+                    PCAPointRaw(
+                        id: segment.id,
+                        vector: vector,
+                        speakerID: speakerID,
+                        slot: slot,
+                        clusterID: clusterID,
+                        isInactive: isInactive
+                    )
+                )
+                continue
+            }
+            
+            let segmentVector = centroidVector(for: segment)
+            let clusterID = segmentVector.map { nearestClusterID(for: $0, clusters: clusterCandidates) } ?? -1
+            
+            if segment.embeddings.isEmpty {
+                guard let segmentVector else { continue }
+                rawPoints.append(
+                    PCAPointRaw(
+                        id: segment.id,
+                        vector: segmentVector,
+                        speakerID: speakerID,
+                        slot: slot,
+                        clusterID: clusterID,
+                        isInactive: isInactive
+                    )
+                )
+                continue
+            }
             
             for embedding in segment.embeddings {
                 rawPoints.append(
@@ -921,21 +925,21 @@ final class DiarizerViewModel: ObservableObject {
                         speakerID: speakerID,
                         slot: slot,
                         clusterID: clusterID,
-                        isInactive: !activeSpeakerIDs.contains(speakerID)
+                        isInactive: isInactive
                     )
                 )
             }
         }
         
-        for seed in clusterSeeds where !activeSpeakerIDs.contains(seed.speakerID) {
+        for seed in clusterSeeds where seed.isInactive || !speakersWithLivePoints.contains(seed.speakerID) {
             rawPoints.append(
                 PCAPointRaw(
                     id: seed.id,
                     vector: seed.centerVector,
                     speakerID: seed.speakerID,
-                    slot: dominantSlot(for: seed.segmentIDs, map: slotMap),
+                    slot: seed.slot,
                     clusterID: seed.clusterID,
-                    isInactive: true
+                    isInactive: seed.isInactive
                 )
             )
         }
@@ -966,14 +970,18 @@ final class DiarizerViewModel: ObservableObject {
     }
 
     private func schedulePCAPlotRefresh(from timeline: SortformerTimeline) {
-        let rawPoints = makePCARawPoints(from: timeline)
+        let detail: PCAPlotDetail = isRecording ? .streaming : .full
+        let pointLimit = isRecording ? streamingPCAPointLimit : finalizedPCAPointLimit
+        let rawPoints = Self.downsampleRawPoints(
+            makePCARawPoints(from: timeline, detail: detail),
+            limit: pointLimit
+        )
         guard !rawPoints.isEmpty else {
             cancelPendingPCAWork()
             kmeansPCAPlotModel = .empty
             return
         }
         
-        pcaBuildGeneration &+= 1
         pendingPCARawPoints = rawPoints
         startNextPCABuildIfNeeded()
     }
@@ -991,13 +999,13 @@ final class DiarizerViewModel: ObservableObject {
         
         pendingPCARawPoints = nil
         isPCABuildInFlight = true
-        let generation = pcaBuildGeneration
+        let cancellationToken = pcaBuildGeneration
         
         pcaBuildQueue.async { [rawPoints] in
             let plotModel = Self.makeKMeansPCAPlotModel(from: rawPoints)
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if generation == self.pcaBuildGeneration {
+                if cancellationToken == self.pcaBuildGeneration {
                     self.kmeansPCAPlotModel = plotModel
                 }
                 self.isPCABuildInFlight = false
@@ -1011,11 +1019,11 @@ final class DiarizerViewModel: ObservableObject {
         results.reserveCapacity(64)
         var nextClusterID = 0
         
-        let allProfiles = Array(timeline.activeSpeakers.values) + timeline.inactiveSpeakers
-        for profile in allProfiles {
-            let clusters = profile.finalizedClusters + profile.tentativeClusters + profile.outliers
+        let orderedActive = timeline.activeSpeakers.sorted { $0.key < $1.key }
+        for (slot, profile) in orderedActive {
+            let clusters = profile.finalizedClusters + profile.tentativeClusters
             for cluster in clusters {
-                let vector = Array(cluster.buffer)
+                let vector = normalizedVector(Array(cluster.buffer))
                 guard !vector.isEmpty else { continue }
                 
                 results.append(
@@ -1023,8 +1031,29 @@ final class DiarizerViewModel: ObservableObject {
                         id: cluster.id,
                         clusterID: nextClusterID,
                         speakerID: profile.speakerId,
+                        slot: slot,
                         centerVector: vector,
-                        segmentIDs: Set(cluster.segmentIds)
+                        isInactive: false
+                    )
+                )
+                nextClusterID += 1
+            }
+        }
+        
+        for profile in timeline.inactiveSpeakers {
+            let clusters = profile.finalizedClusters + profile.tentativeClusters
+            for cluster in clusters {
+                let vector = normalizedVector(Array(cluster.buffer))
+                guard !vector.isEmpty else { continue }
+                
+                results.append(
+                    PCAClusterSeed(
+                        id: cluster.id,
+                        clusterID: nextClusterID,
+                        speakerID: profile.speakerId,
+                        slot: -1,
+                        centerVector: vector,
+                        isInactive: true
                     )
                 )
                 nextClusterID += 1
@@ -1034,51 +1063,61 @@ final class DiarizerViewModel: ObservableObject {
         return results
     }
     
-    private func speakerID(
-        for segment: EmbeddingSegment,
-        timeline: SortformerTimeline,
-        identityBySegmentID: [UInt64: Int]
-    ) -> Int {
-        if let activeSpeaker = timeline.activeSpeakers[segment.speakerId] {
-            return activeSpeaker.speakerId
-        }
+    private func nearestClusterID(for vector: [Float], clusters: [PCAClusterSeed]) -> Int {
+        guard !clusters.isEmpty else { return -1 }
+        var bestDistance = Float.greatestFiniteMagnitude
+        var bestClusterID = -1
         
-        for segmentID in segment.segmentIds {
-            if let speakerID = identityBySegmentID[segmentID] {
-                return speakerID
+        for cluster in clusters {
+            let distance = cosineDistance(vector, cluster.centerVector)
+            if distance < bestDistance {
+                bestDistance = distance
+                bestClusterID = cluster.clusterID
             }
         }
         
-        return segment.speakerId
+        return bestClusterID
     }
     
-    private func dominantClusterID(for segmentIDs: [UInt64], map: [UInt64: Int]) -> Int {
-        guard !segmentIDs.isEmpty else { return -1 }
-        var histogram: [Int: Int] = [:]
+    nonisolated private static func downsampleRawPoints(_ points: [PCAPointRaw], limit: Int) -> [PCAPointRaw] {
+        guard limit > 0, points.count > limit else { return points }
         
-        for segmentID in segmentIDs {
-            guard let clusterID = map[segmentID] else { continue }
-            histogram[clusterID, default: 0] += 1
+        let inactivePoints = points.filter(\.isInactive)
+        if inactivePoints.count >= limit {
+            return Array(inactivePoints.prefix(limit))
         }
         
-        guard !histogram.isEmpty else { return -1 }
-        return histogram.max { lhs, rhs in
-            if lhs.value == rhs.value { return lhs.key > rhs.key }
-            return lhs.value < rhs.value
-        }?.key ?? -1
-    }
-    
-    private func dominantSlot(for segmentIDs: Set<UInt64>, map: [UInt64: Int]) -> Int {
-        guard !segmentIDs.isEmpty else { return -1 }
-        var histogram: [Int: Int] = [:]
-        
-        for segmentID in segmentIDs {
-            guard let slot = map[segmentID] else { continue }
-            histogram[slot, default: 0] += 1
+        let activePoints = points.filter { !$0.isInactive }
+        guard !activePoints.isEmpty else {
+            return Array(inactivePoints.prefix(limit))
         }
         
-        guard !histogram.isEmpty else { return -1 }
-        return dominantSpeakerSlot(from: histogram)
+        let activeBudget = max(0, limit - inactivePoints.count)
+        guard activeBudget > 0 else {
+            return Array(inactivePoints.prefix(limit))
+        }
+        
+        let sortedActive = activePoints.sorted { lhs, rhs in
+            if lhs.speakerID != rhs.speakerID {
+                return lhs.speakerID < rhs.speakerID
+            }
+            if lhs.clusterID != rhs.clusterID {
+                return lhs.clusterID < rhs.clusterID
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+        
+        var sampled = inactivePoints
+        sampled.reserveCapacity(limit)
+        let stride = Double(sortedActive.count) / Double(activeBudget)
+        var cursor = 0.0
+        
+        for _ in 0..<activeBudget {
+            sampled.append(sortedActive[min(Int(cursor), sortedActive.count - 1)])
+            cursor += stride
+        }
+        
+        return sampled
     }
     
     nonisolated private static func computePCAProjection(vectors: [[Float]], components k: Int) -> PCAProjection {

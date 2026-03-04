@@ -4,6 +4,15 @@ import CoreGraphics
 import AppKit
 #endif
 
+enum SpeakerTimelinePalette {
+    static let slotColors: [Color] = [.red, .green, .blue, .orange]
+
+    static func slotColor(for slot: Int) -> Color {
+        guard slot >= 0 else { return .gray }
+        return slotColors[((slot % slotColors.count) + slotColors.count) % slotColors.count]
+    }
+}
+
 /// Real-time speech diarization heatmap view.
 /// Displays speaker probabilities as a viridis-colored heatmap with 4 speaker rows.
 struct SpeechPlotView: View {
@@ -56,12 +65,12 @@ struct SpeechPlotView: View {
     
     /// Number of speakers (fixed at 4 for Sortformer)
     private let numSpeakers = globalConfig.numSpeakers
+
+    private let yAxisWidth: CGFloat = 62
+    private let sectionSpacing: CGFloat = 4
     
     /// Chunk size for virtualization (frames per chunk)
     private let chunkSize = 500
-    
-    /// Buffer chunks to render outside visible area
-    private let bufferChunks = 2
     
     /// Track if we're at the trailing edge (following live updates)
     @State private var isFollowingLive = true
@@ -74,11 +83,6 @@ struct SpeechPlotView: View {
     @State private var hoveredEmbeddingSegment: EmbeddingSegment?
     @State private var hoverLocation: CGPoint = .zero
     
-    // Segment outline colors per speaker
-    private let speakerColors: [Color] = [
-        .red, .green, .blue, .orange
-    ]
-
     private var horizontalScrollbarHeight: CGFloat {
 #if os(macOS)
         switch NSScroller.preferredScrollerStyle {
@@ -98,8 +102,8 @@ struct SpeechPlotView: View {
         GeometryReader { geometry in
             let availableHeight = geometry.size.height - 90  // Reserved for title/labels/padding
             let plotHeight = availableHeight / 3.0  // Equal height for all 4 plots
-            // Subtract 66 for Y-axis labels (62) + spacing (4) to get actual plot width
-            let plotWidth = geometry.size.width - 66
+            let timelineInset = yAxisWidth + sectionSpacing
+            let plotWidth = max(0, geometry.size.width - timelineInset)
             
             VStack(alignment: .leading, spacing: 4) {
                 // Title with stats
@@ -114,7 +118,7 @@ struct SpeechPlotView: View {
                 Text("Time (frames, 80ms each) - \(totalFrameCount) total frames")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                    .padding(.leading, 66)
+                    .padding(.leading, timelineInset)
                 
                 // FIFO queue visualization (aligned with main timeline)
                 fifoSection(width: plotWidth, height: plotHeight)
@@ -144,7 +148,7 @@ struct SpeechPlotView: View {
                         }) {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 10))
-                                .foregroundColor(speakerColors[speaker % speakerColors.count].opacity(0.7))
+                                .foregroundColor(speakerColor(forSlot: speaker).opacity(0.7))
                         }
                         .buttonStyle(.plain)
                         .help("Purge speaker \(speaker)")
@@ -156,7 +160,7 @@ struct SpeechPlotView: View {
                     .frame(maxHeight: .infinity)
                 }
             }
-            .frame(width: 62, height: contentHeight)
+            .frame(width: yAxisWidth, height: contentHeight)
             
             // Scrollable heatmap - virtualized chunks
             ScrollViewReader { scrollProxy in
@@ -296,14 +300,6 @@ struct SpeechPlotView: View {
                                 Text("Spk \(embSegment.speakerId): \(startStr)s - \(endStr)s")
                                 if let embeddingDistanceStr {
                                     Text("cluster d: \(embeddingDistanceStr)")
-                                        .font(.caption2)
-                                        .foregroundColor(.gray)
-                                }
-                                if !embSegment.segmentIds.isEmpty {
-                                    let ids = embSegment.segmentIds
-                                        .map { String($0, radix: 16).uppercased() }
-                                        .joined(separator: ", ")
-                                    Text("Speaker: \(embSegment.speakerId), IDs: [\(ids)]")
                                         .font(.caption2)
                                         .foregroundColor(.gray)
                                 }
@@ -449,7 +445,7 @@ struct SpeechPlotView: View {
                             .frame(maxHeight: .infinity)
                     }
                 }
-                .frame(width: 45, height: max(height, 0))
+                .frame(width: yAxisWidth, height: max(height, 0))
                 
                 // FIFO heatmap - fixed width, right-aligned content
                 Canvas { context, size in
@@ -481,7 +477,7 @@ struct SpeechPlotView: View {
                             .frame(maxHeight: .infinity)
                     }
                 }
-                .frame(width: 45, height: max(0, height))
+                .frame(width: yAxisWidth, height: max(0, height))
                 
                 // Speaker cache heatmap
                 Canvas { context, size in
@@ -512,6 +508,11 @@ struct SpeechPlotView: View {
     private var totalFrameCount: Int {
         guard let tl = timeline else { return 0 }
         return tl.cursorFrame + tl.numTentative
+    }
+
+    @inline(__always)
+    private func speakerColor(forSlot slot: Int) -> Color {
+        SpeakerTimelinePalette.slotColor(for: slot)
     }
     
     private func calculatedContentWidth(viewportWidth: CGFloat) -> CGFloat {
@@ -705,7 +706,7 @@ struct SpeechPlotView: View {
             }
             
             // Draw strokes
-            let speakerColor = speakerColors[speakerIndex % speakerColors.count]
+            let speakerColor = speakerColor(forSlot: speakerIndex)
             let rowY = CGFloat(speakerIndex) * cellHeight
             let stackHeight = CGFloat(maxStaggerLevels) * strokeHeight + CGFloat(max(maxStaggerLevels - 1, 0)) * strokeMargin
             let baseY = rowY + max(0, (cellHeight - stackHeight) * 0.5)
@@ -1152,7 +1153,7 @@ struct SpeechPlotView: View {
         let x = CGFloat(startFrame) * cellWidth
         let y = CGFloat(speaker) * cellHeight
         let width = CGFloat(endFrame - startFrame) * cellWidth
-        let color = speakerColors[speaker % speakerColors.count]
+        let color = speakerColor(forSlot: speaker)
         
         let lineWidth: CGFloat = 2
         let strokeStyle: StrokeStyle = tentative
@@ -1195,7 +1196,7 @@ struct SpeechPlotView: View {
             height: max(1, cellHeight - 2 * yInset)
         )
 
-        let color = speakerColors[segment.speakerId % speakerColors.count]
+        let color = speakerColor(forSlot: segment.speakerId)
         let fillColor = color.opacity(tentative ? 0.09 : 0.16)
         let strokeStyle = tentative
             ? StrokeStyle(lineWidth: 1.4, dash: [4, 2])

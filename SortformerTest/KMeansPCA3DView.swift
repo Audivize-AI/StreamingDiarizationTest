@@ -26,11 +26,15 @@ struct KMeansPCA3DView: View {
     let model: KMeansPCAPlotModel
 
     @State private var scene: SCNScene = SCNScene()
+    @State private var cameraNode: SCNNode = KMeansPCA3DView.makeCameraNode()
     @State private var sceneDebounceTask: Task<Void, Never>?
-    @State private var pendingSceneSnapshot: (generation: UInt64, snapshot: KMeansPCAPlotModel)?
+    @State private var pendingSceneSnapshot: KMeansPCAPlotModel?
     @State private var isSceneBuildInFlight = false
-    @State private var sceneBuildGeneration: UInt64 = 0
+    @State private var sceneCancelGeneration: UInt64 = 0
 
+    private static let defaultCameraPosition = SCNVector3(2.15, 1.45, 3.10)
+    private static let ambientNodeName = "kmeans-ambient-light"
+    private static let contentNodeName = "kmeans-content-node"
     private static let sceneBuildQueue = DispatchQueue(label: "SortformerTest.SceneKit.Build", qos: .utility)
 
     var body: some View {
@@ -56,7 +60,7 @@ struct KMeansPCA3DView: View {
                 } else {
                     SceneView(
                         scene: scene,
-                        pointOfView: nil,
+                        pointOfView: cameraNode,
                         options: [.allowsCameraControl, .autoenablesDefaultLighting]
                     )
                     .padding(6)
@@ -83,6 +87,7 @@ struct KMeansPCA3DView: View {
                 .shadow(color: Color.black.opacity(0.10), radius: 8, x: 0, y: 3)
         )
         .onAppear {
+            ensureSceneScaffold()
             scheduleSceneUpdate(immediate: true)
         }
         .onChange(of: model.updatedAt) { _, _ in
@@ -92,7 +97,7 @@ struct KMeansPCA3DView: View {
             sceneDebounceTask?.cancel()
             sceneDebounceTask = nil
             pendingSceneSnapshot = nil
-            sceneBuildGeneration &+= 1
+            sceneCancelGeneration &+= 1
         }
     }
 
@@ -116,7 +121,7 @@ struct KMeansPCA3DView: View {
 
     private var footer: some View {
         HStack(spacing: 8) {
-            Text("Hue = speaker ID")
+            Text("Hue = speaker slot")
                 .font(.system(size: 10, weight: .semibold, design: .rounded))
                 .foregroundStyle(KMeansPalette.subtitle)
                 .padding(.horizontal, 8)
@@ -141,6 +146,23 @@ struct KMeansPCA3DView: View {
             Text("Drag rotate, scroll zoom, secondary drag pan")
                 .font(.system(size: 10, weight: .medium, design: .rounded))
                 .foregroundStyle(KMeansPalette.subtitle)
+
+            Button(action: resetCamera) {
+                Label("Reset Camera", systemImage: "camera.rotate")
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(KMeansPalette.subtitle)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(Color.white.opacity(0.62))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(KMeansPalette.border.opacity(0.22), lineWidth: 0.8)
+                    )
+            }
+            .buttonStyle(.plain)
         }
     }
 
@@ -176,27 +198,67 @@ struct KMeansPCA3DView: View {
         )
     }
 
-    private func scheduleSceneUpdate(immediate: Bool) {
-        sceneDebounceTask?.cancel()
-        let snapshot = model
-        sceneBuildGeneration &+= 1
-        let generation = sceneBuildGeneration
+    private static func makeCameraNode() -> SCNNode {
+        let node = SCNNode()
+        let camera = SCNCamera()
+        camera.zNear = 0.001
+        camera.zFar = 100
+        node.camera = camera
+        node.position = defaultCameraPosition
+        node.look(at: SCNVector3Zero)
+        return node
+    }
 
+    private func attachCamera(to targetScene: SCNScene) {
+        if cameraNode.parent !== targetScene.rootNode {
+            cameraNode.removeFromParentNode()
+            targetScene.rootNode.addChildNode(cameraNode)
+        }
+    }
+
+    private func ensureSceneScaffold() {
+        attachCamera(to: scene)
+        if scene.rootNode.childNode(withName: Self.ambientNodeName, recursively: false) == nil {
+            let ambient = SCNNode()
+            ambient.name = Self.ambientNodeName
+            ambient.light = SCNLight()
+            ambient.light?.type = .ambient
+            ambient.light?.intensity = 420
+            scene.rootNode.addChildNode(ambient)
+        }
+    }
+
+    private func applyContentNode(_ contentNode: SCNNode) {
+        if let existing = scene.rootNode.childNode(withName: Self.contentNodeName, recursively: false) {
+            existing.removeFromParentNode()
+        }
+        contentNode.name = Self.contentNodeName
+        scene.rootNode.addChildNode(contentNode)
+    }
+
+    private func resetCamera() {
+        cameraNode.simdTransform = matrix_identity_float4x4
+        cameraNode.position = Self.defaultCameraPosition
+        cameraNode.look(at: SCNVector3Zero)
+    }
+
+    private func scheduleSceneUpdate(immediate: Bool) {
+        pendingSceneSnapshot = model
         if immediate {
-            queueSceneBuild(snapshot: snapshot, generation: generation)
+            startNextSceneBuildIfNeeded()
+            return
+        }
+        
+        guard sceneDebounceTask == nil else {
             return
         }
         
         sceneDebounceTask = Task { @MainActor in
+            defer { sceneDebounceTask = nil }
             try? await Task.sleep(nanoseconds: 120_000_000)
             guard !Task.isCancelled else { return }
-            queueSceneBuild(snapshot: snapshot, generation: generation)
+            startNextSceneBuildIfNeeded()
         }
-    }
-    
-    private func queueSceneBuild(snapshot: KMeansPCAPlotModel, generation: UInt64) {
-        pendingSceneSnapshot = (generation: generation, snapshot: snapshot)
-        startNextSceneBuildIfNeeded()
     }
     
     private func startNextSceneBuildIfNeeded() {
@@ -207,12 +269,14 @@ struct KMeansPCA3DView: View {
         
         pendingSceneSnapshot = nil
         isSceneBuildInFlight = true
+        let cancellationToken = sceneCancelGeneration
         
         Self.sceneBuildQueue.async {
-            let builtScene = Self.makeScene(for: next.snapshot)
+            let builtContent = Self.makeContentNode(for: next)
             Task { @MainActor in
-                if next.generation == sceneBuildGeneration {
-                    scene = builtScene
+                if cancellationToken == sceneCancelGeneration {
+                    ensureSceneScaffold()
+                    applyContentNode(builtContent)
                 }
                 isSceneBuildInFlight = false
                 startNextSceneBuildIfNeeded()
@@ -220,73 +284,53 @@ struct KMeansPCA3DView: View {
         }
     }
 
-    private static func makeScene(for snapshot: KMeansPCAPlotModel) -> SCNScene {
-        let newScene = SCNScene()
-
-        let cameraNode = SCNNode()
-        cameraNode.camera = SCNCamera()
-        cameraNode.camera?.zNear = 0.001
-        cameraNode.camera?.zFar = 100
-        cameraNode.position = SCNVector3(0, 0, 3.0)
-        newScene.rootNode.addChildNode(cameraNode)
-
-        let ambient = SCNNode()
-        ambient.light = SCNLight()
-        ambient.light?.type = .ambient
-        ambient.light?.intensity = 420
-        newScene.rootNode.addChildNode(ambient)
-
-        addAxes(to: newScene)
-        addPoints(to: newScene, points: snapshot.points)
-
-        return newScene
+    private static func makeContentNode(for snapshot: KMeansPCAPlotModel) -> SCNNode {
+        let contentNode = SCNNode()
+        addAxes(to: contentNode)
+        addPoints(to: contentNode, points: snapshot.points)
+        return contentNode
     }
 
-    private static func addAxes(to scene: SCNScene) {
+    private static func addAxes(to parent: SCNNode) {
         let axisLength: CGFloat = 1.3
-        let axisRadius: CGFloat = 0.003
+        let axisThickness: CGFloat = 0.006
 
-        func axisNode(from start: SCNVector3, to end: SCNVector3, color: NSColor) -> SCNNode {
-            let vector = end - start
-            let distance = vector.length()
-
-            let cylinder = SCNCylinder(radius: axisRadius, height: distance)
+        func material(_ color: NSColor) -> SCNMaterial {
             let material = SCNMaterial()
-            material.diffuse.contents = color.withAlphaComponent(0.62)
+            material.diffuse.contents = color.withAlphaComponent(0.70)
             material.lightingModel = .constant
-            cylinder.materials = [material]
-
-            let node = SCNNode(geometry: cylinder)
-            node.position = (start + end) / 2
-            node.eulerAngles = vector.eulerAngles()
-            node.castsShadow = false
-            return node
+            return material
         }
 
-        scene.rootNode.addChildNode(
-            axisNode(
-                from: SCNVector3(-axisLength, 0, 0),
-                to: SCNVector3(axisLength, 0, 0),
-                color: NSColor.systemRed
-            )
+        let xAxis = SCNBox(
+            width: axisLength * 2,
+            height: axisThickness,
+            length: axisThickness,
+            chamferRadius: axisThickness * 0.25
         )
-        scene.rootNode.addChildNode(
-            axisNode(
-                from: SCNVector3(0, -axisLength, 0),
-                to: SCNVector3(0, axisLength, 0),
-                color: NSColor.systemGreen
-            )
+        xAxis.materials = [material(.systemRed)]
+        parent.addChildNode(SCNNode(geometry: xAxis))
+
+        let yAxis = SCNBox(
+            width: axisThickness,
+            height: axisLength * 2,
+            length: axisThickness,
+            chamferRadius: axisThickness * 0.25
         )
-        scene.rootNode.addChildNode(
-            axisNode(
-                from: SCNVector3(0, 0, -axisLength),
-                to: SCNVector3(0, 0, axisLength),
-                color: NSColor.systemBlue
-            )
+        yAxis.materials = [material(.systemGreen)]
+        parent.addChildNode(SCNNode(geometry: yAxis))
+
+        let zAxis = SCNBox(
+            width: axisThickness,
+            height: axisThickness,
+            length: axisLength * 2,
+            chamferRadius: axisThickness * 0.25
         )
+        zAxis.materials = [material(.systemBlue)]
+        parent.addChildNode(SCNNode(geometry: zAxis))
     }
 
-    private static func addPoints(to scene: SCNScene, points: [KMeansPCAPlotPoint]) {
+    private static func addPoints(to parent: SCNNode, points: [KMeansPCAPlotPoint]) {
         let brightnessLookup = brightnessLookup(for: points)
         var geometryCache: [PointStyleKey: SCNGeometry] = [:]
 
@@ -309,7 +353,7 @@ struct KMeansPCA3DView: View {
             let node = SCNNode(geometry: geometry)
             node.position = SCNVector3(point.position)
             node.castsShadow = false
-            scene.rootNode.addChildNode(node)
+            parent.addChildNode(node)
         }
     }
 
@@ -347,13 +391,27 @@ struct KMeansPCA3DView: View {
             return NSColor.systemGray.withAlphaComponent(0.90)
         }
 
-        let hue = CGFloat((point.speakerID * 53).quotientAndRemainder(dividingBy: 360).remainder) / 360.0
+        let paletteIndex = point.slot >= 0 ? point.slot : point.speakerID
+        let baseColor: NSColor
+        switch ((paletteIndex % 4) + 4) % 4 {
+        case 0: baseColor = .systemRed
+        case 1: baseColor = .systemGreen
+        case 2: baseColor = .systemBlue
+        default: baseColor = .systemOrange
+        }
+
+        let color = baseColor.usingColorSpace(.deviceRGB) ?? baseColor
+        var hue: CGFloat = 0
+        var saturation: CGFloat = 0.8
+        var baseBrightness: CGFloat = 0.8
+        var baseAlpha: CGFloat = 1
+        _ = color.getHue(&hue, saturation: &saturation, brightness: &baseBrightness, alpha: &baseAlpha)
         let key = SpeakerClusterKey(speakerID: point.speakerID, clusterID: point.clusterID)
         let brightness = lookup[key] ?? (point.clusterID < 0 ? 0.30 : 0.86)
-        let saturation: CGFloat = point.isInactive ? 0.22 : 0.82
+        let saturationAdjusted: CGFloat = point.isInactive ? max(0.16, saturation * 0.35) : max(0.58, saturation)
         let adjustedBrightness: CGFloat = point.isInactive ? brightness * 0.88 : brightness
         let alpha: CGFloat = point.isInactive ? 0.80 : 0.96
-        return NSColor(calibratedHue: hue, saturation: saturation, brightness: adjustedBrightness, alpha: alpha)
+        return NSColor(calibratedHue: hue, saturation: saturationAdjusted, brightness: adjustedBrightness, alpha: alpha)
     }
 
     private static func geometryForSlot(_ slot: Int) -> SCNGeometry {
@@ -392,28 +450,5 @@ struct KMeansPCA3DView: View {
 private extension SCNVector3 {
     init(_ v: SIMD3<Float>) {
         self.init(SCNFloat(v.x), SCNFloat(v.y), SCNFloat(v.z))
-    }
-
-    static func +(lhs: SCNVector3, rhs: SCNVector3) -> SCNVector3 {
-        SCNVector3(lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z)
-    }
-
-    static func -(lhs: SCNVector3, rhs: SCNVector3) -> SCNVector3 {
-        SCNVector3(lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z)
-    }
-
-    static func /(lhs: SCNVector3, rhs: CGFloat) -> SCNVector3 {
-        let divisor = SCNFloat(rhs)
-        return SCNVector3(lhs.x / divisor, lhs.y / divisor, lhs.z / divisor)
-    }
-
-    func length() -> CGFloat {
-        sqrt(x * x + y * y + z * z)
-    }
-
-    func eulerAngles() -> SCNVector3 {
-        let yaw = atan2(x, z)
-        let pitch = atan2(y, sqrt(x * x + z * z))
-        return SCNVector3(-pitch, yaw, 0)
     }
 }
