@@ -204,43 +204,23 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     /// Extracted embedding regions for this segment
     public private(set) var embeddings: [SpeakerEmbedding]
     
-    /// Array of it's corresponding SpeakerSegments
-    public var segments: [TimelineSegment]
-    
     public var isNone: Bool { speakerId < 0 }
     public var isValid: Bool { speakerId >= 0 }
     
-    public static let none: EmbeddingSegment = .init(slot: -1, startFrame: 0, endFrame: 0, segments: [])
+    public static let none: EmbeddingSegment = .init(slot: -1, startFrame: 0, endFrame: 0)
     
     // MARK: - Init
     public init(
         slot: Int,
         startFrame: Int,
         endFrame: Int,
-        finalized: Bool = true,
-        segments: [TimelineSegment] = []
+        finalized: Bool = true
     ) {
         self.speakerId = slot
         self.startFrame = startFrame
         self.endFrame = endFrame
         self.isFinalized = finalized
         self.embeddings = []
-        self.segments = segments
-    }
-    
-    public init(
-        slot: Int,
-        startFrame: Int,
-        endFrame: Int,
-        finalized: Bool = true,
-        segment: TimelineSegment
-    ) {
-        self.speakerId = slot
-        self.startFrame = startFrame
-        self.endFrame = endFrame
-        self.isFinalized = finalized
-        self.embeddings = []
-        self.segments = [segment]
     }
     
     // MARK: - Speaker Frame Range
@@ -557,28 +537,15 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
     
     // MARK: - Concatenating two embedding segments
     
-    /// Check whether this embedding segment must link with another segment.
-    /// This requires that the last segment ID in this segment is the first segment ID in `other`.
-    /// - Note: Segments can only absorb segments built after itself.
-    internal func mustLink(with other: EmbeddingSegment) -> Bool {
-        return (self.speakerId == other.speakerId &&
-                self.segments.last == other.segments.first)
-    }
-    
     /// Check if this segment must link with another segment and absorb it if so.
     /// - Parameter other: Another embedding segment
     /// - Returns: `true` if the segment was absorbed, `false` if not.
-    internal func successfullyAbsorbed(_ other: EmbeddingSegment) -> Bool {
-        guard self.mustLink(with: other) else {
-            return false
-        }
-        
+    internal func absorb(_ other: EmbeddingSegment) {
         self.startFrame = min(self.startFrame, other.startFrame)
         self.endFrame = max(self.endFrame, other.endFrame)
         self.isFinalized = self.isFinalized && other.isFinalized
         
         self.embeddings.append(contentsOf: other.embeddings)
-        self.segments.append(contentsOf: other.segments.dropFirst())
         
         // Combine IDs
         withUnsafeMutableBytes(of: &self.id) { idPtr in
@@ -591,8 +558,6 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
                 s[1] &+= o[1] &+ (overflow ? 1 : 0)
             }
         }
-        
-        return true
     }
     
     // MARK: - Centroid computation
@@ -610,7 +575,6 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
             self.centroid = SpeakerClusterCentroid(
                 id: id,
                 embedding: embeddings[0],
-                segments: segments,
                 weight: Float(embeddings[0].length),
                 isFinalized: isFinalized
             )
@@ -622,7 +586,6 @@ public class EmbeddingSegment: SpeakerFrameRange, Identifiable {
         
         let centroid = SpeakerClusterCentroid(
             id: id,
-            segments: segments,
             weight: w0 + w1,
             isFinalized: isFinalized
         )
@@ -697,13 +660,6 @@ public struct EmbeddingRequest: SortformerFrameRange, Hashable {
         return SortformerFrameRangeHelpers.overlapLength(self, other)
     }
 }
-
-public extension EmbeddingSegment {
-    var segmentIds: [UInt64] {
-        segments.map(\.id)
-    }
-}
-
 
 extension UUID {
     static var zero: UUID {

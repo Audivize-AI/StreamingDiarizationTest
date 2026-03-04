@@ -7,31 +7,20 @@
 #include <Accelerate/Accelerate.h>
 
 SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(float* buffer,
-                                                 float weight,
-                                                 bool isOutlier,
-                                                 const Segment* segments,
-                                                 long segmentCount):
+                                                 float weight):
         _vector(buffer),
-        _weight(weight),
-        _isOutlier(isOutlier),
-        _segments(segments, segments + segmentCount) {}
+        _weight(weight) {}
 
 SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(float* buffer):
         _vector(buffer) {}
 
 SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(const SpeakerEmbeddingWrapper& other):
         _vector(other._vector),
-        _weight(other._weight),
-        _isOutlier(other._isOutlier),
-        _segments(other._segments)
-{}
+        _weight(other._weight) {}
 
 SpeakerEmbeddingWrapper::SpeakerEmbeddingWrapper(SpeakerEmbeddingWrapper&& other) noexcept:
         _vector(other._vector), 
-        _weight(other._weight),
-        _isOutlier(other._isOutlier),
-        _segments(std::move(other._segments))
-{}
+        _weight(other._weight) {}
         
 float SpeakerEmbeddingWrapper::squaredDistanceTo(const SpeakerEmbeddingWrapper& other) const {
     float dist;
@@ -114,8 +103,6 @@ SpeakerEmbeddingWrapper& SpeakerEmbeddingWrapper::rescaledInPlaceToLength(float 
 void SpeakerEmbeddingWrapper::setFrom(const SpeakerEmbeddingWrapper& other) {
     if (this == &other) return;
     this->_weight = other._weight;
-    this->_isOutlier = other._isOutlier;
-    this->_segments = other._segments;
     if (this->_vector == other._vector)
         return;
     std::copy(other._vector, other._vector + dims, this->_vector);
@@ -123,8 +110,6 @@ void SpeakerEmbeddingWrapper::setFrom(const SpeakerEmbeddingWrapper& other) {
 
 void SpeakerEmbeddingWrapper::setFrom(SpeakerEmbeddingWrapper&& other) {
     this->_weight = other._weight;
-    this->_isOutlier = other._isOutlier;
-    this->_segments = std::move(other._segments);
     if (this->_vector == other._vector)
         return;
     std::copy(other._vector, other._vector + dims, this->_vector);
@@ -137,8 +122,6 @@ bool SpeakerEmbeddingWrapper::operator==(const SpeakerEmbeddingWrapper& other) c
 SpeakerEmbeddingWrapper& SpeakerEmbeddingWrapper::operator=(SpeakerEmbeddingWrapper&& other) noexcept {
     this->_vector = other._vector;
     this->_weight = other._weight;
-    this->_isOutlier = other._isOutlier;
-    this->_segments = std::move(other._segments);
     return *this;
 }
 
@@ -146,8 +129,6 @@ SpeakerEmbeddingWrapper& SpeakerEmbeddingWrapper::operator=(const SpeakerEmbeddi
     if (this == &other) return *this;
     this->_vector = other._vector;
     this->_weight = other._weight;
-    this->_isOutlier = other._isOutlier;
-    this->_segments = other._segments;
     return *this;
 }
 

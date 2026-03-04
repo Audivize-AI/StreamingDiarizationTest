@@ -56,6 +56,11 @@ protected:
     static void computeCentroidHelper(const SpeakerEmbeddingWrapper *embeddings,
                                       const Cluster &cluster,
                                       SpeakerEmbeddingWrapper& result);
+    
+public:
+    static constexpr auto computeUnitCentroid = computeCentroidHelper<NormalizeBy::l2Norm>;
+    
+    static constexpr auto computeWeightedCentroid = computeCentroidHelper<NormalizeBy::weight>;
 };
 
 class WardLinkage: public LinkagePolicy {
@@ -94,9 +99,10 @@ public:
         return a.unitCosineDistanceTo(b);
     }
 
-    inline void computeCentroid(const SpeakerEmbeddingWrapper* embeddings,
-                                const Cluster& cluster,
-                                SpeakerEmbeddingWrapper& result) const final {
+    inline void
+    computeCentroid(const SpeakerEmbeddingWrapper *embeddings,
+                    const Cluster &cluster,
+                    SpeakerEmbeddingWrapper& result) const final {
         computeCentroidHelper<NormalizeBy::weight>(embeddings, cluster, result);
     }
 };
@@ -115,9 +121,10 @@ public:
         return a.unitCosineDistanceTo(b);
     }
 
-    inline void computeCentroid(const SpeakerEmbeddingWrapper* embeddings,
-                                const Cluster& cluster,
-                                SpeakerEmbeddingWrapper& result) const final {
+    inline void
+    computeCentroid(const SpeakerEmbeddingWrapper *embeddings,
+                    const Cluster &cluster,
+                    SpeakerEmbeddingWrapper& result) const final {
         computeCentroidHelper<NormalizeBy::l2Norm>(embeddings, cluster, result);
     }
 };
@@ -136,9 +143,10 @@ public:
         return a.unitCosineDistanceTo(b);
     }
 
-    inline void computeCentroid(const SpeakerEmbeddingWrapper* embeddings,
-                                const Cluster& cluster,
-                                SpeakerEmbeddingWrapper& result) const final {
+    inline void
+    computeCentroid(const SpeakerEmbeddingWrapper *embeddings,
+                    const Cluster &cluster,
+                    SpeakerEmbeddingWrapper& result) const final {
         computeCentroidHelper<NormalizeBy::l2Norm>(embeddings, cluster, result);
     }
 };

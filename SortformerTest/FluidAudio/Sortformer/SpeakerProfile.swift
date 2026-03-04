@@ -15,24 +15,16 @@ public class SpeakerProfile: Hashable {
     public let config: ClusteringConfig
     public private(set) var finalizedClusters: [SpeakerClusterCentroid] = []
     public private(set) var tentativeClusters: [SpeakerClusterCentroid] = []
-    public private(set) var outliers: [SpeakerClusterCentroid] = []
-    
     public private(set) var finalizedSegments: [TimelineSegment] = []
     public private(set) var tentativeSegments: [TimelineSegment] = []
     
+    /// All speaker segments
     public var segments: [SpeakerSegment] {
         (finalizedSegments + tentativeSegments).map(\.speakerSegment)
     }
     
-    /// The ID of the speaker whose outliers formed this speaker profile
-    public private(set) var parent: SpeakerProfile? = nil {
-        didSet { oldValue?.children.remove(self) }
-    }
-    
-    public private(set) var children: Set<SpeakerProfile> = []
-    
     /// Set of speaker IDs with which this profile cannot link
-    public var cannotLink: Set<Int> = []
+    public private(set) var cannotLink: Set<Int> = []
     
     /// The speaker's original ID, assigned at creation. Used as a fallback
     /// when no inactive speaker profile matches.
@@ -51,7 +43,11 @@ public class SpeakerProfile: Hashable {
         }
     }
     
-    public var isFinalized: Bool = false
+    /// Whether this speaker is finalized
+    public private(set) var isFinalized: Bool = false
+    
+    /// Whether this speaker has any outliers
+    public private(set) var hasOutliers: Bool = false
     
     /// Whether this speaker has any clusters
     public var hasClusters: Bool {
@@ -61,11 +57,6 @@ public class SpeakerProfile: Hashable {
     /// Whether this speaker has any segments
     public var hasSegments: Bool {
         !(finalizedSegments.isEmpty && tentativeSegments.isEmpty)
-    }
-    
-    /// Whether this speaker has any outliers
-    public var hasOutliers: Bool {
-        !outliers.isEmpty
     }
     
     /// The combined weight of all confirmed clusters
@@ -78,28 +69,13 @@ public class SpeakerProfile: Hashable {
         tentativeClusters.reduce(0) { $0 + $1.weight }
     }
     
-    /// The combined weight of all tentative clusters
-    public var outlierWeight: Float {
-        outliers.reduce(0) { $0 + $1.weight }
-    }
-    
     public var finalizedSegmentCount: Int { finalizedSegments.count }
     public var tentativeSegmentCount: Int { tentativeSegments.count }
     public var finalizedClusterCount: Int { finalizedClusters.count }
     public var tentativeClusterCount: Int { tentativeClusters.count }
-    public var outlierCount: Int { outliers.count }
-    public var childCount: Int { children.count }
-    
-    public var finalizedOutliers: [SpeakerClusterCentroid] {
-        outliers.filter(\.isFinalized)
-    }
-    
-    public var tentativeOutliers: [SpeakerClusterCentroid] {
-        outliers.filter { !$0.isFinalized }
-    }
     
     public var isDroppable: Bool {
-        outliers.isEmpty && parent == nil && children.isEmpty
+        !hasOutliers
     }
     
     var lastActiveFrame: Int {
@@ -127,7 +103,6 @@ public class SpeakerProfile: Hashable {
     private init(
         config: ClusteringConfig,
         speakerId: Int,
-        parent: SpeakerProfile? = nil,
         finalizedSegments: [TimelineSegment],
         tentativeSegments: [TimelineSegment],
         finalizedClusters: [SpeakerClusterCentroid],
@@ -140,20 +115,14 @@ public class SpeakerProfile: Hashable {
         self.tentativeClusters = tentativeClusters
         self.finalizedSegments = finalizedSegments
         self.tentativeSegments = tentativeSegments
-        self.parent = parent
         self.speakerId = speakerId
         self.cannotLink = cannotLink
-    }
-    
-    deinit {
-        detachFromParent()
     }
     
     // MARK: - Segment Updates
     
     @inline(__always)
     public func appendFinalizedSegment(_ segment: TimelineSegment) {
-        detachFromParent() // This confirms that this speaker is new
         let newSegment = segment.reassigned(toSpeaker: speakerId)
         finalizedSegments.append(newSegment)
     }
@@ -201,7 +170,8 @@ public class SpeakerProfile: Hashable {
         newTentative: [EmbeddingSegment],
         updateOutliers: Bool = false
     ) {
-        outliers.removeAll(keepingCapacity: true)
+        hasOutliers = false
+        let updateOutliers = updateOutliers && hasClusters
         
         // Update finalized clusters
         for segment in newFinalized {
@@ -220,7 +190,7 @@ public class SpeakerProfile: Hashable {
             } else if !updateOutliers {
                 finalizedClusters.append(centroid.deepCopy())
             } else {
-                outliers.append(centroid.deepCopy())
+                hasOutliers = true
                 debugPrint("WARNING: A finalized segment was an outlier in speaker \(speakerId).")
             }
         }
@@ -256,22 +226,12 @@ public class SpeakerProfile: Hashable {
             }
             
             // Create a new cluster if we aren't checking for outliers
-            if (!updateOutliers || oldClusters.isEmpty ||
-                hasMatchingCluster(for: centroid, in: oldClusters))
-            {
+            if !updateOutliers || hasMatchingCluster(for: centroid, in: oldClusters) {
                 tentativeClusters.append(centroid.deepCopy())
                 continue
             }
             
-            // Create an outlier cluster
-            if let (cluster, distance) = findCluster(for: centroid, in: outliers) {
-                cluster.update(
-                    with: centroid,
-                    updateVector: distance <= config.updateThreshold
-                )
-            } else {
-                outliers.append(centroid.deepCopy())
-            }
+            hasOutliers = true
         }
         
         self.isFinalized = false
@@ -358,99 +318,9 @@ public class SpeakerProfile: Hashable {
         
         return (sumA / sumWeightsA + sumB / sumWeightsB) / 2
     }
-    
-    
-    /// Separate the outlier clusters speaker profile from the outlier clusters.
-    public func extractOutlierProfile(speakerId: Int, cannotLink: Set<Int> = []) -> SpeakerProfile {
-        // Collect segments
-        var outlierSegments = outliers
-            .flatMap(\.segments)
-            .map { $0.reassigned(toSpeaker: speakerId) }
-        
-        let numTentativeOutlierSegments = outlierSegments.partition(by: \.isFinalized)
-        
-        outlierSegments[0..<numTentativeOutlierSegments].sort()
-        outlierSegments[numTentativeOutlierSegments...].sort()
-        
-        var outlierTentativeSegments = Array(outlierSegments
-            .prefix(numTentativeOutlierSegments))
-        var outlierFinalizedSegments = Array(outlierSegments
-            .suffix(from: numTentativeOutlierSegments))
-        
-        for segment in outlierTentativeSegments {
-            guard let index = tentativeSegments.lastIndex(of: segment) else { continue }
-            tentativeSegments.remove(at: index)
-        }
-        
-        for segment in outlierFinalizedSegments {
-            guard let index = finalizedSegments.lastIndex(of: segment) else { continue }
-            finalizedSegments.remove(at: index)
-        }
-        
-        let result = SpeakerProfile(
-            config: self.config,
-            speakerId: speakerId,
-            parent: self,
-            finalizedSegments: outlierFinalizedSegments,
-            tentativeSegments: outlierTentativeSegments,
-            finalizedClusters: [],
-            tentativeClusters: outliers,
-            cannotLink: cannotLink
-        )
-        
-        outliers.removeAll()
-        result.parent = self
-        children.insert(result)
-        
-        return result
-    }
-    
-    @inline(__always)
-    public func detachFromParent() {
-        parent = nil
-    }
-    
-    public func returnToParent() {
-        guard let parent else { return }
-        
-        for cluster in tentativeClusters {
-            if let (existing, _) = self.findCluster(for: cluster, in: parent.tentativeClusters) {
-                existing.update(with: cluster)
-            } else {
-                parent.tentativeClusters.append(cluster)
-            }
-        }
-        
-        for cluster in finalizedClusters {
-            if let (existing, _) = self.findCluster(for: cluster, in: parent.finalizedClusters) {
-                existing.update(with: cluster)
-            } else {
-                parent.finalizedClusters.append(cluster)
-            }
-        }
-        
-        for outlier in outliers {
-            if let (cluster, _) = self.findCluster(for: outlier, in: parent.tentativeClusters) {
-                cluster.update(with: outlier)
-            } else {
-                parent.tentativeClusters.append(outlier)
-            }
-        }
-        
-        parent.mergeFinalizedSegments(of: self)
-        parent.mergeTentativeSegments(of: self)
-        
-        tentativeClusters.removeAll(keepingCapacity: true)
-        finalizedClusters.removeAll(keepingCapacity: true)
-        outliers.removeAll(keepingCapacity: true)
-        tentativeSegments.removeAll(keepingCapacity: true)
-        finalizedSegments.removeAll(keepingCapacity: true)
-        
-        self.parent = nil
-    }
-    
+
     /// Finalize the speaker
-    public func finalize(keepOutliers: Bool = false) {
+    public func finalize() {
         guard !isFinalized else { return }
         
         if !tentativeClusters.isEmpty {
@@ -465,12 +335,8 @@ public class SpeakerProfile: Hashable {
             tentativeSegments.removeAll()
         }
         
-        if !keepOutliers {
-            outliers.removeAll()
-        }
-        
+        hasOutliers = false
         isFinalized = true
-        detachFromParent()
     }
     
     public func updateCannotLink(with speakerIds: Set<Int>) {
@@ -487,16 +353,15 @@ public class SpeakerProfile: Hashable {
     /// - Parameters:
     ///   - other: The speaker to absorb
     public func absorbAndFinalize(_ other: SpeakerProfile) {
-        self.finalize(keepOutliers: true)
-        other.finalize(keepOutliers: true)
+        self.finalize()
+        other.finalize()
         other.speakerId = self.speakerId
         
         // 1. Compress clusters and outliers
         
         // Initialize and fill pair-wise distance matrix
         var matrix = EmbeddingDistanceMatrix(.upgma)
-        matrix.reserve(self.finalizedClusterCount + other.finalizedClusterCount +
-                       self.outlierCount + other.outlierCount)
+        matrix.reserve(self.finalizedClusterCount + other.finalizedClusterCount)
         
         for cluster in self.finalizedClusters {
             matrix.append(cluster.cppView)
@@ -504,80 +369,37 @@ public class SpeakerProfile: Hashable {
         for cluster in other.finalizedClusters {
             matrix.append(cluster.cppView)
         }
-        for outlier in self.outliers {
-            matrix.append(outlier.cppOutlierView)
-        }
-        for outlier in other.outliers {
-            matrix.append(outlier.cppOutlierView)
-        }
         
         // Extract clusters
         let dendrogram = matrix.dendrogram()
         let clusters = dendrogram.extractClusters(config.clusteringThreshold)
         
-        var newClusters: [SpeakerClusterCentroid] = []
-        var newOutliers: [SpeakerClusterCentroid] = []
-        newClusters.reserveCapacity(clusters.count)
-        newOutliers.reserveCapacity(clusters.count)
-        
-        for cluster in clusters {
-            var isOutlier: Bool = false
-            let centroid = SpeakerClusterCentroid(
+        let newClusterCentroids = clusters.map { cluster in
+            SpeakerClusterCentroid(
                 cluster: cluster,
                 dendrogram: dendrogram,
                 matrix: matrix,
-                isFinalized: true,
-                isOutlierResult: &isOutlier
+                isFinalized: true
             )
-            if isOutlier {
-                newOutliers.append(centroid)
-            } else {
-                newClusters.append(centroid)
-            }
         }
         
         // Free the matrix so its embeddings don't become dangling pointers
         matrix.free()
         
-        self.finalizedClusters = newClusters
-        self.outliers = newOutliers
+        self.finalizedClusters = newClusterCentroids
         
         // 2. Update segments
-        self.mergeFinalizedSegments(of: other)
+        if !other.finalizedSegments.isEmpty {
+            let wasEmpty = finalizedSegments.isEmpty
+            finalizedSegments.append(contentsOf: other.finalizedSegments)
+            if !wasEmpty { finalizedSegments.sort() }
+        }
         
         // 3. Inherit cannot-link constraints
         self.cannotLink.formUnion(other.cannotLink)
         self.cannotLink.remove(speakerId)
     }
     
-    private func mergeFinalizedSegments(of other: SpeakerProfile) {
-        guard !other.finalizedSegments.isEmpty else { return }
-        let wasEmpty = finalizedSegments.isEmpty
-        
-        if self.speakerId == other.speakerId {
-            finalizedSegments.append(contentsOf: other.finalizedSegments)
-        } else {
-            finalizedSegments.append(contentsOf:
-                other.finalizedSegments.map { $0.reassigned(toSpeaker: self.speakerId) })
-        }
-        
-        if !wasEmpty {
-            self.finalizedSegments.sort()
-        }
-    }
-    
-    private func mergeTentativeSegments(of other: SpeakerProfile) {
-        guard !other.tentativeSegments.isEmpty else { return }
-        
-        if self.speakerId == other.speakerId {
-            tentativeSegments.append(contentsOf: other.tentativeSegments)
-        } else {
-            let newSegments = other.tentativeSegments.map {
-                $0.reassigned(toSpeaker: self.speakerId)
-            }
-            tentativeSegments.append(contentsOf: newSegments)
-        }
-    }
     
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -592,29 +414,28 @@ public class SpeakerClusterCentroid: EmbeddingVector {
     public var id: UUID { embedding.id }
     public let embedding: SpeakerEmbedding
     public var weight: Float
-    public var segments: [TimelineSegment]
     public var isFinalized: Bool
     
     public var bufferView: UnsafeBufferPointer<Float> { embedding.bufferView }
     public var buffer: UnsafeBufferPointer<Float> { embedding.bufferView }
     public var baseAddress: UnsafePointer<Float>? { embedding.baseAddress }
     public var magnitude: Float { embedding.magnitude }
-    public var segmentIds: [UInt64] { segments.map(\.id) }
     
-    @inline(__always)
-    public var cppView: SpeakerEmbeddingWrapper { cppWrapper(isOutlier: false) }
-    
-    @inline(__always)
-    public var cppOutlierView: SpeakerEmbeddingWrapper { cppWrapper(isOutlier: true) }
+    var cppView: SpeakerEmbeddingWrapper {
+        embedding.withUnsafeMutableBufferPointer { embeddingBuf in
+            SpeakerEmbeddingWrapper.init(
+                embeddingBuf.baseAddress,
+                weight
+            )
+        }
+    }
     
     public init(
         id: UUID = UUID(),
-        segments: [TimelineSegment] = [],
         weight: Float,
         isFinalized: Bool = true
     ) {
         self.embedding = SpeakerEmbedding(id: id, startFrame: 0, endFrame: 0)
-        self.segments = segments
         self.isFinalized = isFinalized
         self.weight = weight
     }
@@ -622,13 +443,11 @@ public class SpeakerClusterCentroid: EmbeddingVector {
     public init(
         id: UUID = UUID(),
         embedding: SpeakerEmbedding,
-        segments: [TimelineSegment] = [],
         weight: Float,
         isFinalized: Bool = true
     ) {
         // Create a deep copy of the embedding
         self.embedding = SpeakerEmbedding(id: id, embedding: embedding.bufferView, startFrame: embedding.startFrame, endFrame: embedding.endFrame)
-        self.segments = segments
         self.isFinalized = isFinalized
         self.weight = weight
     }
@@ -637,35 +456,21 @@ public class SpeakerClusterCentroid: EmbeddingVector {
         cluster: Cluster,
         dendrogram: borrowing Dendrogram,
         matrix: borrowing EmbeddingDistanceMatrix,
-        isFinalized: Bool = true,
-        isOutlierResult: inout Bool
+        isFinalized: Bool = true
     ) {
         self.weight = cluster.weight()
         self.embedding = SpeakerEmbedding(startFrame: 0, endFrame: 0)
         self.isFinalized = isFinalized
         
-        var embeddingView = embedding.withUnsafeMutableBufferPointer { embeddingBuf in
-            SpeakerEmbeddingWrapper(embeddingBuf.baseAddress)
+        embedding.withUnsafeMutableBufferPointer { embeddingBuf in
+            var embeddingView = SpeakerEmbeddingWrapper(embeddingBuf.baseAddress)
+            matrix.computeUnitCentroidOf(cluster, &embeddingView)
         }
         
-        matrix.computeClusterCentroid(cluster, &embeddingView)
-        
-        // Copy segments
-        let segmentCount: Int = embeddingView.segmentCount()
-        self.segments = Array(unsafeUninitializedCapacity: segmentCount) { buffer, count in
-            embeddingView.segments().withContiguousStorageIfAvailable { segmentsBuf in
-                segmentsBuf.withMemoryRebound(to: TimelineSegment.self) { srcBuf in
-                    _ = buffer.initialize(fromContentsOf: srcBuf)
-                }
-            }
-            count = segmentCount
-        }
-        
-        isOutlierResult = embeddingView.isOutlier()
+        embedding.setMagnitudeUnsafe(to: 1.0)
     }
     
     public func update(with centroid: SpeakerClusterCentroid, updateVector: Bool = true) {
-        self.segments.append(contentsOf: centroid.segments)
         self.weight += centroid.weight
         
         if updateVector {
@@ -698,7 +503,6 @@ public class SpeakerClusterCentroid: EmbeddingVector {
             _ = muPtr.initialize(fromContentsOf: other.embedding.bufferView)
         }
         self.weight = other.weight
-        self.segments = other.segments
         self.isFinalized = other.isFinalized
     }
     
@@ -707,7 +511,6 @@ public class SpeakerClusterCentroid: EmbeddingVector {
         SpeakerClusterCentroid(
             id: keepingId ? self.id : UUID(),
             embedding: self.embedding,
-            segments: self.segments,
             weight: self.weight,
             isFinalized: self.isFinalized
         )
@@ -735,21 +538,5 @@ public class SpeakerClusterCentroid: EmbeddingVector {
     
     public func hash(into hasher: inout Hasher) {
         hasher.combine(self.id)
-    }
-    
-    private func cppWrapper(isOutlier: Bool) -> SpeakerEmbeddingWrapper {
-        embedding.withUnsafeMutableBufferPointer { embeddingBuf in
-            segments.withUnsafeBufferPointer { segmentsBuf in
-                segmentsBuf.withMemoryRebound(to: UInt64.self) { segmentsBuf in
-                    SpeakerEmbeddingWrapper.init(
-                        embeddingBuf.baseAddress,
-                        weight,
-                        isOutlier,
-                        segmentsBuf.baseAddress,
-                        segmentsBuf.count
-                    )
-                }
-            }
-        }
     }
 }

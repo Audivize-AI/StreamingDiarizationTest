@@ -5,8 +5,6 @@ import OrderedCollections
 
 /// Complete diarization timeline managing streaming predictions and segments
 public class SortformerTimeline {
-//    typealias SegmentID = UInt64
-    
     private struct StreamingState {
         var starts: [Int]
         var isSpeaking: [Bool]
@@ -293,10 +291,6 @@ public class SortformerTimeline {
             segments.removeAll(where: { $0.speakerId == slot })
             for segment in segments where segment.speakerId > slot {
                 segment.speakerId -= 1
-                
-                for i in segment.segments.indices {
-                    segment.segments[i].speakerId -= 1
-                }
             }
         }
         
@@ -453,7 +447,7 @@ public class SortformerTimeline {
         
         var currentEmbeddingSegment: EmbeddingSegment = .none
         
-        // Add additional finalized segments
+        // Add any finalized segments used in previous tentative embedding segments
         var segments = segments
         if let firstTentative = tentativeEmbeddingSegments.first,
            firstTentative.isValid,
@@ -499,16 +493,7 @@ public class SortformerTimeline {
             ($0.frame == $1.frame && !$0.isStart)
         }
         
-        func initializeLastCentroid(
-            in segments: inout [EmbeddingSegment],
-            withCache centroidCache: [UUID : SpeakerClusterCentroid]
-        ) {
-            guard let lastSegment = segments.last else { return }
-            lastSegment.initializeCentroid(withCache: centroidCache)
-            if lastSegment.centroid == nil { segments.removeLast() }
-        }
-        
-        func appendSegment(_ segment: EmbeddingSegment) throws {
+        func appendSegment(_ segment: EmbeddingSegment, mustLink: Bool) throws {
             guard segment.isValid else { return }
             
             // Add embeddings to the segment. It can't be updated anymore.
@@ -519,17 +504,33 @@ public class SortformerTimeline {
             
             guard !segment.embeddings.isEmpty else { return }
             
-            // Append the embedding segment
-            if segment.isFinalized {
-                if embeddingSegments.last?.successfullyAbsorbed(segment) != true {
-                    initializeLastCentroid(in: &embeddingSegments,
-                                           withCache: centroidCache)
-                    embeddingSegments.append(segment)
+            func appendInitializedSegment(
+                _ segment: EmbeddingSegment,
+                to segments: inout [EmbeddingSegment],
+                mustLink: Bool
+            ) {
+                guard let lastSegment = segments.last else {
+                    segments.append(segment)
+                    return
                 }
-            } else if tentativeEmbeddingSegments.last?.successfullyAbsorbed(segment) != true {
-                initializeLastCentroid(in: &tentativeEmbeddingSegments,
-                                       withCache: centroidCache)
-                tentativeEmbeddingSegments.append(segment)
+                
+                guard !mustLink else {
+                    lastSegment.absorb(segment)
+                    return
+                }
+                
+                lastSegment.initializeCentroid(withCache: centroidCache)
+                segments.append(segment)
+            }
+            
+            if segment.isFinalized {
+                appendInitializedSegment(segment,
+                                         to: &embeddingSegments,
+                                         mustLink: mustLink)
+            } else {
+                appendInitializedSegment(segment,
+                                         to: &tentativeEmbeddingSegments,
+                                         mustLink: mustLink)
             }
         }
         
@@ -539,6 +540,10 @@ public class SortformerTimeline {
         var startFrame = firstBoundaryFrame.frame
         
         var activeSegments = [firstSegment.speakerId : firstSegment]
+        
+        var lastTimelineSegment: TimelineSegment = 0
+        var currentTimelineSegment: TimelineSegment = firstSegment
+        var mustLink: Bool { lastTimelineSegment == currentTimelineSegment }
         
         for (frame, isStart, segment) in boundaryFrames {
             // If exactly one speaker was active, this interval is a single-speaker segment
@@ -557,20 +562,19 @@ public class SortformerTimeline {
                     if !isFinalized {
                         currentEmbeddingSegment.isFinalized = false
                     }
-                    if currentEmbeddingSegment.segments.last != activeSegment {
-                        currentEmbeddingSegment.segments.append(activeSegment)
-                    }
+                    currentTimelineSegment = activeSegment
                 } else {
-                    try appendSegment(currentEmbeddingSegment)
+                    try appendSegment(currentEmbeddingSegment, mustLink: mustLink)
+                    lastTimelineSegment = currentTimelineSegment
                     
                     // Make a new segment
                     currentEmbeddingSegment = EmbeddingSegment(
                         slot: activeSegment.speakerId,
                         startFrame: startFrame,
                         endFrame: frame,
-                        finalized: activeSegment.isFinalized && isFinalized,
-                        segment: activeSegment
+                        finalized: activeSegment.isFinalized && isFinalized
                     )
+                    currentTimelineSegment = activeSegment
                 }
             }
             
@@ -579,11 +583,11 @@ public class SortformerTimeline {
             activeSegments[segment.speakerId] = isStart ? segment : nil
         }
         
-        // Initialize embeddings for the remaining active segment
-        try appendSegment(currentEmbeddingSegment)
+        // Append the final embedding segment
+        try appendSegment(currentEmbeddingSegment, mustLink: mustLink)
         
-        initializeLastCentroid(in: &embeddingSegments, withCache: centroidCache)
-        initializeLastCentroid(in: &tentativeEmbeddingSegments, withCache: centroidCache)
+        embeddingSegments.last?.initializeCentroid(withCache: centroidCache)
+        tentativeEmbeddingSegments.last?.initializeCentroid(withCache: centroidCache)
         
         // Clean up spare embeddings
         if dropEmbeddingFrames {

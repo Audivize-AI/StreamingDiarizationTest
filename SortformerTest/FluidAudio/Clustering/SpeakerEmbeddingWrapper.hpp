@@ -21,15 +21,8 @@ public:
      * @brief Construct a new SpeakerEmbedding
      * @param buffer Pointer to the embedding vector's buffer
      * @param weight Speaker embedding weight. Used as a metric of embedding quality
-     * @param isOutlier Whether this embedding represents an outlier
-     * @param segments Pointer to the start of the segments array
-     * @param segmentCount Number of segments that this embedding owns
      */
-    explicit SpeakerEmbeddingWrapper(float* buffer,
-                                     float weight,
-                                     bool isOutlier,
-                                     const Segment* segments,
-                                     long segmentCount);
+    explicit SpeakerEmbeddingWrapper(float* buffer, float weight);
     
     /**
      * @brief Construct a new SpeakerEmbedding
@@ -88,27 +81,8 @@ public:
     // Get weight reference
     [[nodiscard]] inline float& weight() { return _weight; }
     
-    // Whether this represents an outlier embedding
-    [[nodiscard]] inline bool isOutlier() const { return _isOutlier; }
-    
-    // Get reference to outlier flag
-    [[nodiscard]] inline bool& isOutlier() { return _isOutlier; }
-    
     // Get raw pointer to the embedding vector
     [[nodiscard]] inline float* vector() const { return _vector; }
-    
-    // Get segment count
-    [[nodiscard]] inline long segmentCount() const {
-        return static_cast<long>(_segments.size());
-    }
-    
-    // Get segments
-    [[nodiscard]] inline std::span<const Segment> segments() const {
-        return { _segments.begin(), _segments.end() };
-    }
-    
-    // Get reference to segments
-    [[nodiscard]] inline std::vector<Segment>& segments() { return _segments; }
     
     // Embedding vector norm
     [[nodiscard]] float norm() const;
@@ -136,8 +110,6 @@ public:
     SpeakerEmbeddingWrapper& operator/=(float scalar);
 
 protected:
-    std::vector<Segment> _segments{};
     float* _vector = nullptr;
     float _weight = 0.f;
-    bool _isOutlier = false;
 };

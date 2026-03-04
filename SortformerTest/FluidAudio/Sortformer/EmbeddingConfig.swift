@@ -53,7 +53,7 @@ public struct EmbeddingConfig {
     public init(
         modelVariant: TitaNetVariant = .large2_48s,
         minFramesOn: Int = 12,
-        minFramesOff: Int = 3,
+        minFramesOff: Int = 1,
         maxFramesSkipped: Int = 6,
         maxOutsideFrames: Int = 2,
     ) {

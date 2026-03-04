@@ -50,15 +50,41 @@ public:
     }
     
     /**
-     * @brief Compute the centroid of a cluster
+     * @brief Compute the centroid of a cluster according to the linkage policy
      * @param cluster The cluster from the dendrogram
      * @param result The `SpeakerEmbeddingWrapper` object in which the result should be stored
      * @returns True if successful, false if not.
      */
-    inline bool computeClusterCentroid(const Cluster& cluster,
-                                       SpeakerEmbeddingWrapper& result) const {
+    inline bool computeCentroidOf(const Cluster& cluster,
+                                  SpeakerEmbeddingWrapper& result) const {
         if (_embeddings == nullptr) return false;
         _linkagePolicy->computeCentroid(_embeddings, cluster, result);
+        return true;
+    }
+    
+    /**
+     * @brief Compute the L2 normalized centroid of a cluster
+     * @param cluster The cluster from the dendrogram
+     * @param result The `SpeakerEmbeddingWrapper` object in which the result should be stored
+     * @returns True if successful, false if not.
+     */
+    inline bool computeUnitCentroidOf(const Cluster& cluster,
+                                      SpeakerEmbeddingWrapper& result) const {
+        if (_embeddings == nullptr) return false;
+        LinkagePolicy::computeUnitCentroid(_embeddings, cluster, result);
+        return true;
+    }
+    
+    /**
+     * @brief Compute the weighted centroid of a cluster
+     * @param cluster The cluster from the dendrogram
+     * @param result The `SpeakerEmbeddingWrapper` object in which the result should be stored
+     * @returns True if successful, false if not.
+     */
+    inline bool computeWeightedCentroidOf(const Cluster& cluster,
+                                          SpeakerEmbeddingWrapper& result) const {
+        if (_embeddings == nullptr) return false;
+        LinkagePolicy::computeWeightedCentroid(_embeddings, cluster, result);
         return true;
     }
     
