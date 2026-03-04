@@ -173,31 +173,37 @@ public class SpeakerProfile: Hashable {
         hasOutliers = false
         let updateOutliers = updateOutliers && hasClusters
         
-        // Update finalized clusters
-        for segment in newFinalized {
-            guard let centroid = segment.centroid else {
-                debugPrint("Some idiot forgot to initialize the finalized centroids " +
-                           "before streaming the segments to the speaker profile")
-                continue
-            }
-            
-            // Find the best match
-            if let (cluster, distance) = findCluster(for: centroid, in: finalizedClusters) {
-                cluster.update(
-                    with: centroid,
-                    updateVector: distance <= config.updateThreshold
-                )
-            } else if !updateOutliers {
-                finalizedClusters.append(centroid.deepCopy())
-            } else {
-                hasOutliers = true
-                debugPrint("WARNING: A finalized segment was an outlier in speaker \(speakerId).")
+        func update(
+            clusters: inout [SpeakerClusterCentroid],
+            with segments: [EmbeddingSegment],
+            oldClusters: borrowing [SpeakerClusterCentroid]
+        ) {
+            for segment in segments {
+                guard let centroid = segment.centroid else { continue }
+                
+                // Find the best match
+                if let (cluster, distance) = findCluster(for: centroid, in: clusters) {
+                    cluster.update(
+                        with: centroid,
+                        updateVector: distance <= config.updateThreshold
+                    )
+                } else if !updateOutliers || hasMatchingCluster(for: centroid, in: oldClusters) {
+                    finalizedClusters.append(centroid.deepCopy())
+                } else {
+                    hasOutliers = true
+                    debugPrint("There was an outlier in speaker \(speakerId).")
+                }
             }
         }
         
-        // Initialize tentative clusters
-        let oldClusters: [SpeakerClusterCentroid]
+        // Update finalized clusters
+        var oldClusters = finalizedClusters.isEmpty ? tentativeClusters : []
+
+        update(clusters: &finalizedClusters,
+               with: newFinalized,
+               oldClusters: oldClusters)
         
+        // Update tentative clusters
         if finalizedClusters.isEmpty {
             oldClusters = tentativeClusters
             tentativeClusters.removeAll(keepingCapacity: true)
@@ -207,32 +213,10 @@ public class SpeakerProfile: Hashable {
                 $0.deepCopy(keepingId: true)
             }
         }
-            
-        // Update tentative clusters
-        for segment in newTentative {
-            guard let centroid = segment.centroid else {
-                debugPrint("Some idiot forgot to initialize the tentative centroids " +
-                           "before streaming the segments to the speaker profile")
-                continue
-            }
-            
-            // Find the best match
-            if let (cluster, distance) = findCluster(for: centroid, in: tentativeClusters) {
-                cluster.update(
-                    with: centroid,
-                    updateVector: distance <= config.updateThreshold
-                )
-                continue
-            }
-            
-            // Create a new cluster if we aren't checking for outliers
-            if !updateOutliers || hasMatchingCluster(for: centroid, in: oldClusters) {
-                tentativeClusters.append(centroid.deepCopy())
-                continue
-            }
-            
-            hasOutliers = true
-        }
+        
+        update(clusters: &tentativeClusters,
+               with: newFinalized,
+               oldClusters: oldClusters)
         
         self.isFinalized = false
     }
@@ -243,7 +227,7 @@ public class SpeakerProfile: Hashable {
         maxDistance: Float? = nil
     ) -> (cluster: SpeakerClusterCentroid, distance: Float)?
     where E: EmbeddingVector {
-        if clusters.isEmpty { return nil }
+        guard !clusters.isEmpty else { return nil }
         
         var bestDistance = (maxDistance ?? config.clusteringThreshold).nextUp
         var bestCluster: SpeakerClusterCentroid? = nil
@@ -265,7 +249,8 @@ public class SpeakerProfile: Hashable {
         for embedding: E,
         in clusters: [SpeakerClusterCentroid],
         maxDistance: Float? = nil
-    ) -> Bool where E: EmbeddingVector{
+    ) -> Bool where E: EmbeddingVector {
+        guard !clusters.isEmpty else { return false }
         let threshold = maxDistance ?? config.clusteringThreshold
         return clusters.contains {
             $0.cosineDistance(to: embedding) <= threshold
