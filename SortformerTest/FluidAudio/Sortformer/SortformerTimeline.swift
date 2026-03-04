@@ -288,7 +288,7 @@ public class SortformerTimeline {
         }
         
         func shiftEmbeddingSegments(in segments: inout [EmbeddingSegment], after slot: Int) {
-            segments.removeAll(where: { $0.speakerId == slot })
+            segments.removeAll { $0.speakerId == slot }
             for segment in segments where segment.speakerId > slot {
                 segment.speakerId -= 1
             }
@@ -493,7 +493,7 @@ public class SortformerTimeline {
             ($0.frame == $1.frame && !$0.isStart)
         }
         
-        func appendSegment(_ segment: EmbeddingSegment, mustLink: Bool) throws {
+        func appendSegment(_ segment: EmbeddingSegment, isSameSegment: Bool) throws {
             guard segment.isValid else { return }
             
             // Add embeddings to the segment. It can't be updated anymore.
@@ -507,14 +507,14 @@ public class SortformerTimeline {
             func appendInitializedSegment(
                 _ segment: EmbeddingSegment,
                 to segments: inout [EmbeddingSegment],
-                mustLink: Bool
+                isSameSegment: Bool
             ) {
                 guard let lastSegment = segments.last else {
                     segments.append(segment)
                     return
                 }
                 
-                guard !mustLink else {
+                guard !(isSameSegment && lastSegment.speakerId == segment.speakerId) else {
                     lastSegment.absorb(segment)
                     return
                 }
@@ -524,13 +524,9 @@ public class SortformerTimeline {
             }
             
             if segment.isFinalized {
-                appendInitializedSegment(segment,
-                                         to: &embeddingSegments,
-                                         mustLink: mustLink)
+                appendInitializedSegment(segment, to: &embeddingSegments, isSameSegment: isSameSegment)
             } else {
-                appendInitializedSegment(segment,
-                                         to: &tentativeEmbeddingSegments,
-                                         mustLink: mustLink)
+                appendInitializedSegment(segment, to: &tentativeEmbeddingSegments, isSameSegment: isSameSegment)
             }
         }
         
@@ -543,7 +539,10 @@ public class SortformerTimeline {
         
         var lastTimelineSegment: TimelineSegment = 0
         var currentTimelineSegment: TimelineSegment = firstSegment
-        var mustLink: Bool { lastTimelineSegment == currentTimelineSegment }
+        
+        var isSameSegment: Bool {
+            lastTimelineSegment.speakerSegment == currentTimelineSegment.speakerSegment
+        }
         
         for (frame, isStart, segment) in boundaryFrames {
             // If exactly one speaker was active, this interval is a single-speaker segment
@@ -564,8 +563,10 @@ public class SortformerTimeline {
                     }
                     currentTimelineSegment = activeSegment
                 } else {
-                    try appendSegment(currentEmbeddingSegment, mustLink: mustLink)
-                    lastTimelineSegment = currentTimelineSegment
+                    if currentEmbeddingSegment.isValid {
+                        try appendSegment(currentEmbeddingSegment, isSameSegment: isSameSegment)
+                        lastTimelineSegment = currentTimelineSegment
+                    }
                     
                     // Make a new segment
                     currentEmbeddingSegment = EmbeddingSegment(
@@ -584,7 +585,7 @@ public class SortformerTimeline {
         }
         
         // Append the final embedding segment
-        try appendSegment(currentEmbeddingSegment, mustLink: mustLink)
+        try appendSegment(currentEmbeddingSegment, isSameSegment: isSameSegment)
         
         embeddingSegments.last?.initializeCentroid(withCache: centroidCache)
         tentativeEmbeddingSegments.last?.initializeCentroid(withCache: centroidCache)
@@ -621,15 +622,6 @@ public class SortformerTimeline {
         
         for _ in 0..<config.numSpeakers {
             speakers.finalizeAll()
-//            for j in 0..<tentativeSegments[i].count {
-//                tentativeSegments[i][j].isFinalized = true
-//            }
-//            segments[i].append(contentsOf: tentativeSegments[i])
-//            tentativeSegments[i].removeAll()
-//            
-//            if let lastSegment = segments[i].last, lastSegment.length < config.minFramesOn {
-//                segments[i].removeLast()
-//            }
         }
         
         // Finalize tentative embedding segments
