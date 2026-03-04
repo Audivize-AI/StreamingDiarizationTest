@@ -66,13 +66,6 @@ final class DiarizerViewModel: ObservableObject {
     private var processingTask: Task<Void, Never>?
     private var audioPlayer: AVAudioPlayer?
     private var audioConverter: AudioConverter
-    private let clusteringConfig = ClusteringConfig(clusteringThreshold: 0.25)
-    private var speakerProfile: SpeakerProfile
-    private var streamedFinalizedEmbeddingSegmentCount = 0
-    private var streamedFinalizedTailSignature = FinalizedEmbeddingTailSignature.empty
-    // Keep replay traffic bounded so replay/incremental catch-up cannot explode memory.
-    private let clusterMaxFinalizedReplaySegments = 3000
-    private let clusterMaxTentativeReplaySegments = 1500
     // Keep live updates responsive while recording.
     private let streamingPCARefreshInterval: TimeInterval = 0.2
     private let streamingPCAPointLimit = 900
@@ -91,22 +84,6 @@ final class DiarizerViewModel: ObservableObject {
         let speakerHistogram: [Int: Int]
     }
 
-    private struct FinalizedEmbeddingTailSignature: Equatable {
-        let count: Int
-        let lastID: UUID?
-        let lastSlot: Int
-        let lastStartFrame: Int
-        let lastEndFrame: Int
-
-        static let empty = FinalizedEmbeddingTailSignature(
-            count: 0,
-            lastID: nil,
-            lastSlot: -1,
-            lastStartFrame: -1,
-            lastEndFrame: -1
-        )
-    }
-    
     private let sampleRate: Double = 16000.0
     
     // Audio buffer for accumulating samples between processing
@@ -117,7 +94,6 @@ final class DiarizerViewModel: ObservableObject {
     
     init() {
         self.audioConverter = AudioConverter()
-        self.speakerProfile = SpeakerProfile(config: clusteringConfig, speakerIndex: 0)
         Task {
             await loadModels()
         }
@@ -502,10 +478,11 @@ final class DiarizerViewModel: ObservableObject {
     private func processingLoop() async {
         while !Task.isCancelled {
             // Get samples from buffer
-            audioBufferLock.lock()
-            let samples = audioBuffer
-            audioBuffer = []
-            audioBufferLock.unlock()
+            let samples = audioBufferLock.withLock {
+                let result = audioBuffer
+                audioBuffer = []
+                return result
+            }
             
             if !samples.isEmpty {
                 await processAudioChunk(samples)
@@ -543,9 +520,6 @@ final class DiarizerViewModel: ObservableObject {
 
     private func resetClusterState() {
         cancelPendingPCAWork()
-        speakerProfile = SpeakerProfile(config: clusteringConfig, speakerIndex: 0)
-        streamedFinalizedEmbeddingSegmentCount = 0
-        streamedFinalizedTailSignature = .empty
         lastStreamingPCARefreshTime = 0
         segmentCentroidDistances = [:]
         embeddingSegmentCentroidDistances = [:]
@@ -555,64 +529,18 @@ final class DiarizerViewModel: ObservableObject {
     private func updateClusterVisualization(forcePlotRefresh: Bool = false) {
         guard let tl = timeline else {
             cancelPendingPCAWork()
-            streamedFinalizedEmbeddingSegmentCount = 0
-            streamedFinalizedTailSignature = .empty
             segmentCentroidDistances = [:]
             embeddingSegmentCentroidDistances = [:]
             kmeansPCAPlotModel = .empty
             return
         }
 
-        let currentFinalizedTailSignature = finalizedTailSignature(for: tl.embeddingSegments)
-        if tl.embeddingSegments.count < streamedFinalizedEmbeddingSegmentCount {
-            _ = replayFullClusterState(from: tl, forcePlotRefresh: forcePlotRefresh)
-            return
-        }
-
-        let pendingFinalizedCount = tl.embeddingSegments.count - streamedFinalizedEmbeddingSegmentCount
-        if pendingFinalizedCount > clusterMaxFinalizedReplaySegments {
-            print("[Dendrogram] Backlog too large (\(pendingFinalizedCount)); replaying capped window")
-            _ = replayFullClusterState(from: tl, forcePlotRefresh: forcePlotRefresh)
-            return
-        }
-
-        // A finalized segment can be extended/absorbed in place without increasing count.
-        // In that case incremental-by-count misses updates, so replay the capped window.
-        if pendingFinalizedCount == 0 && currentFinalizedTailSignature != streamedFinalizedTailSignature {
-            _ = replayFullClusterState(from: tl, forcePlotRefresh: forcePlotRefresh)
-            return
-        }
-
-        let newFinalized = Array(tl.embeddingSegments.dropFirst(streamedFinalizedEmbeddingSegmentCount))
-        let tentativeWindow = Array(tl.tentativeEmbeddingSegments.suffix(clusterMaxTentativeReplaySegments))
-        speakerProfile.stream(newFinalized: newFinalized, newTentative: tentativeWindow, updateOutliers: true)
-        streamedFinalizedEmbeddingSegmentCount = tl.embeddingSegments.count
-        streamedFinalizedTailSignature = currentFinalizedTailSignature
-
-        let distanceMaps = makeDistanceMaps(from: speakerProfile, timeline: tl)
+        let distanceMaps = makeDistanceMaps(from: tl)
         segmentCentroidDistances = distanceMaps.bySegmentID
         embeddingSegmentCentroidDistances = distanceMaps.byEmbeddingSegmentID
         if shouldRefreshPCAPlot(force: forcePlotRefresh) {
             schedulePCAPlotRefresh(from: tl)
         }
-    }
-
-    @discardableResult
-    private func replayFullClusterState(from timeline: SortformerTimeline, forcePlotRefresh: Bool = false) -> Bool {
-        speakerProfile = SpeakerProfile(config: clusteringConfig, speakerIndex: 0)
-        let finalizedWindow = timeline.embeddingSegments
-        let tentativeWindow = timeline.tentativeEmbeddingSegments
-        speakerProfile.stream(newFinalized: finalizedWindow, newTentative: tentativeWindow, updateOutliers: true)
-        print("[Dendrogram] Full replay succeeded (\(timeline.embeddingSegments.count) finalized segments)")
-        streamedFinalizedEmbeddingSegmentCount = timeline.embeddingSegments.count
-        streamedFinalizedTailSignature = finalizedTailSignature(for: timeline.embeddingSegments)
-        let distanceMaps = makeDistanceMaps(from: speakerProfile, timeline: timeline)
-        segmentCentroidDistances = distanceMaps.bySegmentID
-        embeddingSegmentCentroidDistances = distanceMaps.byEmbeddingSegmentID
-        if shouldRefreshPCAPlot(force: forcePlotRefresh) {
-            schedulePCAPlotRefresh(from: timeline)
-        }
-        return true
     }
 
     private func shouldRefreshPCAPlot(force: Bool) -> Bool {
@@ -628,46 +556,46 @@ final class DiarizerViewModel: ObservableObject {
         return false
     }
 
-    private func finalizedTailSignature(for segments: [EmbeddingSegment]) -> FinalizedEmbeddingTailSignature {
-        guard let last = segments.last else {
-            return .empty
-        }
-        return FinalizedEmbeddingTailSignature(
-            count: segments.count,
-            lastID: last.id,
-            lastSlot: last.speakerId,
-            lastStartFrame: last.startFrame,
-            lastEndFrame: last.endFrame
-        )
-    }
-
-
-    private func visualizationCentroids(from profile: SpeakerProfile) -> [SpeakerClusterCentroid] {
-        let tentative = profile.tentativeClusters
-        if !tentative.isEmpty {
-            return tentative
-        }
-        let finalized = profile.finalizedClusters
-        if !finalized.isEmpty {
-            return finalized
-        }
-        return []
-    }
 
     private func makeDistanceMaps(
-        from profile: SpeakerProfile,
-        timeline: SortformerTimeline
+        from timeline: SortformerTimeline
     ) -> (bySegmentID: [UInt64: Float], byEmbeddingSegmentID: [UUID: Float]) {
-        let clusters = visualizationCentroids(from: profile)
-        guard !clusters.isEmpty else {
-            return ([:], [:])
+        let activeProfilesBySlot = timeline.activeSpeakers
+        let sortedActive = activeProfilesBySlot.keys.sorted()
+
+        func profileCentroids(_ profile: SpeakerProfile) -> [SpeakerClusterCentroid] {
+            if !profile.tentativeClusters.isEmpty {
+                return profile.tentativeClusters
+            }
+            return profile.finalizedClusters
         }
 
-        let clusterVectors: [[Float]] = clusters.compactMap { centroid in
-            let vector = normalizedVector(Array(centroid.buffer))
-            return vector.isEmpty ? nil : vector
+        var clustersBySlot: [Int: [[Float]]] = [:]
+        var allClusterVectors: [[Float]] = []
+        for slot in sortedActive {
+            guard let profile = activeProfilesBySlot[slot] else { continue }
+            let vectors = profileCentroids(profile).compactMap { centroid -> [Float]? in
+                let vector = normalizedVector(Array(centroid.buffer))
+                return vector.isEmpty ? nil : vector
+            }
+            if !vectors.isEmpty {
+                clustersBySlot[slot] = vectors
+                allClusterVectors.append(contentsOf: vectors)
+            }
         }
-        guard !clusterVectors.isEmpty else {
+
+        // Fallback: if no active centroids are available, use inactive profiles.
+        if allClusterVectors.isEmpty {
+            for profile in timeline.inactiveSpeakers {
+                let vectors = profileCentroids(profile).compactMap { centroid -> [Float]? in
+                    let vector = normalizedVector(Array(centroid.buffer))
+                    return vector.isEmpty ? nil : vector
+                }
+                allClusterVectors.append(contentsOf: vectors)
+            }
+        }
+
+        guard !allClusterVectors.isEmpty else {
             return ([:], [:])
         }
 
@@ -689,8 +617,9 @@ final class DiarizerViewModel: ObservableObject {
                 continue
             }
 
+            let candidateClusterVectors = clustersBySlot[embeddingSegment.speakerId] ?? allClusterVectors
             var bestDistance = Float.greatestFiniteMagnitude
-            for clusterVector in clusterVectors {
+            for clusterVector in candidateClusterVectors {
                 bestDistance = min(bestDistance, cosineDistance(segmentVector, clusterVector))
             }
             guard bestDistance.isFinite else {
