@@ -188,7 +188,7 @@ public class SpeakerProfile: Hashable {
                         updateVector: distance <= config.updateThreshold
                     )
                 } else if !updateOutliers || hasMatchingCluster(for: centroid, in: oldClusters) {
-                    finalizedClusters.append(centroid.deepCopy())
+                    clusters.append(centroid.deepCopy())
                 } else {
                     hasOutliers = true
                     debugPrint("There was an outlier in speaker \(speakerId).")
@@ -215,7 +215,7 @@ public class SpeakerProfile: Hashable {
         }
         
         update(clusters: &tentativeClusters,
-               with: newFinalized,
+               with: newTentative,
                oldClusters: oldClusters)
         
         self.isFinalized = false
