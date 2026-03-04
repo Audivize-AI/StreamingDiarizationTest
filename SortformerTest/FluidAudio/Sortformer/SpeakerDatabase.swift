@@ -77,7 +77,7 @@ public class SpeakerDatabase {
             speaker.stream(
                 newFinalized: finalized,
                 newTentative: tentative,
-                updateOutliers: activeSpeakers.count >= numSlots
+                checkOutliers: activeSpeakers.count >= numSlots
             )
             
             // Get rid empty speakers

@@ -168,10 +168,10 @@ public class SpeakerProfile: Hashable {
     public func stream(
         newFinalized: [EmbeddingSegment],
         newTentative: [EmbeddingSegment],
-        updateOutliers: Bool = false
+        checkOutliers: Bool = false
     ) {
         hasOutliers = false
-        let updateOutliers = updateOutliers && hasClusters
+        let checkOutliers = checkOutliers && self.hasClusters
         
         func update(
             clusters: inout [SpeakerClusterCentroid],
@@ -187,7 +187,7 @@ public class SpeakerProfile: Hashable {
                         with: centroid,
                         updateVector: distance <= config.updateThreshold
                     )
-                } else if !updateOutliers || hasMatchingCluster(for: centroid, in: oldClusters) {
+                } else if !checkOutliers || hasMatchingCluster(for: centroid, in: oldClusters) {
                     clusters.append(centroid.deepCopy())
                 } else {
                     hasOutliers = true
