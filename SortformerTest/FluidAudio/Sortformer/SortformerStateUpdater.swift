@@ -417,7 +417,7 @@ public struct SortformerStateUpdater {
             }
             
             // Fill the remainder of frames that intersected with the removed speaker using the powerset embeddings where possible. Loop-pad them if needed
-            for powersetIndex in powersetFrames.indices where powersetIndex & removedIndex != 0 {
+            for powersetIndex in powersetFrames.indices where (powersetIndex & removedIndex) != 0 {
                 let dstFrames = powersetFrames[powersetIndex]
                 guard !dstFrames.isEmpty else { continue }
                 guard powersetIndex != removedIndex else { continue }

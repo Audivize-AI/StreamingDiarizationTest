@@ -321,6 +321,7 @@ public class SortformerTimeline {
         addTrailingTentative: Bool,
         accumulator: inout [TimelineSegment],
     ) where T: Sequence & Collection, T.Element == Float, T.Index == Int {
+        print("UPDATING TIMELINE SEGMENTS")
         let numSpeakers = config.numSpeakers
         let onset = config.onsetThreshold
         let offset = config.offsetThreshold

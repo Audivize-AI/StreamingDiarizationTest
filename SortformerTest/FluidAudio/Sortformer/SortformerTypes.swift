@@ -270,11 +270,11 @@ public struct SortformerTimelineConfig {
             offsetThreshold: 0.5,
             onsetPadFrames: 0,
             offsetPadFrames: 0,
-            minFramesOn: 1,
-            minFramesOff: 1,
+            minFramesOn: 6,
+            minFramesOff: 4,
             filterLeftContext: 1,
             clusteringThreshold: 0.25,
-            updateThreshold: 0.2,
+            updateThreshold: 0.175,
             matchThreshold: 0.25
         )
     }

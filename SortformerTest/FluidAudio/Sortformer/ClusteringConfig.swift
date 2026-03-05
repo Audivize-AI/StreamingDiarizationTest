@@ -22,7 +22,7 @@ public struct ClusteringConfig {
     
     init(
         clusteringThreshold: Float = 0.25,
-        updateThreshold: Float = 0.15,
+        updateThreshold: Float = 0.2,
         matchThreshold: Float = 0.2,
         numSlots: Int = 4,
     ) {

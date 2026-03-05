@@ -16,7 +16,7 @@ public class SpeakerDatabase {
     
     public var droppableSlots: [Int] {
         activeSpeakers
-            .filter { $1.isDroppable }
+            .filter { !$1.hasOutliers && $1.hasClusters }
             .map(\.key)
     }
     
@@ -41,6 +41,7 @@ public class SpeakerDatabase {
     ) where F: Sequence, F.Element == EmbeddingSegment,
             T: Sequence, T.Element == EmbeddingSegment
     {
+        print("STREAMING NEW SEGMENTS")
         var binnedSegments: [Int : (finalized: [EmbeddingSegment], tentative: [EmbeddingSegment])] = [:]
         var segmentCounts: [Int : Int] = [:]
         binnedSegments.reserveCapacity(activeSpeakers.count)
@@ -74,6 +75,7 @@ public class SpeakerDatabase {
                 continue
             }
             
+            print("\tSTREAMING to SLOT \(slot) (ID = \(speaker.speakerId)).")
             speaker.stream(
                 newFinalized: finalized,
                 newTentative: tentative,
@@ -82,12 +84,14 @@ public class SpeakerDatabase {
             
             // Get rid empty speakers
             guard speaker.hasSegments else {
+                print("\tEMPTY SLOT: \(slot) (ID = \(speaker.speakerId)) ")
                 activeSpeakers[slot] = nil
                 numSlotsToDrop -= 1
                 continue
             }
             
             if speaker.hasOutliers {
+                print("\tOUTLIERS found in SLOT \(slot) (ID = \(speaker.speakerId)).")
                 numSlotsToDrop += 1
             }
         }
@@ -103,19 +107,33 @@ public class SpeakerDatabase {
                 break
             }
             droppedSlots.append(droppedSlot)
-            freeSlot(droppedSlot, refindMatch: false)
+            freeSlot(droppedSlot, refindMatch: true)
             onSlotFreed?(droppedSlot)
-            print("Dropping slot: \(droppedSlot)")
         }
     }
     
     public func finalizeAll() {
+        print("----------- FINALIZING SPEAKERS -----------")
         for (_, speaker) in activeSpeakers {
             speaker.finalize()
         }
-        for speaker in inactiveSpeakers {
-            speaker.finalize()
+        
+        updateSpeakerIds()
+        
+        for (slot, speaker) in activeSpeakers {
+            let match = inactiveSpeakers.first {
+                $0.speakerId == speaker.speakerId
+            }
+            if let match {
+                print("\tMATCH FOR SLOT \(slot): \(speaker.speakerId) <-> \(match.speakerId)")
+                match.absorbAndFinalize(speaker)
+            } else {
+                print("\tNO MATCH FOR SLOT \(slot), NEW SPEAKER")
+                inactiveSpeakers.append(speaker)
+            }
         }
+        
+        activeSpeakers.removeAll()
     }
     
     public func clear() {
@@ -130,6 +148,7 @@ public class SpeakerDatabase {
         }
         
         let newSpeaker = SpeakerProfile(config: config, speakerId: nextSpeakerId)
+        print("\tNEW SPEAKER in EMPTY SLOT \(slot) (ID = \(newSpeaker.speakerId))")
         nextSpeakerId += 1
         activeSpeakers[slot] = newSpeaker
 
@@ -137,21 +156,23 @@ public class SpeakerDatabase {
     }
     
     public func freeSlot(_ slot: Int, refindMatch: Bool = true) {
+        print("\tREMOVING SLOT \(slot)")
         // Remove the old speaker
         if let speaker = activeSpeakers.removeValue(forKey: slot) {
-            let removedId = speaker.speakerId
             let match = refindMatch
                 ? findMatchingSpeaker(for: speaker)
-                : inactiveSpeakers.first { $0.speakerId == removedId }
+                : inactiveSpeakers.first { $0.speakerId == speaker.speakerId }
             if let match {
                 match.absorbAndFinalize(speaker)
+                print("\t\tUpdating existing speaker with ID \(speaker.speakerId)")
             } else {
                 inactiveSpeakers.append(speaker)
+                print("\t\tNew speaker added to database with ID \(speaker.speakerId)")
             }
             
             // Only update cannot-link constraints from speakers as they are deactivated to avoid stale IDs
             for other in activeSpeakers.values {
-                other.updateCannotLink(with: removedId)
+                other.updateCannotLink(with: speaker.speakerId)
             }
         }
         
@@ -198,13 +219,41 @@ public class SpeakerDatabase {
             return isUnused.firstIndex(of: true)
         }
         
-        return droppableSlots.min {
+        var droppableSlots = activeSpeakers
+                .filter { !$1.hasOutliers && $1.hasClusters }
+                .map(\.key)
+        
+        var bestSlot = droppableSlots.min {
             guard let end0 = activeSpeakers[$0]?.lastActiveFrame,
                   let end1 = activeSpeakers[$1]?.lastActiveFrame else {
                 return false
             }
             return end0 < end1
         }
+        
+        if let bestSlot = bestSlot {
+            return bestSlot
+        }
+        
+        droppableSlots = activeSpeakers
+                .filter { !$1.hasOutliers }
+                .map(\.key)
+        
+        bestSlot = droppableSlots.min {
+            guard let end0 = activeSpeakers[$0]?.lastActiveFrame,
+                  let end1 = activeSpeakers[$1]?.lastActiveFrame else {
+                return false
+            }
+            return end0 < end1
+        }
+        
+        if let bestSlot = bestSlot {
+            return bestSlot
+        }
+        
+        return activeSpeakers.min {
+            $0.value.lastActiveFrame < $1.value.lastActiveFrame
+        }?.key
     }
     
     private func shiftSlotsLeft(startingAt slot: Int) {
@@ -216,6 +265,7 @@ public class SpeakerDatabase {
     }
     
     private func updateSpeakerIds() {
+        print("\tUPDATING SPEAKER IDs")
         guard !inactiveSpeakers.isEmpty else {
             // No inactive speakers to match against — revert to birth IDs
             for (_, speaker) in activeSpeakers {
@@ -269,7 +319,10 @@ public class SpeakerDatabase {
         // Note: if numRows > 0, then numCols > 0
         guard numRows > 0 else {
             // No matches found — revert to birth IDs
-            for (_, speaker) in activeSpeakers {
+            for (slot, speaker) in activeSpeakers {
+                if speaker.speakerId != speaker.defaultSpeakerId {
+                    print("\t\tSLOT \(slot): \(speaker.speakerId) -> \(speaker.defaultSpeakerId) (DEFAULT)")
+                }
                 speaker.speakerId = speaker.defaultSpeakerId
             }
             return
@@ -288,6 +341,7 @@ public class SpeakerDatabase {
         // Solve the assignment
         guard let assignments = solveRectangularLinearAssignment(
             numRows: numRows, numCols: numCols, costMatrix: costMatrix) else {
+            print("Cost Matrix (\(numRows)x\(numCols)):\n\(costMatrix)")
             fatalError("Failed to solve ID assignments")
         }
         
@@ -299,6 +353,11 @@ public class SpeakerDatabase {
             let slot = rowToSlot[row]
             let inactiveIndex = columnToIndex[col]
             let matchedId = inactiveSpeakers[inactiveIndex].speakerId
+            let distance = costMatrix[row * numCols + col]
+            if let oldId = activeSpeakers[slot]?.speakerId,
+               oldId != matchedId {
+                print("\t\tSLOT \(slot): \(oldId) -> \(matchedId) (MATCHED - d=\(distance))")
+            }
             activeSpeakers[slot]?.speakerId = matchedId
             matchedSlots.insert(slot)
             claimedIds.insert(matchedId)
@@ -309,9 +368,15 @@ public class SpeakerDatabase {
         // assign a new unique ID to avoid collisions.
         for (slot, speaker) in activeSpeakers where !matchedSlots.contains(slot) {
             if claimedIds.contains(speaker.defaultSpeakerId) {
+                if speaker.speakerId != nextSpeakerId {
+                    print("\t\tSLOT \(slot): \(speaker.speakerId) -> \(nextSpeakerId) (NEW)")
+                }
                 speaker.speakerId = nextSpeakerId
                 nextSpeakerId += 1
             } else {
+                if speaker.speakerId != speaker.defaultSpeakerId {
+                    print("\t\tSLOT \(slot): \(speaker.speakerId) -> \(speaker.defaultSpeakerId) (DEFAULT)")
+                }
                 speaker.speakerId = speaker.defaultSpeakerId
             }
         }

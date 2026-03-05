@@ -188,6 +188,7 @@ public class SpeakerProfile: Hashable {
                         updateVector: distance <= config.updateThreshold
                     )
                 } else if !checkOutliers || hasMatchingCluster(for: centroid, in: oldClusters) {
+                    print("\t\tNEW CLUSTER for Speaker \(speakerId)")
                     clusters.append(centroid.deepCopy())
                 } else {
                     hasOutliers = true
@@ -273,35 +274,8 @@ public class SpeakerProfile: Hashable {
         let clustersB = (useTentative && !other.isFinalized)
             ? other.tentativeClusters : other.finalizedClusters
         
-        var bestB: [(dist: Float, weight: Float)] = Array(repeating: (.infinity, 0), count: clustersB.count)
-        var sumA: Float = 0
-        var sumWeightsA: Float = 0
-        
-        for embA in clustersA {
-            var minDistA = Float.infinity
-            var bestWeightA: Float = 0
-            for (i, embB) in clustersB.enumerated() {
-                let dist: Float = embA.cosineDistance(to: embB)
-                if dist < minDistA {
-                    minDistA = dist
-                    bestWeightA = embB.weight
-                }
-                if dist < bestB[i].dist {
-                    bestB[i] = (dist, embB.weight * embA.weight)
-                }
-            }
-            
-            let weight = embA.weight * bestWeightA
-            
-            sumWeightsA += weight
-            sumA += weight * minDistA
-        }
-        
-        let (sumB, sumWeightsB) = bestB.reduce((dist: 0 as Float, weight: 0 as Float)) {
-            ($0.dist + $1.dist * $1.weight, $0.weight + $1.weight)
-        }
-        
-        return (sumA / sumWeightsA + sumB / sumWeightsB) / 2
+//        return Self.weightedChamferDistance(clustersA, clustersB)
+        return Self.weightedAverageDistance(clustersA, clustersB)
     }
 
     /// Finalize the speaker
@@ -313,6 +287,8 @@ public class SpeakerProfile: Hashable {
             tentativeClusters.removeAll()
             finalizedClusters.sort { $0.weight > $1.weight }
             debugPrint("Cluster weights for speaker \(speakerId): \(finalizedClusters.map(\.weight))")
+            let totalWeight = finalizedClusters.reduce(0) { $0 + $1.weight }
+            finalizedClusters.removeLast(finalizedClusters.count-1) 
         }
         
         if !tentativeSegments.isEmpty {
@@ -357,7 +333,7 @@ public class SpeakerProfile: Hashable {
         
         // Extract clusters
         let dendrogram = matrix.dendrogram()
-        let clusters = dendrogram.extractClusters(config.clusteringThreshold)
+        let clusters = dendrogram.extractClusters(config.updateThreshold)
         
         let newClusterCentroids = clusters.map { cluster in
             SpeakerClusterCentroid(
@@ -393,6 +369,54 @@ public class SpeakerProfile: Hashable {
     public static func == (lhs: SpeakerProfile, rhs: SpeakerProfile) -> Bool {
         return lhs.id == rhs.id
     }
+    
+    static func weightedChamferDistance(_ clustersA: [SpeakerClusterCentroid], _ clustersB: [SpeakerClusterCentroid]) -> Float {
+        var bestB: [(dist: Float, weight: Float)] = Array(repeating: (.infinity, 0), count: clustersB.count)
+        var sumA: Float = 0
+        var sumWeightsA: Float = 0
+        
+        for embA in clustersA {
+            var minDistA = Float.infinity
+            var bestWeightA: Float = 0
+            for (i, embB) in clustersB.enumerated() {
+                let dist: Float = embA.cosineDistance(to: embB)
+                if dist < minDistA {
+                    minDistA = dist
+                    bestWeightA = embB.weight
+                }
+                if dist < bestB[i].dist {
+                    bestB[i] = (dist, embB.weight * embA.weight)
+                }
+            }
+            
+            let weight = embA.weight * bestWeightA
+            
+            sumWeightsA += weight
+            sumA += weight * minDistA
+        }
+        
+        let (sumB, sumWeightsB) = bestB.reduce((dist: 0 as Float, weight: 0 as Float)) {
+            ($0.dist + $1.dist * $1.weight, $0.weight + $1.weight)
+        }
+        
+        return (sumA / sumWeightsA + sumB / sumWeightsB) / 2
+    }
+    
+    static func weightedAverageDistance(_ clustersA: [SpeakerClusterCentroid], _ clustersB: [SpeakerClusterCentroid]) -> Float {
+        var totalWeight: Float = 0
+        var totalDistance: Float = 0
+        
+        for embA in clustersA {
+            for embB in clustersB {
+                let dist: Float = embA.cosineDistance(to: embB)
+                let weight = embA.weight * embB.weight
+                totalWeight += weight
+                totalDistance += weight * dist
+            }
+        }
+        
+        return totalDistance / totalWeight
+    }
 }
 
 public class SpeakerClusterCentroid: EmbeddingVector {
@@ -408,10 +432,7 @@ public class SpeakerClusterCentroid: EmbeddingVector {
     
     var cppView: SpeakerEmbeddingWrapper {
         embedding.withUnsafeMutableBufferPointer { embeddingBuf in
-            SpeakerEmbeddingWrapper.init(
-                embeddingBuf.baseAddress,
-                weight
-            )
+            SpeakerEmbeddingWrapper(embeddingBuf.baseAddress, weight)
         }
     }
     
@@ -433,8 +454,8 @@ public class SpeakerClusterCentroid: EmbeddingVector {
     ) {
         // Create a deep copy of the embedding
         self.embedding = SpeakerEmbedding(id: id, embedding: embedding.bufferView, startFrame: embedding.startFrame, endFrame: embedding.endFrame)
-        self.isFinalized = isFinalized
         self.weight = weight
+        self.isFinalized = isFinalized
     }
     
     init(
@@ -525,3 +546,4 @@ public class SpeakerClusterCentroid: EmbeddingVector {
         hasher.combine(self.id)
     }
 }
+

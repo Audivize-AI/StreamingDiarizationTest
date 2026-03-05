@@ -37,7 +37,9 @@ internal class SortformerFilter {
     ///   - result: Where to store the output
     ///   - count: Number of elements to update
     func update(_ x: UnsafePointer<Float>, with y: UnsafePointer<Float>, result: UnsafeMutablePointer<Float>, count: Int) throws {
-        guard count > 0 else { return }
+        guard count > 0 else {
+            print("No frames in the filter"); return }
+        print("YES frames in the filter")
         guard count <= weights.count else {
             throw SortformerFilterError.invalidInputCount
         }

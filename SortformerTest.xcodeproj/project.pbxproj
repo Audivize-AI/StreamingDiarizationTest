@@ -31,7 +31,6 @@
 		D831B4A22F0239600089CDFA /* SortformerTest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SortformerTest.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		D831B4B12F0239610089CDFA /* SortformerTestTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SortformerTestTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		D831B4BB2F0239610089CDFA /* SortformerTestUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SortformerTestUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		D8B9265C2F0A226500F06CAB /* sox.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = sox.h; path = ../../../../../opt/homebrew/Cellar/sox/14.4.2_5/include/sox.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -84,7 +83,6 @@
 				D831B4A42F0239600089CDFA /* SortformerTest */,
 				D831B4B42F0239610089CDFA /* SortformerTestTests */,
 				D831B4BE2F0239610089CDFA /* SortformerTestUITests */,
-				D8B9265B2F0A226500F06CAB /* Frameworks */,
 				D831B4A32F0239600089CDFA /* Products */,
 			);
 			sourceTree = "<group>";
@@ -97,14 +95,6 @@
 				D831B4BB2F0239610089CDFA /* SortformerTestUITests.xctest */,
 			);
 			name = Products;
-			sourceTree = "<group>";
-		};
-		D8B9265B2F0A226500F06CAB /* Frameworks */ = {
-			isa = PBXGroup;
-			children = (
-				D8B9265C2F0A226500F06CAB /* sox.h */,
-			);
-			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
