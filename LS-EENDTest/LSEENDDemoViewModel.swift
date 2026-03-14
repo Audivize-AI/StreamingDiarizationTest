@@ -169,11 +169,10 @@ final class LSEENDDemoViewModel: ObservableObject {
     @Published var displayOrder: [Int] = []
 
     private let processingQueue = DispatchQueue(label: "LS-EEND.Processing", qos: .userInitiated)
-    private var engine: LSEENDInferenceEngine?
-    private var session: LSEENDStreamingSession?
+    private let processor = LSEENDDiarizer()
     private var audioSource: LSEENDAudioSource?
     private var currentDescriptor: LSEENDModelDescriptor?
-    private var pendingAudio: [Float] = []
+    private var pendingAudioCount = 0
     private var totalSamplesReceived = 0
     private let outputDirectory = LSEENDWorkspace.rootURL.appendingPathComponent("artifacts/mic_gui_swift", isDirectory: true)
 
@@ -190,7 +189,7 @@ final class LSEENDDemoViewModel: ObservableObject {
     var probabilitySnapshot: LSEENDHeatmapSnapshot {
         let combined = combinedProbabilities()
         let ordered = reordered(matrix: combined)
-        let frameRate = engine?.modelFrameHz ?? 10
+        let frameRate = processor.modelFrameHz ?? 10
         let windowFrames = max(1, Int(round(windowSeconds * frameRate)))
         let startFrame = max(0, ordered.rows - windowFrames)
         let shown = ordered.slicingRows(start: startFrame, end: ordered.rows)
@@ -209,7 +208,7 @@ final class LSEENDDemoViewModel: ObservableObject {
 
     var binarySnapshot: LSEENDHeatmapSnapshot {
         let ordered = reordered(matrix: currentBinary())
-        let frameRate = engine?.modelFrameHz ?? 10
+        let frameRate = processor.modelFrameHz ?? 10
         let windowFrames = max(1, Int(round(windowSeconds * frameRate)))
         let startFrame = max(0, ordered.rows - windowFrames)
         let shown = ordered.slicingRows(start: startFrame, end: ordered.rows)
@@ -242,12 +241,13 @@ final class LSEENDDemoViewModel: ObservableObject {
         processingQueue.async { [weak self] in
             guard let self else { return }
             do {
-                let engine = try LSEENDInferenceEngine(descriptor: descriptor)
+                try self.processor.initialize(descriptor: descriptor)
+                let numSpeakers = self.processor.numSpeakers ?? 0
+                let latency = self.processor.streamingLatencySeconds ?? 0
                 DispatchQueue.main.async {
-                    self.engine = engine
                     self.currentDescriptor = descriptor
                     self.statusText = "Ready."
-                    self.modelInfoText = "\(descriptor.variant.rawValue) | \(engine.decodeMaxSpeakers - 2) speaker tracks | \(String(format: "%.2f", engine.streamingLatencySeconds)) s latency"
+                    self.modelInfoText = "\(descriptor.variant.rawValue) | \(numSpeakers) speaker tracks | \(String(format: "%.2f", latency)) s latency"
                     self.resetTimelineUI(clearStatus: false, receivedSamples: 0)
                 }
             } catch {
@@ -309,17 +309,18 @@ final class LSEENDDemoViewModel: ObservableObject {
     }
 
     private func startMicrophoneCapture() {
-        guard let engine else {
+        guard processor.isAvailable else {
             statusText = "Model is not loaded yet."
             return
         }
+        guard let targetSampleRate = processor.targetSampleRate else { return }
         resetTimeline(clearStatus: false)
         processingQueue.async { [weak self] in
             guard let self else { return }
             do {
-                let session = try engine.createSession(inputSampleRate: engine.targetSampleRate)
+                self.processor.reset()
                 let source = try LSEENDMicrophoneSource(
-                    targetSampleRate: Double(engine.targetSampleRate),
+                    targetSampleRate: Double(targetSampleRate),
                     blockSeconds: self.blockSeconds,
                     onChunk: { [weak self] chunk in
                         self?.enqueueChunk(chunk)
@@ -330,7 +331,6 @@ final class LSEENDDemoViewModel: ObservableObject {
                         }
                     }
                 )
-                self.session = session
                 self.audioSource = source
                 try source.start()
                 DispatchQueue.main.async {
@@ -341,7 +341,7 @@ final class LSEENDDemoViewModel: ObservableObject {
             } catch {
                 self.audioSource?.stop()
                 self.audioSource = nil
-                self.session = nil
+                self.processor.reset()
                 DispatchQueue.main.async {
                     self.statusText = "Failed to start microphone: \(error.localizedDescription)"
                 }
@@ -350,10 +350,11 @@ final class LSEENDDemoViewModel: ObservableObject {
     }
 
     func startSimulation() {
-        guard let engine else {
+        guard processor.isAvailable else {
             statusText = "Model is not loaded yet."
             return
         }
+        guard let targetSampleRate = processor.targetSampleRate else { return }
         guard !simulationPath.isEmpty else {
             statusText = "Choose an audio file to simulate."
             return
@@ -362,10 +363,10 @@ final class LSEENDDemoViewModel: ObservableObject {
         processingQueue.async { [weak self] in
             guard let self else { return }
             do {
-                let session = try engine.createSession(inputSampleRate: engine.targetSampleRate)
+                self.processor.reset()
                 let source = try LSEENDAudioFileSource(
                     fileURL: URL(fileURLWithPath: self.simulationPath),
-                    targetSampleRate: engine.targetSampleRate,
+                    targetSampleRate: targetSampleRate,
                     blockSeconds: self.blockSeconds,
                     speed: self.simulateSpeed,
                     onChunk: { [weak self] chunk in
@@ -375,7 +376,6 @@ final class LSEENDDemoViewModel: ObservableObject {
                         self?.stopCapture(flush: true)
                     }
                 )
-                self.session = session
                 self.audioSource = source
                 try source.start()
                 DispatchQueue.main.async {
@@ -386,7 +386,7 @@ final class LSEENDDemoViewModel: ObservableObject {
             } catch {
                 self.audioSource?.stop()
                 self.audioSource = nil
-                self.session = nil
+                self.processor.reset()
                 DispatchQueue.main.async {
                     self.statusText = "Failed to start simulation: \(error.localizedDescription)"
                 }
@@ -402,9 +402,9 @@ final class LSEENDDemoViewModel: ObservableObject {
             guard let self else { return }
 
             guard flush else {
-                self.session = nil
-                self.pendingAudio.removeAll(keepingCapacity: false)
+                self.processor.reset()
                 self.totalSamplesReceived = 0
+                self.pendingAudioCount = 0
                 DispatchQueue.main.async {
                     self.sourceText = "Not started"
                     self.updateBufferText(receivedSamples: 0)
@@ -412,7 +412,7 @@ final class LSEENDDemoViewModel: ObservableObject {
                 return
             }
 
-            guard let session = self.session else {
+            guard self.processor.isAvailable else {
                 DispatchQueue.main.async {
                     self.sourceText = "Not started"
                 }
@@ -420,18 +420,12 @@ final class LSEENDDemoViewModel: ObservableObject {
             }
 
             do {
-                if let pendingUpdate = try self.pushPendingAudioIfNeeded(force: true) {
-                    DispatchQueue.main.async {
-                        self.merge(update: pendingUpdate)
-                    }
-                }
-                let update = try session.finalize()
-                self.session = nil
-                self.pendingAudio.removeAll(keepingCapacity: false)
+                // Flush pending audio and finalize
+                let _ = try self.processor.finalizeSession()
+                let timeline = self.processor.timeline
+                let numSpeakers = self.processor.numSpeakers ?? 0
                 DispatchQueue.main.async {
-                    if let update {
-                        self.merge(update: update)
-                    }
+                    self.syncHeatmapFromTimeline(timeline, numSpeakers: numSpeakers)
                     self.previewProbabilities = .empty(columns: self.committedProbabilities.columns)
                     self.previewStartFrame = self.committedProbabilities.rows
                     self.inferenceText = "Inference: finalized"
@@ -440,7 +434,7 @@ final class LSEENDDemoViewModel: ObservableObject {
                     self.updateBufferText(receivedSamples: self.totalSamplesReceived)
                 }
             } catch {
-                self.session = nil
+                self.processor.reset()
                 DispatchQueue.main.async {
                     self.statusText = "Finalize failed: \(error.localizedDescription)"
                     self.sourceText = "Not started"
@@ -455,9 +449,9 @@ final class LSEENDDemoViewModel: ObservableObject {
         source?.stop()
         processingQueue.async { [weak self] in
             guard let self else { return }
-            self.session = nil
-            self.pendingAudio.removeAll(keepingCapacity: false)
+            self.processor.reset()
             self.totalSamplesReceived = 0
+            self.pendingAudioCount = 0
             DispatchQueue.main.async {
                 self.sourceText = "Not started"
                 self.resetTimelineUI(clearStatus: clearStatus, receivedSamples: 0)
@@ -485,7 +479,7 @@ final class LSEENDDemoViewModel: ObservableObject {
     }
 
     func saveRTTM() {
-        guard let engine else { return }
+        guard let frameRate = processor.modelFrameHz else { return }
         let binary = currentBinary()
         guard binary.rows > 0 else {
             statusText = "No inference available to save."
@@ -498,7 +492,7 @@ final class LSEENDDemoViewModel: ObservableObject {
                 recordingID: outputURL.deletingPathExtension().lastPathComponent,
                 binaryPrediction: reordered(matrix: binary),
                 outputURL: outputURL,
-                frameRate: engine.modelFrameHz,
+                frameRate: frameRate,
                 speakerLabels: speakerLabelsForDisplay()
             )
             statusText = "Saved RTTM: \(outputURL.lastPathComponent)"
@@ -508,7 +502,7 @@ final class LSEENDDemoViewModel: ObservableObject {
     }
 
     func saveSessionJSON() {
-        guard let engine else { return }
+        guard let frameRate = processor.modelFrameHz else { return }
         do {
             try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
             let outputURL = outputDirectory.appendingPathComponent(nextOutputStem()).appendingPathExtension("json")
@@ -519,16 +513,16 @@ final class LSEENDDemoViewModel: ObservableObject {
                 "checkpoint": currentDescriptor?.checkpointURL.path ?? "",
                 "config": currentDescriptor?.configURL.path ?? "",
                 "source": sourceText,
-                "duration_seconds": Double(committedProbabilities.rows) / engine.modelFrameHz,
-                "preview_duration_seconds": Double(previewProbabilities.rows) / engine.modelFrameHz,
-                "frame_hz": engine.modelFrameHz,
+                "duration_seconds": Double(committedProbabilities.rows) / frameRate,
+                "preview_duration_seconds": Double(previewProbabilities.rows) / frameRate,
+                "frame_hz": frameRate,
                 "display_order": displayOrder,
                 "speaker_labels": speakerLabelsForDisplay(),
                 "block_seconds": blockSeconds,
                 "refresh_seconds": refreshSeconds,
                 "threshold": threshold,
                 "median": medianWidth,
-                "streaming_latency_seconds": engine.streamingLatencySeconds,
+                "streaming_latency_seconds": processor.streamingLatencySeconds ?? 0,
             ]
             let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
             try data.write(to: outputURL)
@@ -540,15 +534,34 @@ final class LSEENDDemoViewModel: ObservableObject {
 
     private func enqueueChunk(_ chunk: [Float]) {
         processingQueue.async { [weak self] in
-            guard let self, self.session != nil else { return }
+            guard let self, self.processor.isAvailable else { return }
             do {
-                self.pendingAudio.append(contentsOf: chunk)
+                self.processor.addAudio(chunk)
                 self.totalSamplesReceived += chunk.count
-                let update = try self.pushPendingAudioIfNeeded(force: false)
-                DispatchQueue.main.async {
-                    if let update {
-                        self.merge(update: update)
+                self.pendingAudioCount += chunk.count
+
+                // Respect refresh rate: only process when enough audio has accumulated
+                let sampleRate = self.processor.targetSampleRate ?? 1
+                let minimumDelta = max(1, Int(round(self.refreshSeconds * Double(max(sampleRate, 1)))))
+                guard self.pendingAudioCount >= minimumDelta else {
+                    DispatchQueue.main.async {
+                        self.updateBufferText(receivedSamples: self.totalSamplesReceived)
                     }
+                    return
+                }
+                self.pendingAudioCount = 0
+
+                guard let result = try self.processor.process() else {
+                    DispatchQueue.main.async {
+                        self.updateBufferText(receivedSamples: self.totalSamplesReceived)
+                    }
+                    return
+                }
+
+                let numSpeakers = self.processor.numSpeakers ?? 0
+                let totalEmitted = self.processor.numFramesProcessed
+                DispatchQueue.main.async {
+                    self.mergeChunkResult(result, numSpeakers: numSpeakers, totalEmittedFrames: totalEmitted)
                     self.updateBufferText(receivedSamples: self.totalSamplesReceived)
                 }
             } catch {
@@ -559,33 +572,43 @@ final class LSEENDDemoViewModel: ObservableObject {
         }
     }
 
-    private func merge(update: LSEENDStreamingUpdate) {
+    private func mergeChunkResult(_ result: DiarizerChunkResult, numSpeakers: Int, totalEmittedFrames: Int) {
+        guard numSpeakers > 0 else { return }
+
+        // Convert committed predictions to LSEENDMatrix
+        let committedMatrix = LSEENDMatrix(
+            validatingRows: result.frameCount,
+            columns: numSpeakers,
+            values: result.speakerPredictions
+        )
         committedProbabilities = merge(
             existing: committedProbabilities,
-            patch: update.probabilities,
-            startFrame: update.startFrame
+            patch: committedMatrix,
+            startFrame: result.startFrame
         )
-        previewProbabilities = update.previewProbabilities
-        previewStartFrame = update.previewStartFrame
-        ensureTrackState(trackCount: max(committedProbabilities.columns, previewProbabilities.columns))
-        inferenceText = "Inference: \(update.totalEmittedFrames) committed + \(update.previewProbabilities.rows) preview frames"
+
+        // Convert tentative predictions to LSEENDMatrix
+        previewProbabilities = LSEENDMatrix(
+            validatingRows: result.tentativeFrameCount,
+            columns: numSpeakers,
+            values: result.tentativePredictions
+        )
+        previewStartFrame = result.tentativeStartFrame
+
+        ensureTrackState(trackCount: numSpeakers)
+        inferenceText = "Inference: \(totalEmittedFrames) committed + \(result.tentativeFrameCount) preview frames"
         statusText = "Inference updated."
     }
 
-    private func pushPendingAudioIfNeeded(force: Bool) throws -> LSEENDStreamingUpdate? {
-        guard let session else {
-            return nil
-        }
-        guard !pendingAudio.isEmpty else {
-            return nil
-        }
-        let minimumDelta = max(1, Int(round(refreshSeconds * Double(max(session.inputSampleRate, 1)))))
-        guard force || pendingAudio.count >= minimumDelta else {
-            return nil
-        }
-        let chunk = pendingAudio
-        pendingAudio.removeAll(keepingCapacity: true)
-        return try session.pushAudio(chunk)
+    /// Sync heatmap from the full timeline (used after finalize)
+    private func syncHeatmapFromTimeline(_ timeline: DiarizerTimeline, numSpeakers: Int) {
+        guard numSpeakers > 0 else { return }
+        committedProbabilities = LSEENDMatrix(
+            validatingRows: timeline.numFrames,
+            columns: numSpeakers,
+            values: timeline.framePredictions
+        )
+        ensureTrackState(trackCount: numSpeakers)
     }
 
     private func resetTimelineUI(clearStatus: Bool, receivedSamples: Int) {
@@ -684,14 +707,16 @@ final class LSEENDDemoViewModel: ObservableObject {
     }
 
     private func updateBufferText(receivedSamples: Int) {
-        let receivedSeconds = Double(receivedSamples) / Double(max(engine?.targetSampleRate ?? 1, 1))
-        let committedSeconds = Double(committedProbabilities.rows) / (engine?.modelFrameHz ?? 10)
-        let previewSeconds = Double(max(committedProbabilities.rows, previewStartFrame + previewProbabilities.rows)) / (engine?.modelFrameHz ?? 10)
+        let sampleRate = processor.targetSampleRate ?? 1
+        let frameRate = processor.modelFrameHz ?? 10
+        let receivedSeconds = Double(receivedSamples) / Double(max(sampleRate, 1))
+        let committedSeconds = Double(committedProbabilities.rows) / frameRate
+        let previewSeconds = Double(max(committedProbabilities.rows, previewStartFrame + previewProbabilities.rows)) / frameRate
         bufferText = String(format: "Buffered: %.1f s received, %.1f s committed, %.1f s incl preview", receivedSeconds, committedSeconds, previewSeconds)
     }
 
     private func previewRangeInDisplayedMatrix(totalRows: Int, startFrame: Int) -> (start: Double?, end: Double?) {
-        guard let engine, previewProbabilities.rows > 0 else {
+        guard let frameRate = processor.modelFrameHz, previewProbabilities.rows > 0 else {
             return (nil, nil)
         }
         let previewStart = max(previewStartFrame, startFrame)
@@ -700,8 +725,8 @@ final class LSEENDDemoViewModel: ObservableObject {
             return (nil, nil)
         }
         return (
-            Double(previewStart) / engine.modelFrameHz,
-            Double(previewEnd) / engine.modelFrameHz
+            Double(previewStart) / frameRate,
+            Double(previewEnd) / frameRate
         )
     }
 
