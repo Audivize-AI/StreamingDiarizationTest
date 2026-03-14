@@ -44,18 +44,6 @@ private struct LSEENDStepOutput {
     let nextState: LSEENDModelState
 }
 
-private struct LSEENDInferenceSharedResourcesKey: Hashable {
-    let modelPath: String
-    let metadataPath: String
-    let computeUnitsRawValue: Int
-
-    init(descriptor: LSEENDModelDescriptor, computeUnits: MLComputeUnits) {
-        modelPath = descriptor.modelURL.standardizedFileURL.path
-        metadataPath = descriptor.metadataURL.standardizedFileURL.path
-        computeUnitsRawValue = Int(computeUnits.rawValue)
-    }
-}
-
 private final class LSEENDInferenceSharedResources {
     let descriptor: LSEENDModelDescriptor
     let computeUnits: MLComputeUnits
@@ -107,42 +95,6 @@ private final class LSEENDInferenceSharedResources {
     }
 }
 
-private final class LSEENDInferenceSharedResourcesStore {
-    static let shared = LSEENDInferenceSharedResourcesStore()
-
-    private let lock = NSLock()
-    private var cache: [LSEENDInferenceSharedResourcesKey: LSEENDInferenceSharedResources] = [:]
-
-    private init() {}
-
-    func resources(
-        for descriptor: LSEENDModelDescriptor,
-        computeUnits: MLComputeUnits
-    ) throws -> LSEENDInferenceSharedResources {
-        let key = LSEENDInferenceSharedResourcesKey(descriptor: descriptor, computeUnits: computeUnits)
-
-        lock.lock()
-        if let cached = cache[key] {
-            lock.unlock()
-            return cached
-        }
-        lock.unlock()
-
-        let created = try LSEENDInferenceSharedResources(
-            descriptor: descriptor,
-            computeUnits: computeUnits
-        )
-
-        lock.lock()
-        defer { lock.unlock() }
-        if let cached = cache[key] {
-            return cached
-        }
-        cache[key] = created
-        return created
-    }
-}
-
 public final class LSEENDInferenceEngine {
     private let logger = AppLogger(category: "LSEENDInference")
     private let sharedResources: LSEENDInferenceSharedResources
@@ -164,8 +116,8 @@ public final class LSEENDInferenceEngine {
         descriptor: LSEENDModelDescriptor,
         computeUnits: MLComputeUnits = .cpuOnly
     ) throws {
-        sharedResources = try LSEENDInferenceSharedResourcesStore.shared.resources(
-            for: descriptor,
+        sharedResources = try LSEENDInferenceSharedResources(
+            descriptor: descriptor,
             computeUnits: computeUnits
         )
         logger.info("Loaded LS-EEND variant \(descriptor.variant.rawValue) @ \(descriptor.modelURL.path)")
