@@ -36,6 +36,20 @@ final public class AudioConverter {
         }
     }
 
+    /// Public initializer so external modules (e.g. CLI) can construct the converter
+    /// - Parameters:
+    ///   - sampleRate: Target audio sample rate
+    ///   - debug: Whether to log debug messages
+    public init(sampleRate: Double, debug: Bool = false) {
+        self.debug = debug
+        self.targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: 1,
+            interleaved: false
+        )!
+    }
+
     // MARK: - Public Resampling Methods
 
     /// Resample a float array from one sample rate to the target sample rate.
