@@ -5,11 +5,18 @@ public enum Repo: String, CaseIterable {
     case vad = "FluidInference/silero-vad-coreml"
     case parakeet = "FluidInference/parakeet-tdt-0.6b-v3-coreml"
     case parakeetV2 = "FluidInference/parakeet-tdt-0.6b-v2-coreml"
+    case parakeetCtc110m = "FluidInference/parakeet-ctc-110m-coreml"
+    case parakeetCtc06b = "FluidInference/parakeet-ctc-0.6b-coreml"
     case parakeetEou160 = "FluidInference/parakeet-realtime-eou-120m-coreml/160ms"
     case parakeetEou320 = "FluidInference/parakeet-realtime-eou-120m-coreml/320ms"
     case diarizer = "FluidInference/speaker-diarization-coreml"
     case kokoro = "FluidInference/kokoro-82m-coreml"
-    case sortformer = "alexwengg/diar-streaming-sortformer-coreml"
+    case sortformer = "FluidInference/diar-streaming-sortformer-coreml"
+    case lseend = "GradientDescent2718/ls-eend-coreml"
+    case pocketTts = "FluidInference/pocket-tts-coreml"
+    case qwen3Asr = "FluidInference/qwen3-asr-0.6b-coreml/f32"
+    case qwen3AsrInt8 = "FluidInference/qwen3-asr-0.6b-coreml/int8"
+    case multilingualG2p = "FluidInference/charsiu-g2p-byt5-coreml"
 
     /// Repository slug (without owner)
     public var name: String {
@@ -20,6 +27,10 @@ public enum Repo: String, CaseIterable {
             return "parakeet-tdt-0.6b-v3-coreml"
         case .parakeetV2:
             return "parakeet-tdt-0.6b-v2-coreml"
+        case .parakeetCtc110m:
+            return "parakeet-ctc-110m-coreml"
+        case .parakeetCtc06b:
+            return "parakeet-ctc-0.6b-coreml"
         case .parakeetEou160:
             return "parakeet-realtime-eou-120m-coreml/160ms"
         case .parakeetEou320:
@@ -30,16 +41,32 @@ public enum Repo: String, CaseIterable {
             return "kokoro-82m-coreml"
         case .sortformer:
             return "diar-streaming-sortformer-coreml"
+        case .lseend:
+            return "ls-eend-coreml"
+        case .pocketTts:
+            return "pocket-tts-coreml"
+        case .qwen3Asr:
+            return "qwen3-asr-0.6b-coreml/f32"
+        case .qwen3AsrInt8:
+            return "qwen3-asr-0.6b-coreml/int8"
+        case .multilingualG2p:
+            return "charsiu-g2p-byt5-coreml"
         }
     }
 
     /// Fully qualified HuggingFace repo path (owner/name)
     public var remotePath: String {
         switch self {
+        case .parakeetCtc110m:
+            return "FluidInference/parakeet-ctc-110m-coreml"
+        case .parakeetCtc06b:
+            return "FluidInference/parakeet-ctc-0.6b-coreml"
         case .parakeetEou160, .parakeetEou320:
             return "FluidInference/parakeet-realtime-eou-120m-coreml"
         case .sortformer:
-            return "alexwengg/diar-streaming-sortformer-coreml"
+            return "FluidInference/diar-streaming-sortformer-coreml"
+        case .qwen3Asr, .qwen3AsrInt8:
+            return "FluidInference/qwen3-asr-0.6b-coreml"
         default:
             return "FluidInference/\(name)"
         }
@@ -52,6 +79,10 @@ public enum Repo: String, CaseIterable {
             return "160ms"
         case .parakeetEou320:
             return "320ms"
+        case .qwen3Asr:
+            return "f32"
+        case .qwen3AsrInt8:
+            return "int8"
         default:
             return nil
         }
@@ -68,6 +99,10 @@ public enum Repo: String, CaseIterable {
             return "parakeet-eou-streaming/320ms"
         case .sortformer:
             return "sortformer"
+        case .pocketTts:
+            return "pocket-tts"
+        case .multilingualG2p:
+            return "charsiu-g2p-byt5"
         default:
             return name
         }
@@ -144,6 +179,23 @@ public enum ModelNames {
         }
     }
 
+    /// CTC model names
+    public enum CTC {
+        public static let melSpectrogram = "MelSpectrogram"
+        public static let audioEncoder = "AudioEncoder"
+
+        public static let melSpectrogramPath = melSpectrogram + ".mlmodelc"
+        public static let audioEncoderPath = audioEncoder + ".mlmodelc"
+
+        // Vocabulary JSON path (shared by Python/Nemo and CoreML exports).
+        public static let vocabularyPath = "vocab.json"
+
+        public static let requiredModels: Set<String> = [
+            melSpectrogramPath,
+            audioEncoderPath,
+        ]
+    }
+
     /// VAD model names
     public enum VAD {
         public static let sileroVad = "silero-vad-unified-256ms-v6.0.0"
@@ -157,25 +209,20 @@ public enum ModelNames {
 
     /// Parakeet EOU streaming model names
     public enum ParakeetEOU {
-        public static let preprocessor = "parakeet_eou_preprocessor"
         public static let encoder = "streaming_encoder"
         public static let decoder = "decoder"
         public static let joint = "joint_decision"
         public static let vocab = "vocab.json"
-        public static let tokenizer = "tokenizer.model"
 
-        public static let preprocessorFile = preprocessor + ".mlmodelc"
         public static let encoderFile = encoder + ".mlmodelc"
         public static let decoderFile = decoder + ".mlmodelc"
         public static let jointFile = joint + ".mlmodelc"
 
         public static let requiredModels: Set<String> = [
-            preprocessorFile,
             encoderFile,
             decoderFile,
             jointFile,
             vocab,
-            tokenizer,
         ]
     }
 
@@ -259,6 +306,143 @@ public enum ModelNames {
             Set(Variant.allCases.map(\.fileName))
         }
     }
+    
+    /// Sortformer streaming diarization model names
+    public enum LSEEND {
+        public enum Variant: CaseIterable, Sendable {
+            case ami
+            case callhome
+            case dihard2
+            case dihard3
+            
+            public var name: String {
+                switch self {
+                case .ami:
+                    return "AMI/ls_eend_ami_step"
+                case .callhome:
+                    return "CALLHOME/ls_eend_callhome_step"
+                case .dihard2:
+                    return "DIHARD II/ls_eend_dih2_step"
+                case .dihard3:
+                    return "DIHARD III/ls_eend_dih3_step"
+                }
+            }
+            
+            public var modelFile: String { "\(name).mlmodelc" }
+            
+            public var configFile: String { "\(name).json" }
+            
+            public var fileNames: [String] { [modelFile, configFile] }
+        }
+        
+        /// Lowest latency for streaming
+        public static let defaultVariant: Variant = .dihard3
+        
+        /// Bundle name for a specific variant
+        public static func bundle(for varient: Variant) -> [String] {
+            return varient.fileNames
+        }
+        
+        /// Default bundle name
+        public static var defaultBundle: [String] {
+            return defaultVariant.fileNames
+        }
+
+        /// All Sortformer bundle models required by the downloader
+        public static var requiredModels: Set<String> {
+            Set(Variant.allCases.flatMap(\.fileNames))
+        }
+    }
+
+    /// Qwen3-ASR model names
+    public enum Qwen3ASR {
+        public static let audioEncoderFile = "qwen3_asr_audio_encoder.mlmodelc"
+        public static let embeddingFile = "qwen3_asr_embedding.mlmodelc"
+        public static let decoderStatefulFile = "qwen3_asr_decoder_stateful.mlmodelc"
+        public static let decoderFullFile = "qwen3_asr_decoder_full.mlmodelc"
+        public static let embeddingsFile = "qwen3_asr_embeddings.bin"
+
+        /// Legacy model names (lmHead is now fused into decoder_stateful)
+        public static let lmHeadFile = "qwen3_asr_lm_head.mlmodelc"
+        public static let decoderStackFile = "qwen3_asr_decoder_stack.mlmodelc"
+        public static let decoderPrefillFile = "qwen3_asr_decoder_prefill.mlmodelc"
+
+        /// Required models for 3-model pipeline (with embedding CoreML model)
+        public static let requiredModels: Set<String> = [
+            audioEncoderFile,
+            embeddingFile,
+            decoderStatefulFile,
+        ]
+
+        /// Required files for 2-model pipeline (with Swift-side embedding)
+        public static let requiredModelsFull: Set<String> = [
+            audioEncoderFile,
+            decoderStatefulFile,
+            embeddingsFile,
+        ]
+    }
+
+    /// PocketTTS model names (flow-matching language model TTS)
+    public enum PocketTTS {
+        public static let condStep = "cond_step"
+        public static let flowlmStep = "flowlm_step"
+        public static let flowDecoder = "flow_decoder"
+        public static let mimiDecoder = "mimi_decoder_v2"
+        public static let mimiEncoder = "mimi_encoder"
+
+        public static let condStepFile = condStep + ".mlmodelc"
+        public static let flowlmStepFile = flowlmStep + ".mlmodelc"
+        public static let flowDecoderFile = flowDecoder + ".mlmodelc"
+        public static let mimiDecoderFile = mimiDecoder + ".mlmodelc"
+        public static let mimiEncoderFile = mimiEncoder + ".mlmodelc"
+
+        /// Directory containing binary constants, tokenizer, and voice data.
+        public static let constantsBinDir = "constants_bin"
+
+        public static let requiredModels: Set<String> = [
+            condStepFile,
+            flowlmStepFile,
+            flowDecoderFile,
+            mimiDecoderFile,
+            constantsBinDir,
+        ]
+
+        /// Models required for voice cloning (optional feature).
+        public static let voiceCloningModels: Set<String> = [
+            mimiEncoderFile
+        ]
+    }
+
+    /// Multilingual G2P (CharsiuG2P ByT5) model names
+    public enum MultilingualG2P {
+        public static let encoder = "MultilingualG2PEncoder"
+        public static let decoder = "MultilingualG2PDecoder"
+
+        public static let encoderFile = encoder + ".mlmodelc"
+        public static let decoderFile = decoder + ".mlmodelc"
+
+        public static let requiredModels: Set<String> = [
+            encoderFile,
+            decoderFile,
+        ]
+    }
+
+    /// G2P (grapheme-to-phoneme) model names
+    public enum G2P {
+        public static let encoder = "G2PEncoder"
+        public static let decoder = "G2PDecoder"
+        public static let vocabulary = "g2p_vocab"
+
+        public static let encoderFile = encoder + ".mlmodelc"
+        public static let decoderFile = decoder + ".mlmodelc"
+        public static let vocabularyFile = vocabulary + ".json"
+
+        public static let requiredModels: Set<String> = [
+            encoderFile,
+            decoderFile,
+            vocabularyFile,
+        ]
+    }
 
     /// TTS model names
     public enum TTS {
@@ -304,7 +488,7 @@ public enum ModelNames {
 
         /// All Kokoro model bundles required by the downloader.
         public static var requiredModels: Set<String> {
-            Set(Variant.allCases.map { $0.fileName })
+            Set(Variant.allCases.map(\.fileName))
         }
     }
 
@@ -314,6 +498,8 @@ public enum ModelNames {
             return ModelNames.VAD.requiredModels
         case .parakeet, .parakeetV2:
             return ModelNames.ASR.requiredModels
+        case .parakeetCtc110m, .parakeetCtc06b:
+            return ModelNames.CTC.requiredModels
         case .parakeetEou160, .parakeetEou320:
             return ModelNames.ParakeetEOU.requiredModels
         case .diarizer:
@@ -322,9 +508,29 @@ public enum ModelNames {
             }
             return ModelNames.Diarizer.requiredModels
         case .kokoro:
-            return ModelNames.TTS.requiredModels
+            let ttsModels: Set<String>
+            if let variant = variant {
+                ttsModels = [variant]
+            } else {
+                ttsModels = ModelNames.TTS.requiredModels
+            }
+            return ttsModels.union(ModelNames.G2P.requiredModels)
+        case .pocketTts:
+            return ModelNames.PocketTTS.requiredModels
         case .sortformer:
+            if let variant = variant {
+                return [variant]
+            }
             return ModelNames.Sortformer.requiredModels
+        case .lseend:
+            if let variant = variant {
+                return [variant]
+            }
+            return ModelNames.LSEEND.requiredModels
+        case .qwen3Asr, .qwen3AsrInt8:
+            return ModelNames.Qwen3ASR.requiredModelsFull
+        case .multilingualG2p:
+            return ModelNames.MultilingualG2P.requiredModels
         }
     }
 }
