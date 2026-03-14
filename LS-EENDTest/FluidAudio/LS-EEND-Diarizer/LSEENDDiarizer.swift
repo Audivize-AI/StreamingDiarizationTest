@@ -96,6 +96,7 @@ public final class LSEENDDiarizer: Diarizer {
 
     private var _engine: LSEENDInferenceEngine?
     private var _session: LSEENDStreamingSession?
+    private var _melSpectrogram: NeMoMelSpectrogram?
     private var _timeline: DiarizerTimeline
     private var _numFramesProcessed: Int = 0
 
@@ -146,11 +147,13 @@ public final class LSEENDDiarizer: Diarizer {
     /// - Parameter descriptor: Model descriptor specifying variant and file paths
     public func initialize(descriptor: LSEENDModelDescriptor) throws {
         let engine = try LSEENDInferenceEngine(descriptor: descriptor, computeUnits: computeUnits)
+        let melSpectrogram = Self.createMelSpectrogram(featureConfig: engine.featureConfig)
 
         lock.lock()
         defer { lock.unlock() }
 
         _engine = engine
+        _melSpectrogram = melSpectrogram
         _timeline = DiarizerTimeline(config: makePostProcessingConfig(engine: engine))
         _session = nil
         resetBuffersLocked()
@@ -165,10 +168,13 @@ public final class LSEENDDiarizer: Diarizer {
 
     /// Initialize with a pre-loaded engine.
     public func initialize(engine: LSEENDInferenceEngine) {
+        let melSpectrogram = Self.createMelSpectrogram(featureConfig: engine.featureConfig)
+
         lock.lock()
         defer { lock.unlock() }
 
         _engine = engine
+        _melSpectrogram = melSpectrogram
         _timeline = DiarizerTimeline(config: makePostProcessingConfig(engine: engine))
         _session = nil
         resetBuffersLocked()
@@ -212,7 +218,7 @@ public final class LSEENDDiarizer: Diarizer {
 
         // Lazily create session on first process call
         if _session == nil {
-            _session = try engine.createSession(inputSampleRate: engine.targetSampleRate)
+            _session = try engine.createSession(inputSampleRate: engine.targetSampleRate, melSpectrogram: _melSpectrogram!)
         }
 
         guard let session = _session else { return nil }
@@ -255,7 +261,7 @@ public final class LSEENDDiarizer: Diarizer {
         guard !pendingAudio.isEmpty else { return nil }
 
         if _session == nil {
-            _session = try engine.createSession(inputSampleRate: engine.targetSampleRate)
+            _session = try engine.createSession(inputSampleRate: engine.targetSampleRate, melSpectrogram: _melSpectrogram!)
         }
         guard let session = _session else { return nil }
 
@@ -327,7 +333,7 @@ public final class LSEENDDiarizer: Diarizer {
         _session = nil
         pendingAudio.removeAll(keepingCapacity: true)
 
-        let session = try engine.createSession(inputSampleRate: engine.targetSampleRate)
+        let session = try engine.createSession(inputSampleRate: engine.targetSampleRate, melSpectrogram: _melSpectrogram!)
         let chunkSize = max(1, Int(round(chunkSeconds * Double(engine.targetSampleRate))))
         let numSpeakers = engine.metadata.realOutputDim
 
@@ -411,6 +417,7 @@ public final class LSEENDDiarizer: Diarizer {
 
         _engine = nil
         _session = nil
+        _melSpectrogram = nil
         _timeline.reset()
         resetBuffersLocked()
         logger.info("LS-EEND resources cleaned up")
@@ -466,6 +473,22 @@ public final class LSEENDDiarizer: Diarizer {
     private func resetBuffersLocked() {
         pendingAudio.removeAll(keepingCapacity: true)
         _numFramesProcessed = 0
+    }
+
+    /// Create a new mel spectrogram instance owned by this diarizer.
+    private static func createMelSpectrogram(featureConfig: LSEENDFeatureConfig) -> NeMoMelSpectrogram {
+        NeMoMelSpectrogram(
+            sampleRate: featureConfig.sampleRate,
+            nMels: featureConfig.nMels,
+            nFFT: featureConfig.nFFT,
+            hopLength: featureConfig.hopLength,
+            winLength: featureConfig.winLength,
+            preemph: 0,
+            padTo: 1,
+            logFloor: 1e-10,
+            logFloorMode: .clamped,
+            windowPeriodic: true
+        )
     }
 
     private func makePostProcessingConfig(engine: LSEENDInferenceEngine) -> DiarizerPostProcessingConfig {
