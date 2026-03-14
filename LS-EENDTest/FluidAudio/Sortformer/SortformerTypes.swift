@@ -232,6 +232,7 @@ public struct SortformerConfig: Sendable {
 }
 
 /// Configuration for post-processing Sortformer diarizer predictions
+@available(*, deprecated, message: "Use DiarizerPostProcessingConfig instead")
 public struct SortformerPostProcessingConfig {
     /// Onset threshold for detecting the beginning and end of a speech
     public var onsetThreshold: Float
@@ -330,6 +331,21 @@ public struct SortformerPostProcessingConfig {
         self.minFramesOn = minFramesOn
         self.minFramesOff = minFramesOff
         self.maxStoredFrames = maxStoredFrames
+    }
+
+    /// Convert to the unified DiarizerPostProcessingConfig
+    public func toDiarizerConfig() -> DiarizerPostProcessingConfig {
+        DiarizerPostProcessingConfig(
+            numSpeakers: numSpeakers,
+            frameDurationSeconds: frameDurationSeconds,
+            onsetThreshold: onsetThreshold,
+            offsetThreshold: offsetThreshold,
+            onsetPadFrames: onsetPadFrames,
+            offsetPadFrames: offsetPadFrames,
+            minFramesOn: minFramesOn,
+            minFramesOff: minFramesOff,
+            maxStoredFrames: maxStoredFrames
+        )
     }
 }
 
@@ -491,56 +507,9 @@ public struct StreamingUpdateResult: Sendable {
     }
 }
 
-/// Result from a single streaming diarization step
-public struct SortformerChunkResult: Sendable {
-    /// Speaker probabilities for confirmed frames in this chunk
-    /// Shape: [chunkLen, numSpeakers] (e.g., [6, 4])
-    public let speakerPredictions: [Float]
-
-    /// Number of confirmed frames in this result
-    public let frameCount: Int
-
-    /// Frame index of the first confirmed frame
-    public let startFrame: Int
-
-    /// Tentative predictions for right context frames (may change with next chunk)
-    /// Shape: [rightContext, numSpeakers]. Empty if no right context.
-    public let tentativePredictions: [Float]
-
-    /// Number of tentative frames
-    public let tentativeFrameCount: Int
-
-    /// Frame index of first tentative frame
-    public var tentativeStartFrame: Int {
-        startFrame + frameCount
-    }
-
-    public init(
-        startFrame: Int,
-        speakerPredictions: [Float],
-        frameCount: Int,
-        tentativePredictions: [Float] = [],
-        tentativeFrameCount: Int = 0
-    ) {
-        self.speakerPredictions = speakerPredictions
-        self.frameCount = frameCount
-        self.startFrame = startFrame
-        self.tentativePredictions = tentativePredictions
-        self.tentativeFrameCount = tentativeFrameCount
-    }
-
-    /// Get probability for a specific speaker at a specific confirmed frame
-    public func getSpeakerPrediction(speaker: Int, frame: Int, numSpeakers: Int = 4) -> Float {
-        guard frame < frameCount, speaker < numSpeakers else { return 0.0 }
-        return speakerPredictions[frame * numSpeakers + speaker]
-    }
-
-    /// Get tentative probability for a specific speaker at a specific tentative frame
-    public func getTentativePrediction(speaker: Int, frame: Int, numSpeakers: Int = 4) -> Float {
-        guard frame < tentativeFrameCount, speaker < numSpeakers else { return 0.0 }
-        return tentativePredictions[frame * numSpeakers + speaker]
-    }
-}
+/// Backward-compatible typealias — SortformerChunkResult is now DiarizerChunkResult
+@available(*, deprecated, renamed: "DiarizerChunkResult")
+public typealias SortformerChunkResult = DiarizerChunkResult
 
 // MARK: - Errors
 

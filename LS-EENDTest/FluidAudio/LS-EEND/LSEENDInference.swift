@@ -175,6 +175,14 @@ public final class LSEENDInferenceEngine {
         try LSEENDStreamingSession(engine: self, inputSampleRate: inputSampleRate)
     }
 
+    /// Create a streaming session with a custom (non-shared) mel spectrogram.
+    ///
+    /// Use this overload when the caller owns its own mel spectrogram instance
+    /// for thread-safety or isolation.
+    public func createSession(inputSampleRate: Int, melSpectrogram: NeMoMelSpectrogram) throws -> LSEENDStreamingSession {
+        try LSEENDStreamingSession(engine: self, inputSampleRate: inputSampleRate, melSpectrogram: melSpectrogram)
+    }
+
     public func infer(samples: [Float], sampleRate: Int) throws -> LSEENDInferenceResult {
         let normalizedAudio = try resampleIfNeeded(samples: samples, sampleRate: sampleRate)
         let features = try offlineFeatureExtractor.extractFeatures(audio: normalizedAudio)
@@ -398,7 +406,7 @@ public final class LSEENDStreamingSession {
     fileprivate var totalFeatureFrames = 0
     fileprivate var emittedFrames = 0
 
-    fileprivate init(engine: LSEENDInferenceEngine, inputSampleRate: Int) throws {
+    fileprivate init(engine: LSEENDInferenceEngine, inputSampleRate: Int, melSpectrogram: NeMoMelSpectrogram? = nil) throws {
         guard inputSampleRate == engine.targetSampleRate else {
             throw LSEENDError.unsupportedAudio(
                 "Stateful LS-EEND streaming expects \(engine.targetSampleRate) Hz audio, received \(inputSampleRate) Hz."
@@ -406,7 +414,7 @@ public final class LSEENDStreamingSession {
         }
         self.engine = engine
         self.inputSampleRate = inputSampleRate
-        featureExtractor = LSEENDStreamingFeatureExtractor(metadata: engine.metadata, spectrogram: engine.melSpectrogram)
+        featureExtractor = LSEENDStreamingFeatureExtractor(metadata: engine.metadata, spectrogram: melSpectrogram ?? engine.melSpectrogram)
         state = try engine.initialState()
         zeroFrame = [Float](repeating: 0, count: engine.metadata.inputDim)
     }

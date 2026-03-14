@@ -23,17 +23,17 @@ import OSLog
 /// // Or complete file
 /// let result = try diarizer.processComplete(audioSamples)
 /// ```
-public final class SortformerDiarizer {
+public final class SortformerDiarizer: Diarizer {
     /// Lock for thread-safe access to mutable state
     private let lock = NSLock()
 
     /// Accumulated results
-    public var timeline: SortformerTimeline {
+    public var timeline: DiarizerTimeline {
         lock.lock()
         defer { lock.unlock() }
         return _timeline
     }
-    private var _timeline: SortformerTimeline
+    private var _timeline: DiarizerTimeline
 
     /// Check if diarizer is ready for processing.
     public var isAvailable: Bool {
@@ -61,6 +61,17 @@ public final class SortformerDiarizer {
     /// Configuration
     public let config: SortformerConfig
 
+    // MARK: - Diarizer Protocol Properties
+
+    /// Model's target sample rate in Hz
+    public var targetSampleRate: Int? { config.sampleRate }
+
+    /// Output frame rate in Hz
+    public var modelFrameHz: Double? { 1.0 / Double(config.frameDurationSeconds) }
+
+    /// Number of speaker output tracks
+    public var numSpeakers: Int? { config.numSpeakers }
+
     private let logger = AppLogger(category: "SortformerDiarizerPipeline")
     private let stateUpdater: SortformerStateUpdater
 
@@ -82,11 +93,24 @@ public final class SortformerDiarizer {
 
     // MARK: - Initialization
 
-    public init(config: SortformerConfig = .default, postProcessingConfig: SortformerPostProcessingConfig = .default) {
+    public init(
+        config: SortformerConfig = .default,
+        postProcessingConfig: DiarizerPostProcessingConfig = .default(
+            numSpeakers: 4, frameDurationSeconds: 0.08)
+    ) {
         self.config = config
         self.stateUpdater = SortformerStateUpdater(config: config)
         self._state = SortformerStreamingState(config: config)
-        self._timeline = SortformerTimeline(config: postProcessingConfig)
+        self._timeline = DiarizerTimeline(config: postProcessingConfig)
+    }
+
+    /// Backward-compatible initializer accepting the legacy SortformerPostProcessingConfig.
+    @available(*, deprecated, message: "Use init(config:postProcessingConfig:) with DiarizerPostProcessingConfig instead")
+    public init(config: SortformerConfig = .default, legacyPostProcessingConfig: SortformerPostProcessingConfig) {
+        self.config = config
+        self.stateUpdater = SortformerStateUpdater(config: config)
+        self._state = SortformerStreamingState(config: config)
+        self._timeline = DiarizerTimeline(config: legacyPostProcessingConfig.toDiarizerConfig())
     }
 
     /// Initialize with CoreML models (combined pipeline mode).
@@ -218,7 +242,18 @@ public final class SortformerDiarizer {
 
     // MARK: - Streaming Processing
 
-    /// Add audio samples to the processing buffer.
+    /// Add audio samples to the processing buffer (protocol conformance).
+    ///
+    /// - Parameter samples: Audio samples (16kHz mono)
+    public func addAudio(_ samples: [Float]) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        audioBuffer.append(contentsOf: samples)
+        preprocessAudioToFeaturesLocked()
+    }
+
+    /// Add audio samples to the processing buffer (generic variant).
     ///
     /// - Parameter samples: Audio samples (16kHz mono)
     public func addAudio<C: Collection>(_ samples: C) where C.Element == Float {
@@ -234,7 +269,7 @@ public final class SortformerDiarizer {
     /// Call this after adding audio with `addAudio()`.
     ///
     /// - Returns: New chunk results if enough audio was processed, nil otherwise
-    public func process() throws -> SortformerChunkResult? {
+    public func process() throws -> DiarizerChunkResult? {
         lock.lock()
         defer { lock.unlock() }
 
@@ -287,7 +322,7 @@ public final class SortformerDiarizer {
 
         // Return new results if any
         if newPredictions.count > 0 {
-            let chunk = SortformerChunkResult(
+            let chunk = DiarizerChunkResult(
                 startFrame: _numFramesProcessed,
                 speakerPredictions: newPredictions,
                 frameCount: newFrameCount,
@@ -310,7 +345,7 @@ public final class SortformerDiarizer {
     ///
     /// - Parameter samples: Audio samples (16kHz mono)
     /// - Returns: New chunk results if enough audio was processed
-    public func processSamples(_ samples: [Float]) throws -> SortformerChunkResult? {
+    public func processSamples(_ samples: [Float]) throws -> DiarizerChunkResult? {
         lock.lock()
         defer { lock.unlock() }
 
@@ -320,7 +355,7 @@ public final class SortformerDiarizer {
     }
 
     /// Internal process - caller must hold lock
-    private func processLocked() throws -> SortformerChunkResult? {
+    private func processLocked() throws -> DiarizerChunkResult? {
         guard let models = _models else {
             throw SortformerError.notInitialized
         }
@@ -362,7 +397,7 @@ public final class SortformerDiarizer {
         }
 
         if newPredictions.count > 0 {
-            let chunk = SortformerChunkResult(
+            let chunk = DiarizerChunkResult(
                 startFrame: _numFramesProcessed,
                 speakerPredictions: newPredictions,
                 frameCount: newFrameCount,
@@ -393,7 +428,7 @@ public final class SortformerDiarizer {
     public func processComplete(
         _ samples: [Float],
         progressCallback: ProgressCallback? = nil
-    ) throws -> SortformerTimeline {
+    ) throws -> DiarizerTimeline {
         lock.lock()
         defer { lock.unlock() }
 
@@ -469,7 +504,7 @@ public final class SortformerDiarizer {
             fflush(stdout)
         }
 
-        _timeline = SortformerTimeline(
+        _timeline = DiarizerTimeline(
             allPredictions: predictions,
             config: _timeline.config,
             isComplete: true
