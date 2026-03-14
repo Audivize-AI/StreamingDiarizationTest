@@ -341,10 +341,10 @@ public class DiarizerTimeline {
     }
 
     /// Finalized segments per speaker
-    public private(set) var segments: [[DiarizerSegment]] = []
-
-    /// Tentative segments per speaker (may change as more predictions arrive)
-    public private(set) var tentativeSegments: [[DiarizerSegment]] = []
+    public private(set) var segments: [(confirmed: [DiarizerSegment], tentative: [DiarizerSegment])] = []
+//
+//    /// Tentative segments per speaker (may change as more predictions arrive)
+//    public private(set) var tentativeSegments: [[DiarizerSegment]] = []
 
     /// Duration of finalized predictions in seconds
     public var duration: Float {
@@ -371,8 +371,7 @@ public class DiarizerTimeline {
         activeStarts = Array(repeating: 0, count: config.numSpeakers)
         recentSegments = Array(repeating: (0, 0), count: config.numSpeakers)
         activeSpeakers = Array(repeating: false, count: config.numSpeakers)
-        segments = Array(repeating: [], count: config.numSpeakers)
-        tentativeSegments = Array(repeating: [], count: config.numSpeakers)
+        segments = Array(repeating: ([], []), count: config.numSpeakers)
     }
 
     /// Initialize with existing probabilities (batch processing or restored state)
@@ -405,7 +404,7 @@ public class DiarizerTimeline {
         framePredictions.append(contentsOf: chunk.speakerPredictions)
         tentativePredictions = chunk.tentativePredictions
         for i in 0..<config.numSpeakers {
-            tentativeSegments[i].removeAll(keepingCapacity: true)
+            segments[i].tentative.removeAll(keepingCapacity: true)
         }
 
         updateSegments(
@@ -431,10 +430,10 @@ public class DiarizerTimeline {
         numFrames += numTentative
         tentativePredictions.removeAll()
         for i in 0..<config.numSpeakers {
-            segments[i].append(contentsOf: tentativeSegments[i])
-            tentativeSegments[i].removeAll()
-            if let lastSegment = segments[i].last, lastSegment.length < config.minFramesOn {
-                segments[i].removeLast()
+            segments[i].confirmed.append(contentsOf: segments[i].tentative)
+            segments[i].tentative.removeAll()
+            if let lastSegment = segments[i].confirmed.last, lastSegment.length < config.minFramesOn {
+                segments[i].confirmed.removeLast()
             }
         }
         trimPredictions()
@@ -448,8 +447,7 @@ public class DiarizerTimeline {
         activeStarts = Array(repeating: 0, count: config.numSpeakers)
         activeSpeakers = Array(repeating: false, count: config.numSpeakers)
         recentSegments = Array(repeating: (0, 0), count: config.numSpeakers)
-        segments = Array(repeating: [], count: config.numSpeakers)
-        tentativeSegments = Array(repeating: [], count: config.numSpeakers)
+        segments = Array(repeating: ([], []), count: config.numSpeakers)
     }
 
     // MARK: - Query
@@ -519,9 +517,9 @@ public class DiarizerTimeline {
                     )
 
                     if wasLastSegmentFinal {
-                        segments[speakerIndex].append(newSegment)
+                        segments[speakerIndex].confirmed.append(newSegment)
                     } else {
-                        tentativeSegments[speakerIndex].append(newSegment)
+                        segments[speakerIndex].tentative.append(newSegment)
                     }
                     lastSegment = (start, end)
 
@@ -532,9 +530,9 @@ public class DiarizerTimeline {
                     if start - lastSegment.end <= minFramesOff {
                         start = lastSegment.start
                         if wasLastSegmentFinal {
-                            _ = segments[speakerIndex].popLast()
+                            _ = segments[speakerIndex].confirmed.popLast()
                         } else {
-                            _ = tentativeSegments[speakerIndex].popLast()
+                            _ = segments[speakerIndex].tentative.popLast()
                         }
                     }
                 }
@@ -556,7 +554,7 @@ public class DiarizerTimeline {
                         finalized: false,
                         frameDurationSeconds: frameDuration
                     )
-                    tentativeSegments[speakerIndex].append(newSegment)
+                    segments[speakerIndex].tentative.append(newSegment)
                 }
             }
         }
