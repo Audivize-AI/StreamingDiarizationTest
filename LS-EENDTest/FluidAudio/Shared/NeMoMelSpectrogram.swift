@@ -21,6 +21,11 @@ public final class NeMoMelSpectrogram {
         case prePadded
     }
 
+    public enum LogFloorMode: Sendable {
+        case additive
+        case clamped
+    }
+
     // Config
     private let sampleRate: Int
     private let nFFT: Int
@@ -29,10 +34,12 @@ public final class NeMoMelSpectrogram {
     private let fMin: Float = 0.0
     private let fMax: Float  // sample_rate / 2
     private let preemph: Float // NeMo preemphasis coefficient
-    private let logZeroGuard: Float = powf(2, -24)
+    private let logFloor: Float
+    private let logFloorMode: LogFloorMode
     private let padValue: Float = 0
     private let nMels: Int
     private let padTo: Int
+    private let windowPeriodic: Bool
 
     // Pre-computed
     private let hannWindow: [Float]
@@ -57,6 +64,9 @@ public final class NeMoMelSpectrogram {
         winLength: Int = 400,
         preemph: Float = 0.97,
         padTo: Int = 0,
+        logFloor: Float = powf(2, -24),
+        logFloorMode: LogFloorMode = .additive,
+        windowPeriodic: Bool = false
     ) {
         self.nMels = nMels
         self.padTo = max(1, padTo)
@@ -65,10 +75,14 @@ public final class NeMoMelSpectrogram {
         self.hopLength = hopLength
         self.winLength = winLength
         self.preemph = preemph
+        self.logFloor = logFloor
+        self.logFloorMode = logFloorMode
+        self.windowPeriodic = windowPeriodic
         self.fMax = Float(sampleRate) / 2.0
         
-        // 1. Create symmetric Hann window (matches PyTorch hann_window(periodic=False))
-        self.hannWindow = Self.createHannWindow(length: winLength, periodic: false)
+        // 1. Create Hann window. NeMo defaults to a symmetric window, while
+        // librosa/STFT paths use a periodic window.
+        self.hannWindow = Self.createHannWindow(length: winLength, periodic: windowPeriodic)
 
         // 2. Create mel filterbank with Slaney normalization
         self.melFilterbank = Self.createMelFilterbank(
@@ -146,8 +160,7 @@ public final class NeMoMelSpectrogram {
 
             // Apply log (with floor for numerical stability)
             let logMelSpec = melSpec.map { value -> Float in
-                let floored = max(value, 1e-10)
-                return log(floored)
+                self.logValue(value)
             }
 
             melFrames.append(logMelSpec)
@@ -267,7 +280,7 @@ public final class NeMoMelSpectrogram {
 
             // Apply log(x + guard_value) and store in output
             for melIdx in 0..<nMels {
-                mel[melIdx * numFrames + frameIdx] = log(melFrame[melIdx] + logZeroGuard)
+                mel[melIdx * numFrames + frameIdx] = logValue(melFrame[melIdx])
             }
         }
 
@@ -423,7 +436,7 @@ public final class NeMoMelSpectrogram {
 
             // Apply log(x + guard_value) and store in output
             for melIdx in 0..<nMels {
-                mel[frameIdx * nMels + melIdx] = log(melFrame[melIdx] + logZeroGuard)
+                mel[frameIdx * nMels + melIdx] = logValue(melFrame[melIdx])
             }
         }
 
@@ -512,6 +525,15 @@ public final class NeMoMelSpectrogram {
         }
 
         return melSpec
+    }
+
+    private func logValue(_ value: Float) -> Float {
+        switch logFloorMode {
+        case .additive:
+            return log(value + logFloor)
+        case .clamped:
+            return log(max(value, logFloor))
+        }
     }
 
     // MARK: - Static Factory Methods

@@ -6,27 +6,27 @@
 //
 
 import SwiftUI
-import SwiftData
+
+private extension ProcessInfo {
+    var isRunningXCTest: Bool {
+        environment["XCTestConfigurationFilePath"] != nil
+    }
+}
 
 @main
 struct LS_EENDTestApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-
-        do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
-        } catch {
-            fatalError("Could not create ModelContainer: \(error)")
-        }
-    }()
+    init() {
+        LSEENDRuntimeProbeSupport.runIfRequested()
+    }
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            if ProcessInfo.processInfo.isRunningXCTest {
+                Text("LS-EENDTest XCTest Host")
+                    .frame(minWidth: 320, minHeight: 200)
+            } else {
+                ContentView()
+            }
         }
-        .modelContainer(sharedModelContainer)
     }
 }

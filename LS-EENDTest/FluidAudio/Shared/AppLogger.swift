@@ -20,6 +20,7 @@ public struct AppLogger {
     private let osLogger: Logger
     private let subsystem: String
     private let category: String
+    private static let isRunningXCTest = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
 
     /// Designated initializer allowing a custom subsystem if needed.
     public init(subsystem: String, category: String) {
@@ -61,9 +62,6 @@ public struct AppLogger {
 
     // MARK: - Console Mirroring
     private func log(_ level: Level, _ message: String) {
-        #if DEBUG
-        logToConsole(level, message)
-        #else
         switch level {
         case .debug:
             osLogger.debug("\(message)")
@@ -78,20 +76,25 @@ public struct AppLogger {
         case .fault:
             osLogger.fault("\(message)")
         }
+
+        #if DEBUG
+        if !Self.isRunningXCTest {
+            logToConsole(level, message)
+        }
         #endif
     }
 
     private func logToConsole(_ level: Level, _ message: String) {
-        Task.detached(priority: .utility) {
-            await LogConsole.shared.write(level: level, category: category, message: message)
-        }
+        LogConsole.shared.write(level: level, category: category, message: message)
     }
 }
 
 // MARK: - Console Sink (thread-safe)
 
-actor LogConsole {
+final class LogConsole {
     static let shared = LogConsole()
+
+    private let lock = NSLock()
 
     private let dateFormatter: DateFormatter = {
         let df = DateFormatter()
@@ -100,6 +103,8 @@ actor LogConsole {
     }()
 
     func write(level: AppLogger.Level, category: String, message: String) {
+        lock.lock()
+        defer { lock.unlock() }
         let timestamp = dateFormatter.string(from: Date())
         let line = "[\(timestamp)] [\(label(for: level))] [FluidAudio.\(category)] \(message)\n"
         if let data = line.data(using: .utf8) {
