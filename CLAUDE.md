@@ -30,7 +30,7 @@ The LS-EEND (Linear Streaming End-to-End Neural Diarization) pipeline is statefu
 
 1. **Feature extraction** (`LSEENDFeatureExtraction.swift`): Mel spectrogram → log-mel cumulative mean normalization → splice-and-subsample context windowing. Two extractors exist: `LSEENDOfflineFeatureExtractor` (batch) and `LSEENDStreamingFeatureExtractor` (incremental with audio buffer management).
 
-2. **Stateful model inference** (`LSEENDInference.swift`): `LSEENDInferenceEngine` wraps a CoreML model with 6-tensor RNN state (enc/dec KV caches, scales, conv cache, top buffer). Each `predictStep` feeds one feature frame and returns logits + updated state. The engine caches compiled models and shared resources via `LSEENDInferenceSharedResourcesStore` (keyed by model path + compute units).
+2. **Stateful model inference** (`LSEENDInference.swift`): `LSEENDInferenceEngine` wraps a CoreML model with 6-tensor RNN state (enc/dec KV caches, scales, conv cache, top buffer). Each `predictStep` feeds one feature frame and returns logits + updated state. Each engine instance owns its own resources (compiled model, mel spectrogram, feature extractor) — no shared singletons.
 
 3. **Streaming session** (`LSEENDStreamingSession`): Manages incremental audio → feature → inference loop. `pushAudio()` returns committed frames + a preview tail (zero-padded decode of pending frames). `finalize()` flushes remaining frames. `snapshot()` assembles the full result.
 
@@ -62,7 +62,7 @@ The Sortformer diarizer runtime has been removed from this app target. Only `Sor
 
 ## Key patterns
 
-- **Shared resource caching**: `LSEENDInferenceSharedResourcesStore` and `LSEENDMelSpectrogramStore` are singletons with NSLock-guarded caches, keyed by model path or feature config. Multiple engine instances sharing the same model path reuse the same compiled MLModel.
+- **Per-instance resources**: Each `LSEENDInferenceEngine` creates its own `LSEENDInferenceSharedResources` (model, mel spectrogram, feature extractor). No singletons or shared caches — safe for Swift 6 strict concurrency.
 - **State deep-copying**: `LSEENDModelState.copy()` and `cloneMultiArray` create independent copies of MLMultiArray tensors for preview/branch inference without mutating the committed state.
 - **Full vs real outputs**: The model outputs `fullOutputDim` columns (including 2 boundary tracks). `cropRealTracks` strips the first and last columns to yield `realOutputDim` speaker probabilities.
 - **Threading**: NSLock for mutable shared state, DispatchQueue for async processing. Not Actor-based.

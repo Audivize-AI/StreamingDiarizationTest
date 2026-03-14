@@ -28,111 +28,19 @@ public struct LSEENDFeatureConfig: Sendable, Hashable {
     }
 }
 
-struct LSEENDMelSpectrogramKey: Hashable {
-    let sampleRate: Int
-    let nMels: Int
-    let nFFT: Int
-    let hopLength: Int
-    let winLength: Int
-    let preemphBits: UInt32
-    let logFloorBits: UInt32
-    let logFloorModeRawValue: Int
-    let windowPeriodic: Bool
-    let padTo: Int
-
-    init(
-        sampleRate: Int,
-        nMels: Int,
-        nFFT: Int,
-        hopLength: Int,
-        winLength: Int,
-        preemph: Float,
-        logFloor: Float,
-        logFloorMode: NeMoMelSpectrogram.LogFloorMode,
-        windowPeriodic: Bool,
-        padTo: Int
-    ) {
-        self.sampleRate = sampleRate
-        self.nMels = nMels
-        self.nFFT = nFFT
-        self.hopLength = hopLength
-        self.winLength = winLength
-        preemphBits = preemph.bitPattern
-        logFloorBits = logFloor.bitPattern
-        logFloorModeRawValue = logFloorMode == .additive ? 0 : 1
-        self.windowPeriodic = windowPeriodic
-        self.padTo = padTo
-    }
-}
-
-final class LSEENDMelSpectrogramStore {
-    static let shared = LSEENDMelSpectrogramStore()
-
-    private let lock = NSLock()
-    private var cache: [LSEENDMelSpectrogramKey: NeMoMelSpectrogram] = [:]
-
-    private init() {}
-
-    func spectrogram(for config: LSEENDFeatureConfig) -> NeMoMelSpectrogram {
-        let key = LSEENDMelSpectrogramKey(
-            sampleRate: config.sampleRate,
-            nMels: config.nMels,
-            nFFT: config.nFFT,
-            hopLength: config.hopLength,
-            winLength: config.winLength,
-            preemph: 0,
-            logFloor: 1e-10,
-            logFloorMode: .clamped,
-            windowPeriodic: true,
-            padTo: 1
-        )
-
-        lock.lock()
-        defer { lock.unlock() }
-
-        if let cached = cache[key] {
-            return cached
-        }
-
-        let created = NeMoMelSpectrogram(
-            sampleRate: config.sampleRate,
-            nMels: config.nMels,
-            nFFT: config.nFFT,
-            hopLength: config.hopLength,
-            winLength: config.winLength,
-            preemph: 0,
-            padTo: 1,
-            logFloor: 1e-10,
-            logFloorMode: .clamped,
-            windowPeriodic: true
-        )
-        cache[key] = created
-        return created
-    }
-}
-
-final class LSEENDOfflineFeatureExtractorStore {
-    static let shared = LSEENDOfflineFeatureExtractorStore()
-
-    private let lock = NSLock()
-    private var cache: [LSEENDFeatureConfig: LSEENDOfflineFeatureExtractor] = [:]
-
-    private init() {}
-
-    func extractor(for metadata: LSEENDModelMetadata, spectrogram: NeMoMelSpectrogram) -> LSEENDOfflineFeatureExtractor {
-        let config = LSEENDFeatureConfig(metadata: metadata)
-
-        lock.lock()
-        defer { lock.unlock() }
-
-        if let cached = cache[config] {
-            return cached
-        }
-
-        let created = LSEENDOfflineFeatureExtractor(metadata: metadata, spectrogram: spectrogram)
-        cache[config] = created
-        return created
-    }
+private func createMelSpectrogram(for config: LSEENDFeatureConfig) -> NeMoMelSpectrogram {
+    NeMoMelSpectrogram(
+        sampleRate: config.sampleRate,
+        nMels: config.nMels,
+        nFFT: config.nFFT,
+        hopLength: config.hopLength,
+        winLength: config.winLength,
+        preemph: 0,
+        padTo: 1,
+        logFloor: 1e-10,
+        logFloorMode: .clamped,
+        windowPeriodic: true
+    )
 }
 
 public final class LSEENDOfflineFeatureExtractor {
@@ -142,7 +50,7 @@ public final class LSEENDOfflineFeatureExtractor {
     public init(metadata: LSEENDModelMetadata, spectrogram: NeMoMelSpectrogram? = nil) {
         let featureConfig = LSEENDFeatureConfig(metadata: metadata)
         config = featureConfig
-        self.spectrogram = spectrogram ?? LSEENDMelSpectrogramStore.shared.spectrogram(for: featureConfig)
+        self.spectrogram = spectrogram ?? createMelSpectrogram(for: featureConfig)
     }
 
     public func extractFeatures(audio: [Float]) throws -> LSEENDMatrix {
@@ -246,7 +154,7 @@ public final class LSEENDStreamingFeatureExtractor {
     public init(metadata: LSEENDModelMetadata, spectrogram: NeMoMelSpectrogram? = nil) {
         let featureConfig = LSEENDFeatureConfig(metadata: metadata)
         config = featureConfig
-        self.spectrogram = spectrogram ?? LSEENDMelSpectrogramStore.shared.spectrogram(for: featureConfig)
+        self.spectrogram = spectrogram ?? createMelSpectrogram(for: featureConfig)
         cumulativeFeatureSum = [Double](repeating: 0, count: featureConfig.nMels)
     }
 
