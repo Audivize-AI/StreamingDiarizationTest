@@ -2,16 +2,29 @@ import Foundation
 
 private let lseendLogConversionFactor = Float(1.0 / Foundation.log(10.0))
 
+/// Resolved feature extraction parameters derived from ``LSEENDModelMetadata``.
+///
+/// Captures the concrete STFT and splice-and-subsample settings needed by the
+/// feature extractors, resolving any optional fields in the metadata to their defaults.
 public struct LSEENDFeatureConfig: Sendable, Hashable {
+    /// Audio sample rate in Hz (e.g. 8000).
     public let sampleRate: Int
+    /// STFT window length in samples.
     public let winLength: Int
+    /// STFT hop length in samples.
     public let hopLength: Int
+    /// FFT size (a power of 2 ≥ ``winLength``).
     public let nFFT: Int
+    /// Number of mel filterbank channels.
     public let nMels: Int
+    /// Context receptive field half-width for the splice step.
     public let contextRecp: Int
+    /// Subsampling factor (how many STFT frames per model frame).
     public let subsampling: Int
+    /// Total input feature dimension per model frame (`nMels × (2 × contextRecp + 1)`).
     public let inputDim: Int
 
+    /// Creates a feature config by resolving all parameters from the given metadata.
     public init(metadata: LSEENDModelMetadata) {
         sampleRate = metadata.resolvedSampleRate
         winLength = metadata.resolvedWinLength
@@ -23,6 +36,10 @@ public struct LSEENDFeatureConfig: Sendable, Hashable {
         inputDim = metadata.inputDim
     }
 
+    /// Minimum audio chunk size in samples that produces an integer number of model frames.
+    ///
+    /// Equal to `hopLength × subsampling`. Audio buffers should be multiples of this
+    /// size for consistent streaming behavior.
     public var stableBlockSize: Int {
         hopLength * subsampling
     }
@@ -43,16 +60,34 @@ private func createMelSpectrogram(for config: LSEENDFeatureConfig) -> NeMoMelSpe
     )
 }
 
+/// Batch feature extractor for offline LS-EEND inference.
+///
+/// Converts a complete audio buffer into model input features in one pass:
+/// 1. STFT → mel spectrogram
+/// 2. Log-mel with cumulative mean normalization
+/// 3. Splice-and-subsample context windowing
+///
+/// For incremental processing, use ``LSEENDStreamingFeatureExtractor`` instead.
 public final class LSEENDOfflineFeatureExtractor {
     private let config: LSEENDFeatureConfig
     private let spectrogram: NeMoMelSpectrogram
 
+    /// Creates an offline feature extractor.
+    ///
+    /// - Parameters:
+    ///   - metadata: Model metadata from which feature parameters are derived.
+    ///   - spectrogram: Optional pre-configured mel spectrogram; one is created if `nil`.
     public init(metadata: LSEENDModelMetadata, spectrogram: NeMoMelSpectrogram? = nil) {
         let featureConfig = LSEENDFeatureConfig(metadata: metadata)
         config = featureConfig
         self.spectrogram = spectrogram ?? createMelSpectrogram(for: featureConfig)
     }
 
+    /// Extracts model input features from a complete audio buffer.
+    ///
+    /// - Parameter audio: Mono audio samples at the model's target sample rate.
+    /// - Returns: Feature matrix with shape `[frames, inputDim]`, or an empty matrix
+    ///   if the audio is too short to produce any frames.
     public func extractFeatures(audio: [Float]) throws -> LSEENDMatrix {
         let usableSamples = (audio.count / config.stableBlockSize) * config.stableBlockSize
         guard usableSamples > 0 else {
@@ -135,6 +170,16 @@ public final class LSEENDOfflineFeatureExtractor {
     }
 }
 
+/// Incremental feature extractor for streaming LS-EEND inference.
+///
+/// Maintains internal buffers for audio samples, STFT frames, and base mel features.
+/// As audio arrives via ``pushAudio(_:)``, the extractor incrementally computes STFT frames,
+/// applies log-mel cumulative mean normalization, and emits splice-and-subsampled model frames
+/// as soon as enough context is available.
+///
+/// Call ``finalize()`` after the last audio chunk to flush any remaining buffered frames.
+///
+/// - Important: This class is **not** thread-safe. All calls must be serialized externally.
 public final class LSEENDStreamingFeatureExtractor {
     private let config: LSEENDFeatureConfig
     private let spectrogram: NeMoMelSpectrogram
@@ -151,6 +196,11 @@ public final class LSEENDStreamingFeatureExtractor {
     private var baseFeatureRows = 0
     private var cumulativeFeatureSum: [Double]
 
+    /// Creates a streaming feature extractor.
+    ///
+    /// - Parameters:
+    ///   - metadata: Model metadata from which feature parameters are derived.
+    ///   - spectrogram: Optional pre-configured mel spectrogram; one is created if `nil`.
     public init(metadata: LSEENDModelMetadata, spectrogram: NeMoMelSpectrogram? = nil) {
         let featureConfig = LSEENDFeatureConfig(metadata: metadata)
         config = featureConfig
@@ -158,6 +208,11 @@ public final class LSEENDStreamingFeatureExtractor {
         cumulativeFeatureSum = [Double](repeating: 0, count: featureConfig.nMels)
     }
 
+    /// Feeds audio samples and returns any new model input frames.
+    ///
+    /// - Parameter chunk: Mono audio samples at the model's target sample rate.
+    /// - Returns: Feature matrix with shape `[newFrames, inputDim]`, or an empty matrix
+    ///   if no new frames could be produced from the available audio.
     public func pushAudio(_ chunk: [Float]) throws -> LSEENDMatrix {
         guard !chunk.isEmpty else {
             return .empty(columns: config.inputDim)
@@ -168,6 +223,13 @@ public final class LSEENDStreamingFeatureExtractor {
         return try emitModelFrames(final: false, totalSTFTFrames: nil)
     }
 
+    /// Flushes remaining buffered audio and returns any final model input frames.
+    ///
+    /// Should be called exactly once after the last ``pushAudio(_:)`` call.
+    /// Applies right-padding to extract any remaining STFT frames that couldn't
+    /// be emitted during streaming.
+    ///
+    /// - Returns: Feature matrix with any remaining frames, or an empty matrix.
     public func finalize() throws -> LSEENDMatrix {
         let usableSamples = usableSampleCount(totalSamples)
         let totalSTFTFrames = offlineSTFTFrameCount(usableSamples)

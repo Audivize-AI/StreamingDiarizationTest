@@ -145,6 +145,15 @@ public final class LSEENDDiarizer: Diarizer {
     /// Initialize with a model descriptor. Loads the CoreML model.
     ///
     /// - Parameter descriptor: Model descriptor specifying variant and file paths
+    public func initialize(variant: LSEENDVariant = .dihard3) async throws {
+        let descriptor = try await LSEENDModelDescriptor.loadFromHuggingFace(variant: variant)
+        try initialize(descriptor: descriptor)
+    }
+    
+    
+    /// Initialize with a model descriptor. Loads the CoreML model.
+    ///
+    /// - Parameter descriptor: Model descriptor specifying variant and file paths
     public func initialize(descriptor: LSEENDModelDescriptor) throws {
         let engine = try LSEENDInferenceEngine(descriptor: descriptor, computeUnits: computeUnits)
         let melSpectrogram = Self.createMelSpectrogram(featureConfig: engine.featureConfig)
@@ -195,7 +204,7 @@ public final class LSEENDDiarizer: Diarizer {
         pendingAudio.append(contentsOf: samples)
     }
 
-    /// Generic overload accepting any Collection of Float.
+    /// Add audio samples from any `Collection` of `Float` to the processing buffer.
     public func addAudio<C: Collection>(_ samples: C) where C.Element == Float {
         lock.lock()
         defer { lock.unlock() }
@@ -290,35 +299,15 @@ public final class LSEENDDiarizer: Diarizer {
 
     /// Process a complete audio buffer.
     ///
-    /// Resets state and processes the entire buffer, returning a finalized timeline.
+    /// Resets state and pushes all audio at once, then finalizes.
     ///
     /// - Parameters:
     ///   - samples: Complete audio samples at the model's target sample rate
-    ///   - progressCallback: Optional progress callback
+    ///   - finalizeOnCompletion: Whether to finalize the timeline after processing
+    ///   - progressCallback: Optional callback (processedSamples, totalSamples, chunksProcessed)
     /// - Returns: Finalized timeline with segments
     public func processComplete(
         _ samples: [Float],
-        finalizeOnCompletion: Bool = true,
-        progressCallback: ((Int, Int, Int) -> Void)? = nil
-    ) throws -> DiarizerTimeline {
-        return try processComplete(
-            samples,
-            chunkSeconds: 0.5,
-            finalizeOnCompletion: finalizeOnCompletion,
-            progressCallback: progressCallback
-        )
-    }
-
-    /// Process a complete audio buffer with configurable chunk size.
-    ///
-    /// - Parameters:
-    ///   - samples: Complete audio samples at the model's target sample rate
-    ///   - chunkSeconds: Size of each chunk for simulated streaming (default: 0.5s)
-    ///   - progressCallback: Optional progress callback
-    /// - Returns: Finalized timeline with segments
-    public func processComplete(
-        _ samples: [Float],
-        chunkSeconds: Double,
         finalizeOnCompletion: Bool = true,
         progressCallback: ((Int, Int, Int) -> Void)? = nil
     ) throws -> DiarizerTimeline {
@@ -337,30 +326,24 @@ public final class LSEENDDiarizer: Diarizer {
         pendingAudio.removeAll(keepingCapacity: true)
 
         let session = try engine.createSession(inputSampleRate: engine.targetSampleRate, melSpectrogram: _melSpectrogram!)
-        let chunkSize = max(1, Int(round(chunkSeconds * Double(engine.targetSampleRate))))
         let numSpeakers = engine.metadata.realOutputDim
 
-        var start = 0
-        var chunksProcessed = 0
-        while start < samples.count {
-            let stop = min(samples.count, start + chunkSize)
-            if let update = try session.pushAudio(Array(samples[start..<stop])) {
-                let chunk = DiarizerChunkResult(
-                    startFrame: update.startFrame,
-                    finalizedPredictions: flattenRowMajor(update.probabilities, numSpeakers: numSpeakers),
-                    finalizedFrameCount: update.probabilities.rows,
-                    tentativePredictions: flattenRowMajor(update.previewProbabilities, numSpeakers: numSpeakers),
-                    tentativeFrameCount: update.previewProbabilities.rows
-                )
-                _numFramesProcessed += chunk.finalizedFrameCount
-                try _timeline.addChunk(chunk)
-            }
-            start = stop
-            chunksProcessed += 1
-            progressCallback?(start, samples.count, chunksProcessed)
+        // Push all audio at once
+        if let update = try session.pushAudio(samples) {
+            let chunk = DiarizerChunkResult(
+                startFrame: update.startFrame,
+                finalizedPredictions: flattenRowMajor(update.probabilities, numSpeakers: numSpeakers),
+                finalizedFrameCount: update.probabilities.rows,
+                tentativePredictions: flattenRowMajor(update.previewProbabilities, numSpeakers: numSpeakers),
+                tentativeFrameCount: update.previewProbabilities.rows
+            )
+            _numFramesProcessed += chunk.finalizedFrameCount
+            try _timeline.addChunk(chunk)
         }
 
-        // Finalize
+        progressCallback?(samples.count, samples.count, 1)
+
+        // Finalize remaining frames
         if let finalUpdate = try session.finalize() {
             let chunk = DiarizerChunkResult(
                 startFrame: _numFramesProcessed,
@@ -380,9 +363,16 @@ public final class LSEENDDiarizer: Diarizer {
     }
 
     /// Process a complete audio file from a URL.
+    ///
+    /// Reads and resamples the file to ``targetSampleRate``, then delegates to
+    /// ``processComplete(_:finalizeOnCompletion:progressCallback:)``.
+    ///
+    /// - Parameters:
+    ///   - audioFileURL: Path to a WAV, CAF, or other audio file.
+    ///   - progressCallback: Optional callback (processedSamples, totalSamples, chunksProcessed).
+    /// - Returns: Finalized timeline with segments.
     public func processComplete(
         audioFileURL: URL,
-        chunkSeconds: Double = 0.5,
         progressCallback: ((Int, Int, Int) -> Void)? = nil
     ) throws -> DiarizerTimeline {
         guard let engine = _engine else {
@@ -397,7 +387,7 @@ public final class LSEENDDiarizer: Diarizer {
             )!
         )
         let audio = try converter.resampleAudioFile(audioFileURL)
-        return try processComplete(audio, chunkSeconds: chunkSeconds, progressCallback: progressCallback)
+        return try processComplete(audio, progressCallback: progressCallback)
     }
 
     // MARK: - Lifecycle (Diarizer Protocol)

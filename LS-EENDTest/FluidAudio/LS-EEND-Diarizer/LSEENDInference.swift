@@ -95,23 +95,57 @@ private final class LSEENDInferenceSharedResources {
     }
 }
 
+/// CoreML inference engine for LS-EEND speaker diarization.
+///
+/// Each engine instance owns its own compiled model, mel spectrogram, and feature extractor.
+/// There are no shared singletons — multiple engines can run concurrently without interference.
+///
+/// The engine supports three usage modes:
+/// - **Offline**: ``infer(samples:sampleRate:)`` or ``infer(audioFileURL:)`` for batch processing.
+/// - **Streaming**: ``createSession(inputSampleRate:)`` to get an ``LSEENDStreamingSession`` for
+///   incremental audio processing.
+/// - **Simulation**: ``simulateStreaming(audioFileURL:chunkSeconds:)`` to replay a file through the
+///   streaming pipeline with fixed-size chunks.
+///
+/// Typical usage:
+/// ```swift
+/// let descriptor = try await LSEENDModelDescriptor.loadFromHuggingFace(variant: .dihard3)
+/// let engine = try LSEENDInferenceEngine(descriptor: descriptor)
+/// let result = try engine.infer(audioFileURL: url)
+/// ```
 public final class LSEENDInferenceEngine {
     private let logger = AppLogger(category: "LSEENDInference")
     private let sharedResources: LSEENDInferenceSharedResources
 
+    /// The descriptor used to create this engine.
     public var descriptor: LSEENDModelDescriptor { sharedResources.descriptor }
+    /// The CoreML compute units this engine was configured with.
     public var computeUnits: MLComputeUnits { sharedResources.computeUnits }
+    /// Model metadata decoded from the JSON configuration file.
     public var metadata: LSEENDModelMetadata { sharedResources.metadata }
+    /// Derived feature extraction parameters.
     public var featureConfig: LSEENDFeatureConfig { sharedResources.featureConfig }
+    /// The loaded CoreML model.
     public var model: MLModel { sharedResources.model }
+    /// Audio sample rate the model expects (e.g. 8000 Hz).
     public var targetSampleRate: Int { sharedResources.targetSampleRate }
+    /// Output frame rate in Hz (e.g. 10.0).
     public var modelFrameHz: Double { sharedResources.modelFrameHz }
+    /// Minimum latency in seconds before the first output frame can be produced.
     public var streamingLatencySeconds: Double { sharedResources.streamingLatencySeconds }
+    /// Maximum number of speaker slots in the model output (including boundary tracks).
     public var decodeMaxSpeakers: Int { sharedResources.decodeMaxSpeakers }
 
     fileprivate var melSpectrogram: NeMoMelSpectrogram { sharedResources.melSpectrogram }
     private var offlineFeatureExtractor: LSEENDOfflineFeatureExtractor { sharedResources.offlineFeatureExtractor }
 
+    /// Creates an inference engine by loading and compiling the CoreML model.
+    ///
+    /// - Parameters:
+    ///   - descriptor: Locates the model and metadata files.
+    ///   - computeUnits: CoreML compute units to use (default: `.cpuOnly`,
+    ///     which is typically fastest for this model's architecture).
+    /// - Throws: ``LSEENDError`` if the model or metadata cannot be loaded.
     public init(
         descriptor: LSEENDModelDescriptor,
         computeUnits: MLComputeUnits = .cpuOnly
@@ -123,18 +157,37 @@ public final class LSEENDInferenceEngine {
         logger.info("Loaded LS-EEND variant \(descriptor.variant.rawValue) @ \(descriptor.modelURL.path)")
     }
 
+    /// Creates a new streaming session for incremental audio processing.
+    ///
+    /// - Parameter inputSampleRate: Must match ``targetSampleRate``.
+    /// - Returns: A session that accepts audio via ``LSEENDStreamingSession/pushAudio(_:)``.
+    /// - Throws: ``LSEENDError/unsupportedAudio(_:)`` if the sample rate doesn't match.
     public func createSession(inputSampleRate: Int) throws -> LSEENDStreamingSession {
         try LSEENDStreamingSession(engine: self, inputSampleRate: inputSampleRate)
     }
 
-    /// Create a streaming session with a custom (non-shared) mel spectrogram.
+    /// Creates a streaming session with a caller-owned mel spectrogram instance.
     ///
-    /// Use this overload when the caller owns its own mel spectrogram instance
-    /// for thread-safety or isolation.
+    /// Use this overload when thread-safety requires the session to have its own
+    /// isolated spectrogram rather than sharing the engine's instance.
+    ///
+    /// - Parameters:
+    ///   - inputSampleRate: Must match ``targetSampleRate``.
+    ///   - melSpectrogram: A mel spectrogram instance owned by the caller.
+    /// - Returns: A session that accepts audio via ``LSEENDStreamingSession/pushAudio(_:)``.
     public func createSession(inputSampleRate: Int, melSpectrogram: NeMoMelSpectrogram) throws -> LSEENDStreamingSession {
         try LSEENDStreamingSession(engine: self, inputSampleRate: inputSampleRate, melSpectrogram: melSpectrogram)
     }
 
+    /// Runs offline inference on raw audio samples.
+    ///
+    /// Resamples to ``targetSampleRate`` if needed, extracts features, runs the full
+    /// model, and returns speaker probabilities for every frame.
+    ///
+    /// - Parameters:
+    ///   - samples: Mono audio samples.
+    ///   - sampleRate: Sample rate of the input audio.
+    /// - Returns: Complete inference result with logits and probabilities.
     public func infer(samples: [Float], sampleRate: Int) throws -> LSEENDInferenceResult {
         let normalizedAudio = try resampleIfNeeded(samples: samples, sampleRate: sampleRate)
         let features = try offlineFeatureExtractor.extractFeatures(audio: normalizedAudio)
@@ -149,6 +202,12 @@ public final class LSEENDInferenceEngine {
         return session.snapshot()
     }
 
+    /// Runs offline inference on an audio file.
+    ///
+    /// Reads the file, resamples to ``targetSampleRate``, and runs full inference.
+    ///
+    /// - Parameter audioFileURL: Path to a WAV, CAF, or other audio file.
+    /// - Returns: Complete inference result with logits and probabilities.
     public func infer(audioFileURL: URL) throws -> LSEENDInferenceResult {
         let converter = AudioConverter(
             targetFormat: AVAudioFormat(
@@ -162,6 +221,14 @@ public final class LSEENDInferenceEngine {
         return try infer(samples: audio, sampleRate: targetSampleRate)
     }
 
+    /// Simulates streaming inference by processing an audio file in fixed-size chunks.
+    ///
+    /// Useful for testing and benchmarking the streaming pipeline against offline results.
+    ///
+    /// - Parameters:
+    ///   - audioFileURL: Path to the audio file.
+    ///   - chunkSeconds: Duration of each simulated audio chunk in seconds.
+    /// - Returns: The final inference result along with per-chunk progress entries.
     public func simulateStreaming(audioFileURL: URL, chunkSeconds: Double) throws -> LSEENDStreamingSimulationResult {
         let converter = AudioConverter(
             targetFormat: AVAudioFormat(
@@ -345,8 +412,29 @@ public final class LSEENDInferenceEngine {
     }
 }
 
+/// A stateful streaming session that incrementally processes audio and emits diarization frames.
+///
+/// Created via ``LSEENDInferenceEngine/createSession(inputSampleRate:)``.
+/// The session maintains internal RNN state across calls to ``pushAudio(_:)``.
+///
+/// Typical usage:
+/// ```swift
+/// let session = try engine.createSession(inputSampleRate: 8000)
+/// for chunk in audioChunks {
+///     if let update = try session.pushAudio(chunk) {
+///         // Handle committed + preview frames
+///     }
+/// }
+/// if let final = try session.finalize() {
+///     // Handle remaining frames
+/// }
+/// let result = session.snapshot()  // Full assembled result
+/// ```
+///
+/// - Important: This class is **not** thread-safe. All calls must be serialized externally.
 public final class LSEENDStreamingSession {
     fileprivate let engine: LSEENDInferenceEngine
+    /// The sample rate of audio being fed to this session.
     public let inputSampleRate: Int
     fileprivate let featureExtractor: LSEENDStreamingFeatureExtractor
     fileprivate var state: LSEENDModelState
@@ -371,6 +459,14 @@ public final class LSEENDStreamingSession {
         zeroFrame = [Float](repeating: 0, count: engine.metadata.inputDim)
     }
 
+    /// Feeds audio samples into the session and returns any newly committed frames.
+    ///
+    /// The returned update contains both committed (final) frames and a speculative preview
+    /// of pending frames decoded by zero-padding the remaining state.
+    ///
+    /// - Parameter chunk: Mono audio samples at ``inputSampleRate``.
+    /// - Returns: An update with new committed and preview frames, or `nil` if no frames were produced.
+    /// - Throws: ``LSEENDError/unsupportedAudio(_:)`` if the session has already been finalized.
     public func pushAudio(_ chunk: [Float]) throws -> LSEENDStreamingUpdate? {
         guard !finalized else {
             throw LSEENDError.unsupportedAudio("Streaming session already finalized.")
@@ -384,6 +480,11 @@ public final class LSEENDStreamingSession {
         return try buildUpdate(committedFullLogits: committed, includePreview: true)
     }
 
+    /// Flushes remaining buffered features and marks the session as complete.
+    ///
+    /// After finalization, ``pushAudio(_:)`` will throw. Calling `finalize()` again returns `nil`.
+    ///
+    /// - Returns: A final update with any remaining frames, or `nil` if no frames were pending.
     public func finalize() throws -> LSEENDStreamingUpdate? {
         guard !finalized else {
             return nil
@@ -396,6 +497,10 @@ public final class LSEENDStreamingSession {
         return try buildUpdate(committedFullLogits: committed.appendingRows(tail), includePreview: false)
     }
 
+    /// Assembles the full inference result from all committed frames emitted so far.
+    ///
+    /// Can be called at any time (before or after finalization) to get a complete
+    /// ``LSEENDInferenceResult`` covering all frames produced up to this point.
     public func snapshot() -> LSEENDInferenceResult {
         let fullLogits = fullLogitChunks.reduce(LSEENDMatrix.empty(columns: engine.decodeMaxSpeakers)) { partial, matrix in
             partial.appendingRows(matrix)
