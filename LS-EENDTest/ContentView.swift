@@ -33,7 +33,7 @@ struct ContentView: View {
         GroupBox("Model") {
             VStack(alignment: .leading, spacing: 12) {
                 Picker("Variant", selection: $viewModel.selectedVariant) {
-                    ForEach(LSEENDModelVariant.allCases) { variant in
+                    ForEach(LSEENDVariant.allCases) { variant in
                         Text(variant.rawValue).tag(variant)
                     }
                 }

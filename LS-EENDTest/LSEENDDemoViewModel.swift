@@ -144,7 +144,7 @@ struct LSEENDHeatmapSnapshot {
 }
 
 final class LSEENDDemoViewModel: ObservableObject {
-    @Published var selectedVariant: LSEENDModelVariant = .dihard3
+    @Published var selectedVariant: LSEENDVariant = .dihard3
     @Published var useCustomPaths = false
     @Published var modelPath = ""
     @Published var metadataPath = ""
@@ -227,7 +227,7 @@ final class LSEENDDemoViewModel: ObservableObject {
 
     func applyVariantDefaults() {
         guard !useCustomPaths else { return }
-        let descriptor = LSEENDModelDescriptor.defaultDescriptor(for: selectedVariant)
+        let descriptor = try! LSEENDModelDescriptor.defaultDescriptor(for: selectedVariant)
         modelPath = descriptor.modelURL.path
         metadataPath = descriptor.metadataURL.path
         currentDescriptor = descriptor
@@ -259,7 +259,7 @@ final class LSEENDDemoViewModel: ObservableObject {
         }
     }
 
-    func selectVariant(_ variant: LSEENDModelVariant) {
+    func selectVariant(_ variant: LSEENDVariant) {
         selectedVariant = variant
         applyVariantDefaults()
         reloadModel()
@@ -510,8 +510,7 @@ final class LSEENDDemoViewModel: ObservableObject {
                 "variant": selectedVariant.rawValue,
                 "coreml_model": modelPath,
                 "metadata": metadataPath,
-                "checkpoint": currentDescriptor?.checkpointURL?.path ?? "",
-                "config": currentDescriptor?.configURL?.path ?? "",
+                "variant_stem": currentDescriptor?.variant.stem ?? "",
                 "source": sourceText,
                 "duration_seconds": Double(committedProbabilities.rows) / frameRate,
                 "preview_duration_seconds": Double(previewProbabilities.rows) / frameRate,
@@ -738,14 +737,12 @@ final class LSEENDDemoViewModel: ObservableObject {
 
     private func descriptorFromCurrentSelection() -> LSEENDModelDescriptor {
         if !useCustomPaths {
-            return LSEENDModelDescriptor.defaultDescriptor(for: selectedVariant)
+            return try! LSEENDModelDescriptor.defaultDescriptor(for: selectedVariant)
         }
         return LSEENDModelDescriptor(
             variant: selectedVariant,
             modelURL: URL(fileURLWithPath: modelPath),
-            metadataURL: URL(fileURLWithPath: metadataPath),
-            checkpointURL: LSEENDModelDescriptor.defaultDescriptor(for: selectedVariant).checkpointURL,
-            configURL: LSEENDModelDescriptor.defaultDescriptor(for: selectedVariant).configURL
+            metadataURL: URL(fileURLWithPath: metadataPath)
         )
     }
 
