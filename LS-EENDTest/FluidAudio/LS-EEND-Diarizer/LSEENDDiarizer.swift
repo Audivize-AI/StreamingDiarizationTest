@@ -72,7 +72,7 @@ public final class LSEENDDiarizer: Diarizer {
     public let computeUnits: MLComputeUnits
 
     /// Post-processing configuration
-    public var postProcessingConfig: DiarizerPostProcessingConfig {
+    public var postProcessingConfig: DiarizerTimelineConfig {
         lock.lock()
         defer { lock.unlock() }
         return _timeline.config
@@ -206,7 +206,7 @@ public final class LSEENDDiarizer: Diarizer {
     /// Process buffered audio and return any new results.
     ///
     /// - Returns: New chunk result if inference produced frames, nil otherwise
-    public func process() throws -> DiarizerChunkResult? {
+    public func process() throws -> DiarizerTimelineUpdate? {
         lock.lock()
         defer { lock.unlock() }
 
@@ -233,22 +233,20 @@ public final class LSEENDDiarizer: Diarizer {
         let numSpeakers = engine.metadata.realOutputDim
         let result = DiarizerChunkResult(
             startFrame: update.startFrame,
-            speakerPredictions: flattenRowMajor(update.probabilities, numSpeakers: numSpeakers),
-            frameCount: update.probabilities.rows,
+            finalizedPredictions: flattenRowMajor(update.probabilities, numSpeakers: numSpeakers),
+            finalizedFrameCount: update.probabilities.rows,
             tentativePredictions: flattenRowMajor(update.previewProbabilities, numSpeakers: numSpeakers),
             tentativeFrameCount: update.previewProbabilities.rows
         )
 
-        _numFramesProcessed += result.frameCount
-        _timeline.addChunk(result)
-
-        return result
+        _numFramesProcessed += result.finalizedFrameCount
+        return try _timeline.addChunk(result)
     }
 
     /// Process a chunk of audio in one call.
     ///
     /// Convenience method that combines `addAudio()` and `process()`.
-    public func processSamples(_ samples: [Float]) throws -> DiarizerChunkResult? {
+    public func process(samples: [Float]) throws -> DiarizerTimelineUpdate? {
         lock.lock()
         defer { lock.unlock() }
 
@@ -275,16 +273,14 @@ public final class LSEENDDiarizer: Diarizer {
         let numSpeakers = engine.metadata.realOutputDim
         let result = DiarizerChunkResult(
             startFrame: update.startFrame,
-            speakerPredictions: flattenRowMajor(update.probabilities, numSpeakers: numSpeakers),
-            frameCount: update.probabilities.rows,
+            finalizedPredictions: flattenRowMajor(update.probabilities, numSpeakers: numSpeakers),
+            finalizedFrameCount: update.probabilities.rows,
             tentativePredictions: flattenRowMajor(update.previewProbabilities, numSpeakers: numSpeakers),
             tentativeFrameCount: update.previewProbabilities.rows
         )
 
-        _numFramesProcessed += result.frameCount
-        _timeline.addChunk(result)
-
-        return result
+        _numFramesProcessed += result.finalizedFrameCount
+        return try _timeline.addChunk(result)
     }
 
     // MARK: - Offline (Diarizer Protocol)
@@ -302,9 +298,15 @@ public final class LSEENDDiarizer: Diarizer {
     /// - Returns: Finalized timeline with segments
     public func processComplete(
         _ samples: [Float],
+        finalizeOnCompletion: Bool = true,
         progressCallback: ((Int, Int, Int) -> Void)? = nil
     ) throws -> DiarizerTimeline {
-        return try processComplete(samples, chunkSeconds: 0.5, progressCallback: progressCallback)
+        return try processComplete(
+            samples,
+            chunkSeconds: 0.5,
+            finalizeOnCompletion: finalizeOnCompletion,
+            progressCallback: progressCallback
+        )
     }
 
     /// Process a complete audio buffer with configurable chunk size.
@@ -317,6 +319,7 @@ public final class LSEENDDiarizer: Diarizer {
     public func processComplete(
         _ samples: [Float],
         chunkSeconds: Double,
+        finalizeOnCompletion: Bool = true,
         progressCallback: ((Int, Int, Int) -> Void)? = nil
     ) throws -> DiarizerTimeline {
         lock.lock()
@@ -344,13 +347,13 @@ public final class LSEENDDiarizer: Diarizer {
             if let update = try session.pushAudio(Array(samples[start..<stop])) {
                 let chunk = DiarizerChunkResult(
                     startFrame: update.startFrame,
-                    speakerPredictions: flattenRowMajor(update.probabilities, numSpeakers: numSpeakers),
-                    frameCount: update.probabilities.rows,
+                    finalizedPredictions: flattenRowMajor(update.probabilities, numSpeakers: numSpeakers),
+                    finalizedFrameCount: update.probabilities.rows,
                     tentativePredictions: flattenRowMajor(update.previewProbabilities, numSpeakers: numSpeakers),
                     tentativeFrameCount: update.previewProbabilities.rows
                 )
-                _numFramesProcessed += chunk.frameCount
-                _timeline.addChunk(chunk)
+                _numFramesProcessed += chunk.finalizedFrameCount
+                try _timeline.addChunk(chunk)
             }
             start = stop
             chunksProcessed += 1
@@ -361,16 +364,18 @@ public final class LSEENDDiarizer: Diarizer {
         if let finalUpdate = try session.finalize() {
             let chunk = DiarizerChunkResult(
                 startFrame: _numFramesProcessed,
-                speakerPredictions: flattenRowMajor(finalUpdate.probabilities, numSpeakers: numSpeakers),
-                frameCount: finalUpdate.probabilities.rows,
+                finalizedPredictions: flattenRowMajor(finalUpdate.probabilities, numSpeakers: numSpeakers),
+                finalizedFrameCount: finalUpdate.probabilities.rows,
                 tentativePredictions: [],
                 tentativeFrameCount: 0
             )
-            _numFramesProcessed += chunk.frameCount
-            _timeline.addChunk(chunk)
+            _numFramesProcessed += chunk.finalizedFrameCount
+            try _timeline.addChunk(chunk)
         }
 
-        _timeline.finalize()
+        if finalizeOnCompletion {
+            _timeline.finalize()
+        }
         return _timeline
     }
 
@@ -455,13 +460,13 @@ public final class LSEENDDiarizer: Diarizer {
         let numSpeakers = engine.metadata.realOutputDim
         let result = DiarizerChunkResult(
             startFrame: _numFramesProcessed,
-            speakerPredictions: flattenRowMajor(finalUpdate.probabilities, numSpeakers: numSpeakers),
-            frameCount: finalUpdate.probabilities.rows,
+            finalizedPredictions: flattenRowMajor(finalUpdate.probabilities, numSpeakers: numSpeakers),
+            finalizedFrameCount: finalUpdate.probabilities.rows,
             tentativePredictions: [],
             tentativeFrameCount: 0
         )
-        _numFramesProcessed += result.frameCount
-        _timeline.addChunk(result)
+        _numFramesProcessed += result.finalizedFrameCount
+        try _timeline.addChunk(result)
         _timeline.finalize()
         _session = nil
 
@@ -491,9 +496,9 @@ public final class LSEENDDiarizer: Diarizer {
         )
     }
 
-    private func makePostProcessingConfig(engine: LSEENDInferenceEngine) -> DiarizerPostProcessingConfig {
+    private func makePostProcessingConfig(engine: LSEENDInferenceEngine) -> DiarizerTimelineConfig {
         let o = _postProcessingOverrides
-        return DiarizerPostProcessingConfig(
+        return DiarizerTimelineConfig(
             numSpeakers: engine.metadata.realOutputDim,
             frameDurationSeconds: Float(1.0 / engine.modelFrameHz),
             onsetThreshold: o.onsetThreshold,

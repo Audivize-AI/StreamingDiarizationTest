@@ -561,7 +561,7 @@ final class LSEENDDemoViewModel: ObservableObject {
                 let numSpeakers = self.processor.numSpeakers ?? 0
                 let totalEmitted = self.processor.numFramesProcessed
                 DispatchQueue.main.async {
-                    self.mergeChunkResult(result, numSpeakers: numSpeakers, totalEmittedFrames: totalEmitted)
+                    self.mergeChunkResult(result.chunkResult, numSpeakers: numSpeakers, totalEmittedFrames: totalEmitted)
                     self.updateBufferText(receivedSamples: self.totalSamplesReceived)
                 }
             } catch {
@@ -577,9 +577,9 @@ final class LSEENDDemoViewModel: ObservableObject {
 
         // Convert committed predictions to LSEENDMatrix
         let committedMatrix = LSEENDMatrix(
-            validatingRows: result.frameCount,
+            validatingRows: result.finalizedFrameCount,
             columns: numSpeakers,
-            values: result.speakerPredictions
+            values: result.finalizedPredictions
         )
         committedProbabilities = merge(
             existing: committedProbabilities,
@@ -606,7 +606,7 @@ final class LSEENDDemoViewModel: ObservableObject {
         committedProbabilities = LSEENDMatrix(
             validatingRows: timeline.numFrames,
             columns: numSpeakers,
-            values: timeline.framePredictions
+            values: timeline.finalizedPredictions
         )
         ensureTrackState(trackCount: numSpeakers)
     }

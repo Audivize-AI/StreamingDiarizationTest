@@ -334,8 +334,8 @@ public struct SortformerPostProcessingConfig {
     }
 
     /// Convert to the unified DiarizerPostProcessingConfig
-    public func toDiarizerConfig() -> DiarizerPostProcessingConfig {
-        DiarizerPostProcessingConfig(
+    public func toDiarizerConfig() -> DiarizerTimelineConfig {
+        DiarizerTimelineConfig(
             numSpeakers: numSpeakers,
             frameDurationSeconds: frameDurationSeconds,
             onsetThreshold: onsetThreshold,
