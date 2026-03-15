@@ -65,6 +65,8 @@ public enum Repo: String, CaseIterable {
             return "FluidInference/parakeet-realtime-eou-120m-coreml"
         case .sortformer:
             return "FluidInference/diar-streaming-sortformer-coreml"
+        case .lseend:
+            return "GradientDescent2718/ls-eend-coreml"
         case .qwen3Asr, .qwen3AsrInt8:
             return "FluidInference/qwen3-asr-0.6b-coreml"
         default:
@@ -99,6 +101,8 @@ public enum Repo: String, CaseIterable {
             return "parakeet-eou-streaming/320ms"
         case .sortformer:
             return "sortformer"
+        case .lseend:
+            return "ls-eend"
         case .pocketTts:
             return "pocket-tts"
         case .multilingualG2p:
@@ -307,7 +311,7 @@ public enum ModelNames {
         }
     }
     
-    /// Sortformer streaming diarization model names
+    /// LS-EEND streaming diarization model names
     public enum LSEEND {
         public enum Variant: CaseIterable, Sendable {
             case ami

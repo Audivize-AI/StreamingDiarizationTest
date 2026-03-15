@@ -210,21 +210,31 @@ public enum LSEENDModelVariant: String, CaseIterable, Identifiable, Sendable {
             return "spk_onl_conformer_retention_enc_dec_nonautoreg_dihard3_infer.yaml"
         }
     }
+
+    /// Corresponding variant in the ``ModelNames/LSEEND`` registry for HuggingFace downloads.
+    public var modelNamesVariant: ModelNames.LSEEND.Variant {
+        switch self {
+        case .ami: return .ami
+        case .callhome: return .callhome
+        case .dihard2: return .dihard2
+        case .dihard3: return .dihard3
+        }
+    }
 }
 
 public struct LSEENDModelDescriptor: Sendable {
     public let variant: LSEENDModelVariant
     public let modelURL: URL
     public let metadataURL: URL
-    public let checkpointURL: URL
-    public let configURL: URL
+    public let checkpointURL: URL?
+    public let configURL: URL?
 
     public init(
         variant: LSEENDModelVariant,
         modelURL: URL,
         metadataURL: URL,
-        checkpointURL: URL,
-        configURL: URL
+        checkpointURL: URL? = nil,
+        configURL: URL? = nil
     ) {
         self.variant = variant
         self.modelURL = modelURL
@@ -242,6 +252,38 @@ public struct LSEENDModelDescriptor: Sendable {
             metadataURL: artifacts.appendingPathComponent("\(variant.artifactStem).json"),
             checkpointURL: root.appendingPathComponent(variant.checkpointName),
             configURL: root.appendingPathComponent("conf/\(variant.configName)")
+        )
+    }
+
+    /// Download LS-EEND models from HuggingFace and construct a descriptor.
+    ///
+    /// Downloads all variant files on first call; subsequent calls use the cache.
+    /// The returned descriptor points at the cached `.mlmodelc` and `.json` files.
+    ///
+    /// - Parameters:
+    ///   - variant: The model variant to load (default: `.dihard3`).
+    ///   - cacheDirectory: Where to cache downloaded models. Defaults to
+    ///     `~/Library/Application Support/FluidAudio/Models`.
+    /// - Returns: A descriptor ready for ``LSEENDInferenceEngine/init(descriptor:computeUnits:)``.
+    public static func fromHuggingFace(
+        variant: LSEENDModelVariant = .dihard3,
+        cacheDirectory: URL? = nil
+    ) async throws -> LSEENDModelDescriptor {
+        let directory = cacheDirectory
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("FluidAudio/Models")
+
+        try await DownloadUtils.downloadRepo(.lseend, to: directory)
+
+        let repoPath = directory.appendingPathComponent(Repo.lseend.folderName)
+        let mnVariant = variant.modelNamesVariant
+        let modelURL = repoPath.appendingPathComponent(mnVariant.modelFile)
+        let metadataURL = repoPath.appendingPathComponent(mnVariant.configFile)
+
+        return LSEENDModelDescriptor(
+            variant: variant,
+            modelURL: modelURL,
+            metadataURL: metadataURL
         )
     }
 }
