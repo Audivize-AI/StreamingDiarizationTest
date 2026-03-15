@@ -139,7 +139,8 @@ extension SortformerModels {
             modelNames: [bundle],
             directory: directory,
             computeUnits: computeUnits,
-            variant: bundle
+            variant: bundle,
+            progressHandler: progressHandler
         )
 
         guard let sortformer = models[bundle]
