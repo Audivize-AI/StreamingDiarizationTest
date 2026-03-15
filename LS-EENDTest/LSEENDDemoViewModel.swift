@@ -174,7 +174,16 @@ final class LSEENDDemoViewModel: ObservableObject {
     private var currentDescriptor: LSEENDModelDescriptor?
     private var pendingAudioCount = 0
     private var totalSamplesReceived = 0
-    private let outputDirectory = LSEENDWorkspace.rootURL.appendingPathComponent("artifacts/mic_gui_swift", isDirectory: true)
+    private let outputDirectory: URL = {
+        if let override = ProcessInfo.processInfo.environment["LSEEND_WORKSPACE_ROOT"], !override.isEmpty {
+            return URL(fileURLWithPath: override, isDirectory: true).appendingPathComponent("artifacts/mic_gui_swift", isDirectory: true)
+        }
+        var url = URL(fileURLWithPath: #filePath)
+        while url.lastPathComponent != "LS-EEND" && url.path != "/" {
+            url.deleteLastPathComponent()
+        }
+        return url.appendingPathComponent("artifacts/mic_gui_swift", isDirectory: true)
+    }()
 
     init() {
         applyVariantDefaults()
@@ -227,34 +236,62 @@ final class LSEENDDemoViewModel: ObservableObject {
 
     func applyVariantDefaults() {
         guard !useCustomPaths else { return }
-        let descriptor = try! LSEENDModelDescriptor.defaultDescriptor(for: selectedVariant)
-        modelPath = descriptor.modelURL.path
-        metadataPath = descriptor.metadataURL.path
-        currentDescriptor = descriptor
+        let variant = selectedVariant
+        let cacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("FluidAudio/Models/ls-eend")
+        modelPath = cacheDir.appendingPathComponent(variant.modelFile).path
+        metadataPath = cacheDir.appendingPathComponent(variant.configFile).path
     }
 
     func reloadModel() {
         resetTimeline(clearStatus: false)
         applyVariantDefaults()
-        let descriptor = descriptorFromCurrentSelection()
-        statusText = "Loading \(descriptor.variant.rawValue) model..."
-        processingQueue.async { [weak self] in
-            guard let self else { return }
-            do {
-                try self.processor.initialize(descriptor: descriptor)
-                let numSpeakers = self.processor.numSpeakers ?? 0
-                let latency = self.processor.streamingLatencySeconds ?? 0
-                DispatchQueue.main.async {
-                    self.currentDescriptor = descriptor
-                    self.statusText = "Ready."
-                    self.modelInfoText = "\(descriptor.variant.rawValue) | \(numSpeakers) speaker tracks | \(String(format: "%.2f", latency)) s latency"
-                    self.resetTimelineUI(clearStatus: false, receivedSamples: 0)
+        let variant = selectedVariant
+        statusText = "Loading \(variant.rawValue) model..."
+
+        if useCustomPaths {
+            let descriptor = descriptorFromCurrentSelection()
+            processingQueue.async { [weak self] in
+                self?.initializeProcessor(descriptor: descriptor)
+            }
+        } else {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let descriptor = try await LSEENDModelDescriptor.loadFromHuggingFace(variant: variant)
+                    DispatchQueue.main.async {
+                        self.modelPath = descriptor.modelURL.path
+                        self.metadataPath = descriptor.metadataURL.path
+                        self.currentDescriptor = descriptor
+                    }
+                    self.processingQueue.async {
+                        self.initializeProcessor(descriptor: descriptor)
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self.statusText = "Model load failed: \(error.localizedDescription)"
+                        self.modelInfoText = ""
+                    }
                 }
-            } catch {
-                DispatchQueue.main.async {
-                    self.statusText = "Model load failed: \(error.localizedDescription)"
-                    self.modelInfoText = ""
-                }
+            }
+        }
+    }
+
+    private func initializeProcessor(descriptor: LSEENDModelDescriptor) {
+        do {
+            try self.processor.initialize(descriptor: descriptor)
+            let numSpeakers = self.processor.numSpeakers ?? 0
+            let latency = self.processor.streamingLatencySeconds ?? 0
+            DispatchQueue.main.async {
+                self.currentDescriptor = descriptor
+                self.statusText = "Ready."
+                self.modelInfoText = "\(descriptor.variant.rawValue) | \(numSpeakers) speaker tracks | \(String(format: "%.2f", latency)) s latency"
+                self.resetTimelineUI(clearStatus: false, receivedSamples: 0)
+            }
+        } catch {
+            DispatchQueue.main.async {
+                self.statusText = "Model load failed: \(error.localizedDescription)"
+                self.modelInfoText = ""
             }
         }
     }
@@ -736,10 +773,7 @@ final class LSEENDDemoViewModel: ObservableObject {
     }
 
     private func descriptorFromCurrentSelection() -> LSEENDModelDescriptor {
-        if !useCustomPaths {
-            return try! LSEENDModelDescriptor.defaultDescriptor(for: selectedVariant)
-        }
-        return LSEENDModelDescriptor(
+        LSEENDModelDescriptor(
             variant: selectedVariant,
             modelURL: URL(fileURLWithPath: modelPath),
             metadataURL: URL(fileURLWithPath: metadataPath)

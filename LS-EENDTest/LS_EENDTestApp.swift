@@ -16,7 +16,7 @@ private extension ProcessInfo {
 @main
 struct LS_EENDTestApp: App {
     init() {
-        LSEENDRuntimeProbeSupport.runIfRequested()
+        Task { await LSEENDRuntimeProbeSupport.runIfRequested() }
     }
 
     var body: some Scene {

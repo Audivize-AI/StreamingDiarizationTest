@@ -83,7 +83,8 @@ public struct LSEENDMatrix: Sendable, Equatable {
 
     /// Creates a zero-filled matrix with the given dimensions.
     public static func zeros(rows: Int, columns: Int) -> LSEENDMatrix {
-        LSEENDMatrix(validatingRows: rows, columns: columns, values: [Float](repeating: 0, count: max(0, rows * columns)))
+        LSEENDMatrix(
+            validatingRows: rows, columns: columns, values: [Float](repeating: 0, count: max(0, rows * columns)))
     }
 
     /// Creates an empty matrix (zero rows) with the given column count.
@@ -149,7 +150,8 @@ public struct LSEENDMatrix: Sendable, Equatable {
         let clipped = max(0, min(count, rows))
         guard clipped > 0 else { return self }
         let start = clipped * columns
-        return LSEENDMatrix(validatingRows: rows - clipped, columns: columns, values: Array(values[start..<values.count]))
+        return LSEENDMatrix(
+            validatingRows: rows - clipped, columns: columns, values: Array(values[start..<values.count]))
     }
 
     /// Returns a submatrix containing rows in the half-open range `[start, end)`.
@@ -303,31 +305,6 @@ public struct LSEENDModelDescriptor: Sendable {
         self.metadataURL = metadataURL
     }
 
-    /// Synchronously downloads and returns a descriptor for the given variant.
-    ///
-    /// > Warning: This method blocks the calling thread using `DispatchSemaphore`.
-    /// > It should not be called from the cooperative thread pool or the main actor.
-    /// > Prefer ``loadFromHuggingFace(variant:cacheDirectory:computeUnits:progressHandler:)`` in async contexts.
-    // TODO: Remove this for FluidAudio
-    public static func defaultDescriptor(for variant: LSEENDVariant) throws -> LSEENDModelDescriptor {
-        let semaphore = DispatchSemaphore(value: 0)
-        var descriptorResult: Result<LSEENDModelDescriptor, Error>!
-        
-        Task {
-            do {
-                let descriptor = try await loadFromHuggingFace(variant: variant)
-                descriptorResult = .success(descriptor)
-            } catch {
-                descriptorResult = .failure(error)
-            }
-            
-            semaphore.signal()
-        }
-        
-        semaphore.wait()
-        return try descriptorResult.get()
-    }
-
     /// Download LS-EEND models from HuggingFace and construct a descriptor.
     ///
     /// Downloads all variant files on first call; subsequent calls use the cache.
@@ -345,22 +322,23 @@ public struct LSEENDModelDescriptor: Sendable {
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> LSEENDModelDescriptor {
         await SystemInfo.logOnce(using: logger)
-        
-        let directory = cacheDirectory
+
+        let directory =
+            cacheDirectory
             ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("FluidAudio/Models")
-        
+            .appendingPathComponent("FluidAudio/Models")
+
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let repo = Repo.lseend
         let repoPath = directory.appendingPathComponent(repo.folderName)
         let requiredModels = ModelNames.getRequiredModelNames(for: repo, variant: variant.stem)
-        
+
         let allModelsExist = requiredModels.allSatisfy { model in
             let modelPath = repoPath.appendingPathComponent(model)
             return FileManager.default.fileExists(atPath: modelPath.path)
         }
-        
+
         if !allModelsExist {
             logger.info("Models not found in cache at \(repoPath.path)")
             try await DownloadUtils.downloadRepo(
@@ -370,7 +348,7 @@ public struct LSEENDModelDescriptor: Sendable {
                 progressHandler: progressHandler
             )
         }
-        
+
         let modelURL = repoPath.appendingPathComponent(variant.modelFile)
         let metadataURL = repoPath.appendingPathComponent(variant.configFile)
 
@@ -418,10 +396,6 @@ public struct LSEENDStateShapes: Decodable, Sendable {
 /// Optional audio fields (`sampleRate`, `winLength`, etc.) fall back to defaults
 /// via the `resolved*` computed properties.
 public struct LSEENDModelMetadata: Decodable, Sendable {
-    /// Original training checkpoint path (informational).
-    public let checkpoint: String?
-    /// Original training config path (informational).
-    public let config: String?
     /// Input feature dimension per frame (nMels × splice window width).
     public let inputDim: Int
     /// Total output dimension including boundary tracks.
@@ -474,8 +448,6 @@ public struct LSEENDModelMetadata: Decodable, Sendable {
     public let featType: String?
 
     enum CodingKeys: String, CodingKey {
-        case checkpoint
-        case config
         case inputDim = "input_dim"
         case fullOutputDim = "full_output_dim"
         case realOutputDim = "real_output_dim"
@@ -566,28 +538,9 @@ public struct LSEENDModelMetadata: Decodable, Sendable {
     /// Accounts for the FFT center padding, context receptive field, and convolutional delay.
     public var streamingLatencySeconds: Double {
         let fftSize = resolvedFFTSize
-        return Double((fftSize / 2) + (resolvedContextRecp * resolvedHopLength) + (convDelay * resolvedSubsampling * resolvedHopLength))
+        return Double(
+            (fftSize / 2) + (resolvedContextRecp * resolvedHopLength)
+                + (convDelay * resolvedSubsampling * resolvedHopLength))
             / Double(max(resolvedSampleRate, 1))
     }
-}
-
-/// Resolves the LS-EEND workspace root directory for development and testing.
-///
-/// The workspace root is determined by:
-/// 1. The `LSEEND_WORKSPACE_ROOT` environment variable (if set), or
-/// 2. Walking up from this source file's path to find the `LS-EEND` directory.
-///
-/// This is used internally by tests and the runtime probe to locate model artifacts.
-public enum LSEENDWorkspace {
-    /// The resolved workspace root URL.
-    public static let rootURL: URL = {
-        if let override = ProcessInfo.processInfo.environment["LSEEND_WORKSPACE_ROOT"], !override.isEmpty {
-            return URL(fileURLWithPath: override, isDirectory: true)
-        }
-        var url = URL(fileURLWithPath: #filePath)
-        while url.lastPathComponent != "LS-EEND" && url.path != "/" {
-            url.deleteLastPathComponent()
-        }
-        return url
-    }()
 }
