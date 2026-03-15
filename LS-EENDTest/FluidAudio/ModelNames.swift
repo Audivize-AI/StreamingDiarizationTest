@@ -313,28 +313,32 @@ public enum ModelNames {
     
     /// LS-EEND streaming diarization model names
     public enum LSEEND {
-        public enum Variant: CaseIterable, Sendable {
-            case ami
-            case callhome
-            case dihard2
-            case dihard3
+        public enum Variant: String, CaseIterable, Sendable, CustomStringConvertible {
+            case ami = "AMI"
+            case callhome = "CALLHOME"
+            case dihard2 = "DIHARD II"
+            case dihard3 = "DIHARD III"
             
             public var name: String {
                 switch self {
                 case .ami:
-                    return "AMI/ls_eend_ami_step"
+                    return "ls_eend_ami_step"
                 case .callhome:
-                    return "CALLHOME/ls_eend_callhome_step"
+                    return "ls_eend_callhome_step"
                 case .dihard2:
-                    return "DIHARD II/ls_eend_dih2_step"
+                    return "ls_eend_dih2_step"
                 case .dihard3:
-                    return "DIHARD III/ls_eend_dih3_step"
+                    return "ls_eend_dih3_step"
                 }
             }
             
-            public var modelFile: String { "\(name).mlmodelc" }
+            public var description: String { rawValue }
             
-            public var configFile: String { "\(name).json" }
+            public var stem: String { "\(rawValue)/\(name)" }
+            
+            public var modelFile: String { "\(stem).mlmodelc" }
+            
+            public var configFile: String { "\(stem).json" }
             
             public var fileNames: [String] { [modelFile, configFile] }
         }
@@ -528,7 +532,7 @@ public enum ModelNames {
             return ModelNames.Sortformer.requiredModels
         case .lseend:
             if let variant = variant {
-                return [variant]
+                return [ variant + ".mlmodelc", variant + ".json" ]
             }
             return ModelNames.LSEEND.requiredModels
         case .qwen3Asr, .qwen3AsrInt8:
