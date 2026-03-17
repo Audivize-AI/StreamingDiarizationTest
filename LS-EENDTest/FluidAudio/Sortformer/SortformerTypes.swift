@@ -8,11 +8,11 @@ import Foundation
 /// Reference: NeMo sortformer_modules.py
 public struct SortformerConfig: Sendable {
     public typealias ModelVariant = ModelNames.Sortformer.Variant
-    
+
     // MARK: - Model Architecture
 
     public let modelVariant: ModelVariant?
-    
+
     /// Number of speaker slots (fixed at 4 for current model)
     public let numSpeakers: Int = 4
 
@@ -122,8 +122,8 @@ public struct SortformerConfig: Sendable {
     )
 
     /// Configuration matching Gradient Descent's Streaming-Sortformer-Conversion models with Sortformer v2 weights
-    public static let `gradientDescentV2` = SortformerConfig(
-        modelVariant: .gradientDecentV2,
+    public static let `fastestV2` = SortformerConfig(
+        modelVariant: .gradientDescentV2,
         chunkLen: 6,
         chunkLeftContext: 1,
         chunkRightContext: 7,
@@ -131,10 +131,10 @@ public struct SortformerConfig: Sendable {
         spkcacheLen: 188,
         spkcacheUpdatePeriod: 31
     )
-    
+
     /// Configuration matching Gradient Descent's Streaming-Sortformer-Conversion models with Sortformer v2.1 weights
-    public static let `gradientDescentV2_1` = SortformerConfig(
-        modelVariant: .gradientDecentV2_1,
+    public static let `fastestV2_1` = SortformerConfig(
+        modelVariant: .gradientDescentV2_1,
         chunkLen: 6,
         chunkLeftContext: 1,
         chunkRightContext: 7,
@@ -142,7 +142,11 @@ public struct SortformerConfig: Sendable {
         spkcacheLen: 188,
         spkcacheUpdatePeriod: 31
     )
-    
+
+    /// Backwards compatible alias for NVIDIA's 30.4s latency configuration with Sortformer v2.1 weights
+    @available(*, deprecated, renamed: "nvidiaHighLatencyV2_1")
+    public static let nvidiaHighLatency = nvidiaHighLatencyV2_1
+
     /// NVIDIA's 30.4s latency configuration with Sortformer v2 weights
     public static let nvidiaHighLatencyV2 = SortformerConfig(
         modelVariant: .nvidiaHighLatencyV2,
@@ -153,7 +157,7 @@ public struct SortformerConfig: Sendable {
         spkcacheLen: 188,
         spkcacheUpdatePeriod: 300
     )
-    
+
     /// NVIDIA's 30.4s latency configuration with Sortformer v2.1 weights
     public static let nvidiaHighLatencyV2_1 = SortformerConfig(
         modelVariant: .nvidiaHighLatencyV2_1,
@@ -165,6 +169,10 @@ public struct SortformerConfig: Sendable {
         spkcacheUpdatePeriod: 300
     )
 
+    /// Backwards compatible alias for NVIDIA's 1.04s latency configuration with Sortformer v2.1 weights
+    @available(*, deprecated, renamed: "nvidiaLowLatencyV2_1")
+    public static let nvidiaLowLatency = nvidiaLowLatencyV2_1
+
     /// NVIDIA's 1.04s latency configuration with Sortformer v2 weights
     public static let nvidiaLowLatencyV2 = SortformerConfig(
         modelVariant: .nvidiaLowLatencyV2,
@@ -175,7 +183,7 @@ public struct SortformerConfig: Sendable {
         spkcacheLen: 188,
         spkcacheUpdatePeriod: 144
     )
-    
+
     /// NVIDIA's 1.04s latency configuration with Sortformer v2.1 weights (20.57% DER on AMI SDM)
     public static let nvidiaLowLatencyV2_1 = SortformerConfig(
         modelVariant: .nvidiaLowLatencyV2_1,
@@ -189,7 +197,7 @@ public struct SortformerConfig: Sendable {
 
     /// - Warning: If you don't use one of the default configurations, you must use a local model converted with that configuration.
     public init(
-        modelVariant: ModelVariant? = .gradientDecentV2_1,
+        modelVariant: ModelVariant? = .gradientDescentV2_1,
         chunkLen: Int = 6,
         chunkLeftContext: Int = 1,
         chunkRightContext: Int = 7,
@@ -232,7 +240,7 @@ public struct SortformerConfig: Sendable {
 }
 
 /// Configuration for post-processing Sortformer diarizer predictions
-@available(*, deprecated, message: "Use DiarizerPostProcessingConfig instead")
+@available(*, deprecated, message: "Use DiarizerTimelineConfig instead", renamed: "DiarizerTimelineConfig")
 public struct SortformerPostProcessingConfig {
     /// Onset threshold for detecting the beginning and end of a speech
     public var onsetThreshold: Float
@@ -348,6 +356,13 @@ public struct SortformerPostProcessingConfig {
         )
     }
 }
+
+/// Backward-compatible typealiases — SortformerTimeline is now DiarizerTimeline
+@available(*, deprecated, renamed: "DiarizerTimeline")
+public typealias SortformerTimeline = DiarizerTimeline
+
+@available(*, deprecated, renamed: "DiarizerSegment")
+public typealias SortformerSegment = DiarizerSegment
 
 // MARK: - Streaming State
 

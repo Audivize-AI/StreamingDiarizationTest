@@ -21,26 +21,70 @@ public protocol Diarizer: AnyObject {
 
     /// Number of real speaker output tracks
     var numSpeakers: Int? { get }
-    
-    /// Diarization timeline 
+
+    /// Diarization timeline
     var timeline: DiarizerTimeline { get }
 
     // MARK: Streaming
-    
-    /// Add audio samples to the processing buffer
-    func addAudio(_ samples: [Float])
 
-    /// Process buffered audio and return any new results
+    /// Add audio samples to the processing buffer.
+    ///
+    /// Implementations may resample the input when `sourceSampleRate` differs from
+    /// the model's target sample rate.
+    ///
+    /// - Parameters:
+    ///   - samples: Mono audio samples to enqueue for diarization.
+    ///   - sourceSampleRate: Sample rate of `samples`, or `nil` if already at the target rate.
+    func addAudio<C: Collection>(_ samples: C, sourceSampleRate: Double?) throws
+    where C.Element == Float
+
+    /// Process buffered audio and return any newly available diarization output.
     func process() throws -> DiarizerTimelineUpdate?
 
-    /// Add audio and process in one call
-    func process(samples: [Float]) throws -> DiarizerTimelineUpdate?
+    /// Add audio and process it in one call.
+    ///
+    /// - Parameters:
+    ///   - samples: Mono audio samples to process.
+    ///   - sourceSampleRate: Sample rate of `samples`, or `nil` if already at the target rate.
+    /// - Returns: A timeline update containing finalized and tentative output, or `nil`
+    ///   if not enough buffered audio was available to emit frames.
+    func process<C: Collection>(samples: C, sourceSampleRate: Double?) throws -> DiarizerTimelineUpdate?
+    where C.Element == Float
 
     // MARK: Offline
 
-    /// Process complete audio and return finalized timeline
+    /// Process a complete audio buffer and return the resulting timeline.
+    ///
+    /// - Parameters:
+    ///   - samples: Complete mono audio buffer to diarize.
+    ///   - sourceSampleRate: Sample rate of `samples`, or `nil` if already at the target rate.
+    ///   - keepSpeakers: Whether to keep pre-enrolled speakers. If `nil`, it will keep the speakers if no audio has been added.
+    ///   - finalizeOnCompletion: Whether to finalize the timeline before returning it.
+    ///   - progressCallback: Optional callback receiving `(processedSamples, totalSamples, chunksProcessed)`.
+    /// - Returns: The diarization timeline for the provided audio.
+    func processComplete<C: Collection>(
+        _ samples: C,
+        sourceSampleRate: Double?,
+        keepingEnrolledSpeakers keepSpeakers: Bool?,
+        finalizeOnCompletion: Bool,
+        progressCallback: ((Int, Int, Int) -> Void)?
+    ) throws -> DiarizerTimeline
+    where C.Element == Float
+
+    /// Process a complete audio file from a URL.
+    ///
+    /// Reads and resamples the file to ``targetSampleRate``, then delegates to
+    /// ``processComplete(_:finalizeOnCompletion:progressCallback:)``.
+    ///
+    /// - Parameters:
+    ///   - audioFileURL: Path to a WAV, CAF, or other audio file.
+    ///   - keepSpeakers: Whether to keep pre-enrolled speakers.
+    ///   - finalizeOnCompletion: Whether to finalize the timeline after processing
+    ///   - progressCallback: Optional callback (processedSamples, totalSamples, chunksProcessed).
+    /// - Returns: Finalized timeline with segments.
     func processComplete(
-        _ samples: [Float],
+        audioFileURL: URL,
+        keepingEnrolledSpeakers keepSpeakers: Bool?,
         finalizeOnCompletion: Bool,
         progressCallback: ((Int, Int, Int) -> Void)?
     ) throws -> DiarizerTimeline
@@ -52,6 +96,22 @@ public protocol Diarizer: AnyObject {
 
     /// Clean up all resources
     func cleanup()
+
+    /// Pre-enroll a speaker before running the diarizer.
+    ///
+    /// - Parameters:
+    ///   - samples: Enrollment audio samples.
+    ///   - sourceSampleRate: Sample rate of `samples`, or `nil` if already at the target rate.
+    ///   - name: The speaker's name.
+    ///   - overwriteAssignedSpeakerName: Whether enrollment may overwrite the name of an already-named slot
+    ///     if the diarizer assigns the audio to that speaker.
+    /// - Returns: The enrolled speaker.
+    func enrollSpeaker<C: Collection>(
+        withAudio samples: C,
+        sourceSampleRate: Double?,
+        named name: String?,
+        overwritingAssignedSpeakerName overwriteAssignedSpeakerName: Bool
+    ) throws -> DiarizerSpeaker? where C.Element == Float
 }
 
 // MARK: - Post-Processing Configuration
@@ -90,21 +150,25 @@ public struct DiarizerTimelineConfig: Sendable {
 
     // MARK: - Seconds Accessors
 
+    /// Padding duration added before each speech segment in seconds
     public var onsetPadSeconds: Float {
         get { Float(onsetPadFrames) * frameDurationSeconds }
         set { onsetPadFrames = Int(round(newValue / frameDurationSeconds)) }
     }
 
+    /// Padding duration added after each speech segment in seconds
     public var offsetPadSeconds: Float {
         get { Float(offsetPadFrames) * frameDurationSeconds }
         set { offsetPadFrames = Int(round(newValue / frameDurationSeconds)) }
     }
 
+    /// Minimum duration for a speech segment in seconds
     public var minDurationOn: Float {
         get { Float(minFramesOn) * frameDurationSeconds }
         set { minFramesOn = Int(round(newValue / frameDurationSeconds)) }
     }
 
+    /// Minimum gap duration between speech segments in seconds (shorter gaps are closed)
     public var minDurationOff: Float {
         get { Float(minFramesOff) * frameDurationSeconds }
         set { minFramesOff = Int(round(newValue / frameDurationSeconds)) }
@@ -126,8 +190,11 @@ public struct DiarizerTimelineConfig: Sendable {
         )
     }
 
+    /// Default timeline configuration for Sortformer (4 speakers, 80ms frames)
+    public static let sortformerDefault = Self.default(numSpeakers: 4, frameDurationSeconds: 0.08)
+
     // MARK: - Init
-    
+
     /// - Parameters:
     ///   - numSpeakers: Number of speaker output tracks
     ///   - frameDurationSeconds: Duration of one output frame in seconds
@@ -139,8 +206,8 @@ public struct DiarizerTimelineConfig: Sendable {
     ///   - minFramesOff: Minimum gap length in frames (shorter gaps are closed)
     ///   - maxStoredFrames: Maximum number of finalized prediction frames to retain (nil = unlimited)
     public init(
-        numSpeakers: Int,
-        frameDurationSeconds: Float,
+        numSpeakers: Int? = nil,
+        frameDurationSeconds: Float? = nil,
         onsetThreshold: Float = 0.5,
         offsetThreshold: Float = 0.5,
         onsetPadFrames: Int = 0,
@@ -149,8 +216,8 @@ public struct DiarizerTimelineConfig: Sendable {
         minFramesOff: Int = 0,
         maxStoredFrames: Int? = nil
     ) {
-        self.numSpeakers = numSpeakers
-        self.frameDurationSeconds = frameDurationSeconds
+        self.numSpeakers = numSpeakers ?? 1
+        self.frameDurationSeconds = frameDurationSeconds ?? 0.08
         self.onsetThreshold = onsetThreshold
         self.offsetThreshold = offsetThreshold
         self.onsetPadFrames = onsetPadFrames
@@ -171,8 +238,8 @@ public struct DiarizerTimelineConfig: Sendable {
     ///   - minDurationOff: Minimum gap length in seconds (shorter gaps are closed)
     ///   - maxStoredFrames: Maximum number of finalized raw prediction frames to retain (nil = unlimited)
     public init(
-        numSpeakers: Int,
-        frameDurationSeconds: Float,
+        numSpeakers: Int? = nil,
+        frameDurationSeconds: Float? = nil,
         onsetThreshold: Float = 0.5,
         offsetThreshold: Float = 0.5,
         onsetPadSeconds: Float = 0,
@@ -181,69 +248,127 @@ public struct DiarizerTimelineConfig: Sendable {
         minDurationOff: Float = 0,
         maxStoredFrames: Int? = nil
     ) {
-        self.numSpeakers = numSpeakers
-        self.frameDurationSeconds = frameDurationSeconds
+        self.numSpeakers = numSpeakers ?? 1
+        self.frameDurationSeconds = frameDurationSeconds ?? 0.08
         self.onsetThreshold = onsetThreshold
         self.offsetThreshold = offsetThreshold
-        self.onsetPadFrames = Int(round(onsetPadSeconds / frameDurationSeconds))
-        self.offsetPadFrames = Int(round(offsetPadSeconds / frameDurationSeconds))
-        self.minFramesOn = Int(round(minDurationOn / frameDurationSeconds))
-        self.minFramesOff = Int(round(minDurationOff / frameDurationSeconds))
+        self.onsetPadFrames = Int(round(onsetPadSeconds / self.frameDurationSeconds))
+        self.offsetPadFrames = Int(round(offsetPadSeconds / self.frameDurationSeconds))
+        self.minFramesOn = Int(round(minDurationOn / self.frameDurationSeconds))
+        self.minFramesOff = Int(round(minDurationOff / self.frameDurationSeconds))
         self.maxStoredFrames = maxStoredFrames
     }
 }
 
 // MARK: - Speaker
 
-public final class DiarizerSpeaker: @unchecked Sendable, Identifiable, CustomStringConvertible {
+public final class DiarizerSpeaker: Identifiable, CustomStringConvertible {
     /// Speaker ID
     public let id: UUID
-    
+
     /// Speaker's string representation
     public var description: String {
         queue.sync { _name ?? "Speaker \(_index)" }
     }
-    
+
     /// Display name
     public var name: String? {
         get { queue.sync { _name } }
         set { queue.sync(flags: .barrier) { _name = newValue } }
     }
-    
+
     /// Slot in the diarizer predictions
     public var index: Int {
         get { queue.sync { _index } }
         set { queue.sync(flags: .barrier) { _index = newValue } }
     }
-    
+
     /// Confirmed/finalized speech segments that belong to this speaker
     public var finalizedSegments: [DiarizerSegment] {
         get { queue.sync { _finalizedSegments } }
         set { queue.sync(flags: .barrier) { _finalizedSegments = newValue } }
     }
-    
+
     /// Tentative speech segments that belong to this speaker
     public var tentativeSegments: [DiarizerSegment] {
         get { queue.sync { _tentativeSegments } }
         set { queue.sync(flags: .barrier) { _tentativeSegments = newValue } }
     }
-    
+
+    /// Whether this speaker has any segments
+    public var hasSegments: Bool {
+        queue.sync { !(_finalizedSegments.isEmpty && _tentativeSegments.isEmpty) }
+    }
+
+    /// Number of segments (finalized + tentative)
+    public var segmentCount: Int {
+        queue.sync { _finalizedSegments.count + _tentativeSegments.count }
+    }
+
     /// Number of confirmed segments
     public var finalizedSegmentCount: Int {
         queue.sync { _finalizedSegments.count }
     }
-    
+
     /// Number of tentative segments
     public var tentativeSegmentCount: Int {
         queue.sync { _tentativeSegments.count }
     }
-    
+
+    /// Total duration of segments in seconds (finalized + tentative)
+    public var speechDuration: Float {
+        queue.sync {
+            return
+                (_finalizedSegments.reduce(0.0) { $0 + $1.duration }
+                + _tentativeSegments.reduce(0.0) { $0 + $1.duration })
+        }
+    }
+
+    /// Duration of all finalized segments in seconds
+    public var finalizedSpeechDuration: Float {
+        queue.sync {
+            _finalizedSegments.reduce(0.0) { $0 + $1.duration }
+        }
+    }
+
+    /// Duration of all tentative segments in seconds
+    public var tentativeSpeechDuration: Float {
+        queue.sync {
+            _tentativeSegments.reduce(0.0) { $0 + $1.duration }
+        }
+    }
+
+    /// Total number of frames spanned by all segments (finalized + tentative)
+    public var numSpeechFrames: Int {
+        queue.sync {
+            return (_finalizedSegments.reduce(0) { $0 + $1.length } + _tentativeSegments.reduce(0) { $0 + $1.length })
+        }
+    }
+
+    /// Number of frames in all finalized segments
+    public var numFinalizedSpeechFrames: Int {
+        queue.sync {
+            _finalizedSegments.reduce(0) { $0 + $1.length }
+        }
+    }
+
+    /// Number of frames in all tentative segments
+    public var numTentativeSpeechFrames: Int {
+        queue.sync {
+            _tentativeSegments.reduce(0) { $0 + $1.length }
+        }
+    }
+
     private var _name: String?
     private var _index: Int
     private var _finalizedSegments: [DiarizerSegment] = []
     private var _tentativeSegments: [DiarizerSegment] = []
     private let queue = DispatchQueue(label: "FluidAudio.Diarization.DiarizerSpeaker")
-    
+
+    /// - Parameters:
+    ///   - id: Speaker UUID
+    ///   - index: Index in diarizer output
+    ///   - name: Speaker display name
     public init(
         id: UUID = UUID(),
         index: Int,
@@ -253,39 +378,45 @@ public final class DiarizerSpeaker: @unchecked Sendable, Identifiable, CustomStr
         self._index = index
         self._name = name
     }
-    
-    public func finalize() {
+
+    /// Finalize all segments
+    /// - Parameter minFramesOn: Minimum segment length
+    public func finalize(enforcingMinFramesOn minFramesOn: Int? = nil) {
         queue.sync(flags: .barrier) {
+            if let minFramesOn {
+                _tentativeSegments.removeAll { $0.length < minFramesOn }
+            }
             _finalizedSegments.append(contentsOf: _tentativeSegments)
             _tentativeSegments.removeAll()
         }
     }
-    
+
+    /// Clear segments
     public func reset() {
         queue.sync(flags: .barrier) {
             _tentativeSegments.removeAll()
             _finalizedSegments.removeAll()
         }
     }
-    
+
     public func removeAllTentative(keepingCapacity: Bool = false) {
         queue.sync(flags: .barrier) {
             _tentativeSegments.removeAll(keepingCapacity: keepingCapacity)
         }
     }
-    
+
     public func appendTentative(_ segment: DiarizerSegment) {
         queue.sync(flags: .barrier) {
             _tentativeSegments.append(segment)
         }
     }
-    
+
     public func appendFinalized(_ segment: DiarizerSegment) {
         queue.sync(flags: .barrier) {
             _finalizedSegments.append(segment)
         }
     }
-    
+
     public func append(_ segment: DiarizerSegment) {
         queue.sync(flags: .barrier) {
             if segment.isFinalized {
@@ -295,27 +426,28 @@ public final class DiarizerSpeaker: @unchecked Sendable, Identifiable, CustomStr
             }
         }
     }
-    
+
     @discardableResult
     public func popLastTentative() -> DiarizerSegment? {
         queue.sync(flags: .barrier) {
             _tentativeSegments.popLast()
         }
     }
-    
+
     @discardableResult
     public func popLastFinalized() -> DiarizerSegment? {
         queue.sync(flags: .barrier) {
             return _finalizedSegments.popLast()
         }
     }
-    
+
     @discardableResult
     public func popLast(fromFinalized: Bool = true) -> DiarizerSegment? {
         queue.sync(flags: .barrier) {
-            return (fromFinalized
-                    ? _finalizedSegments.popLast()
-                    : _tentativeSegments.popLast())
+            return
+                (fromFinalized
+                ? _finalizedSegments.popLast()
+                : _tentativeSegments.popLast())
         }
     }
 }
@@ -406,11 +538,11 @@ public struct DiarizerSegment: Sendable, Identifiable, Comparable, Equatable {
     public mutating func extendStart(toFrame frame: Int) {
         startFrame = min(startFrame, frame)
     }
-    
+
     public static func < (lhs: DiarizerSegment, rhs: DiarizerSegment) -> Bool {
         return (lhs.startFrame, lhs.endFrame, lhs.speakerIndex) < (rhs.startFrame, rhs.endFrame, rhs.speakerIndex)
     }
-    
+
     public static func == (lhs: DiarizerSegment, rhs: DiarizerSegment) -> Bool {
         return (lhs.startFrame, lhs.endFrame, lhs.speakerIndex) == (rhs.startFrame, rhs.endFrame, rhs.speakerIndex)
     }
@@ -476,12 +608,20 @@ public struct DiarizerChunkResult: Sendable {
 ///
 /// Generalizes `SortformerTimeline` for any frame-based diarizer. Works with
 /// both Sortformer (fixed 4 speakers) and LS-EEND (variable speaker count).
-public final class DiarizerTimeline: @unchecked Sendable {
+public final class DiarizerTimeline {
+    public enum KeptOnReset {
+        case nothing
+        case namedSpeakers
+        case allSpeakers
+        case speakersWithoutSegments
+        case speakersWithSegments
+    }
+
     private struct StreamingState {
         var startFrame: Int
         var isSpeaking: Bool
         var lastSegment: (start: Int, end: Int)
-        
+
         init(
             startFrame: Int = 0,
             isSpeaking: Bool = false,
@@ -492,7 +632,7 @@ public final class DiarizerTimeline: @unchecked Sendable {
             self.lastSegment = lastSegment
         }
     }
-    
+
     /// Post-processing configuration
     public let config: DiarizerTimelineConfig
 
@@ -507,59 +647,69 @@ public final class DiarizerTimeline: @unchecked Sendable {
     public var tentativePredictions: [Float] {
         queue.sync { _tentativePredictions }
     }
-    
+
     /// Total number of frames (finalized + tentative)
-    @available(*, deprecated,
-                message: "`numFrames` now includes tentative frames. Use 'numFinalizedFrames' for only finalized frames.",
-                renamed: "numFinalizedFrames")
+    @available(
+        *, deprecated,
+        message: "`numFrames` now includes tentative frames. Use 'numFinalizedFrames' for only finalized frames.",
+        renamed: "numFinalizedFrames"
+    )
     public var numFrames: Int {
         queue.sync { _numFinalizedFrames + _tentativePredictions.count / config.numSpeakers }
     }
-    
+
     /// Total number of finalized frames
     public var numFinalizedFrames: Int {
         queue.sync { _numFinalizedFrames }
     }
-    
+
     /// Number of tentative frames
     public var numTentativeFrames: Int {
         queue.sync { _tentativePredictions.count / config.numSpeakers }
     }
 
     /// Speakers in the timeline
-    public var speakers: [Int : DiarizerSpeaker] {
+    public var speakers: [Int: DiarizerSpeaker] {
         queue.sync { _speakers }
     }
 
+    public var hasSegments: Bool {
+        speakers.values.contains(where: \.hasSegments)
+    }
+
     /// Duration of all predictions in seconds
-    @available(*, deprecated,
-                message: "`duration` now includes tentative frames. Use 'finalizedDuration' for only finalized frames.",
-                renamed: "finalizedDuration")
+    @available(
+        *, deprecated,
+        message: "`duration` now includes tentative frames. Use 'finalizedDuration' for only finalized frames.",
+        renamed: "finalizedDuration"
+    )
     public var duration: Float {
         Float(numFrames) * config.frameDurationSeconds
     }
-    
+
     /// Duration of finalized predictions in seconds
     public var finalizedDuration: Float {
         Float(numFinalizedFrames) * config.frameDurationSeconds
     }
 
     /// Duration of tentative predictions in seconds
-    @available(*, deprecated,
-                message: "tentativeDuration now excludes finalized frames. Use 'duration' for the full timeline duration.",
-                renamed: "duration")
+    @available(
+        *, deprecated,
+        message: "tentativeDuration now excludes finalized frames. Use 'duration' for the full timeline duration.",
+        renamed: "duration"
+    )
     public var tentativeDuration: Float {
         Float(numTentativeFrames) * config.frameDurationSeconds
     }
 
     private var _finalizedPredictions: [Float] = []
     private var _tentativePredictions: [Float] = []
-    private var _speakers: [Int : DiarizerSpeaker] = [:]
+    private var _speakers: [Int: DiarizerSpeaker] = [:]
     private var _numFinalizedFrames: Int = 0
-    
+
     // Segment builder state
     private var states: [StreamingState]
-    
+
     private let queue = DispatchQueue(label: "FluidAudio.Diarizer.DiarizerTimeline")
 
     private static let logger = AppLogger(category: "DiarizerTimeline")
@@ -581,14 +731,14 @@ public final class DiarizerTimeline: @unchecked Sendable {
         isComplete: Bool = true
     ) throws {
         self.init(config: config)
-        
+
         try rebuild(
             finalizedPredictions: finalizedPredictions,
             tentativePredictions: tentativePredictions,
             isComplete: isComplete
         )
     }
-    
+
     /// Initialize with existing probabilities (batch processing or restored state)
     public convenience init(
         allPredictions: [Float],
@@ -604,15 +754,16 @@ public final class DiarizerTimeline: @unchecked Sendable {
     }
 
     // MARK: - Streaming API
-    
+
+    /// Add new predictions from the diarizer
     @discardableResult
-    public func addChunk(
+    public func addPredictions(
         finalizedPredictions: [Float],
         tentativePredictions: [Float]
     ) throws -> DiarizerTimelineUpdate {
         let numFinalized = finalizedPredictions.count / config.numSpeakers
         let numTentative = tentativePredictions.count / config.numSpeakers
-        
+
         let chunk = DiarizerChunkResult(
             startFrame: self.numFinalizedFrames,
             finalizedPredictions: finalizedPredictions,
@@ -620,7 +771,7 @@ public final class DiarizerTimeline: @unchecked Sendable {
             tentativePredictions: tentativePredictions,
             tentativeFrameCount: numTentative
         )
-        
+
         return try addChunk(chunk)
     }
 
@@ -632,42 +783,47 @@ public final class DiarizerTimeline: @unchecked Sendable {
                 finalized: chunk.finalizedPredictions,
                 tentative: chunk.tentativePredictions
             )
-            
+
             _finalizedPredictions.append(contentsOf: chunk.finalizedPredictions)
             _tentativePredictions = chunk.tentativePredictions
-            
+
             for speaker in _speakers.values {
                 speaker.removeAllTentative(keepingCapacity: true)
             }
-            
-            let confirmedCounts = Dictionary(uniqueKeysWithValues: _speakers.map { (index, speaker) in
-                (index, speaker.finalizedSegmentCount)
-            })
-            
+
+            var confirmedCounts = [Int](repeating: 0, count: config.numSpeakers)
+            for (index, speaker) in _speakers {
+                confirmedCounts[index] = speaker.finalizedSegmentCount
+            }
+
             updateSegments(
                 predictions: chunk.finalizedPredictions,
                 numFrames: chunk.finalizedFrameCount,
                 isFinalized: true,
                 addTrailingTentative: false
             )
-            
+
             _numFinalizedFrames += chunk.finalizedFrameCount
-            
+
             updateSegments(
                 predictions: chunk.tentativePredictions,
                 numFrames: chunk.tentativeFrameCount,
                 isFinalized: false,
                 addTrailingTentative: true
             )
-            
+
             trimPredictions()
-            
+
             let newConfirmed = _speakers.flatMap { (index, speaker) in
-                speaker.finalizedSegments.suffix(from: confirmedCounts[index, default: 0])
+                let startIndex = confirmedCounts[index]
+                guard startIndex < speaker.finalizedSegmentCount else {
+                    return ArraySlice<DiarizerSegment>()
+                }
+                return speaker.finalizedSegments.suffix(from: startIndex)
             }
-            
-            let newTentative = _speakers.flatMap(\.value.tentativeSegments)
-            
+
+            let newTentative = _speakers.values.flatMap(\.tentativeSegments)
+
             return DiarizerTimelineUpdate(
                 finalizedSegments: newConfirmed,
                 tentativeSegments: newTentative,
@@ -678,64 +834,131 @@ public final class DiarizerTimeline: @unchecked Sendable {
 
     /// Finalize all tentative data at end of recording
     public func finalize() {
-        queue.sync(flags: .barrier) {
-            _finalizedPredictions.append(contentsOf: _tentativePredictions)
-            _numFinalizedFrames += _tentativePredictions.count / config.numSpeakers
-            _tentativePredictions.removeAll()
-            for speaker in _speakers.values {
-                speaker.finalize()
-            }
-            trimPredictions()
+        queue.sync(flags: .barrier) { finalizeLocked() }
+    }
+
+    private func finalizeLocked() {
+        _finalizedPredictions.append(contentsOf: _tentativePredictions)
+        _numFinalizedFrames += _tentativePredictions.count / config.numSpeakers
+        _tentativePredictions.removeAll()
+        for speaker in _speakers.values {
+            speaker.finalize(enforcingMinFramesOn: config.minFramesOn)
         }
+        trimPredictions()
     }
 
     /// Reset to initial state
-    public func reset() {
+    /// - Parameter condition: Condition for when to keep a speaker. All speakers still have their segments reset.
+    public func reset(keepingSpeakersWhere condition: (DiarizerSpeaker) -> Bool) {
+        queue.sync(flags: .barrier) { resetLocked(keepingSpeakersWhere: condition) }
+    }
+
+    /// Reset to initial state
+    /// - Parameter keepingSpeakers: Whether to keep existing speakers enrolled. Their segments are still reset.
+    public func reset(keepingSpeakers: Bool = false) {
         queue.sync(flags: .barrier) {
-            _finalizedPredictions.removeAll()
-            _tentativePredictions.removeAll()
-            _numFinalizedFrames = 0
-            _speakers = [:]
-            states = Array(repeating: .init(), count: config.numSpeakers)
+            resetLocked(keepingSpeakers: keepingSpeakers)
         }
     }
-    
+
+    private func resetLocked(keepingSpeakersWhere condition: (DiarizerSpeaker) -> Bool) {
+        _finalizedPredictions.removeAll()
+        _tentativePredictions.removeAll()
+        _numFinalizedFrames = 0
+        states = Array(repeating: .init(), count: config.numSpeakers)
+
+        _speakers = _speakers.filter {
+            condition($0.value)
+        }
+
+        for speaker in _speakers.values {
+            speaker.reset()
+        }
+    }
+
+    private func resetLocked(keepingSpeakers: Bool) {
+        _finalizedPredictions.removeAll()
+        _tentativePredictions.removeAll()
+        _numFinalizedFrames = 0
+        states = Array(repeating: .init(), count: config.numSpeakers)
+
+        if keepingSpeakers {
+            for speaker in _speakers.values {
+                speaker.reset()
+            }
+        } else {
+            _speakers = [:]
+        }
+    }
+
+    /// Rebuild the timeline from initial predictions. This is equivalent to reinitializing the timeline.
+    /// - Parameters:
+    ///   - finalizedPredictions: Finalized prediction matrix `[numFrames, numSpeakers]` flattened
+    ///   - tentativePredictions: Tentative prediction matrix `[numFrames, numSpeakers]` flattened
+    ///   - keepingSpeakers: Whether to keep the old speaker names and slots.
+    ///   - isComplete: Whether to finalize the timeline afterward.
     public func rebuild(
         finalizedPredictions: [Float],
         tentativePredictions: [Float],
+        keepingSpeakers: Bool = false,
         isComplete: Bool = true
     ) throws {
         try verifyPredictionCounts(finalized: finalizedPredictions, tentative: tentativePredictions)
-        
-        reset()
+
         queue.sync(flags: .barrier) {
+            resetLocked(keepingSpeakers: keepingSpeakers)
             _finalizedPredictions = finalizedPredictions
             _tentativePredictions = tentativePredictions
-            
+
             let numFinalizedFrames = finalizedPredictions.count / config.numSpeakers
             let numTentativeFrames = tentativePredictions.count / config.numSpeakers
-            
+
             updateSegments(
                 predictions: finalizedPredictions,
                 numFrames: numFinalizedFrames,
                 isFinalized: true,
                 addTrailingTentative: false
             )
-            
+
             _numFinalizedFrames = numFinalizedFrames
-            
+
             updateSegments(
                 predictions: tentativePredictions,
                 numFrames: numTentativeFrames,
                 isFinalized: false,
                 addTrailingTentative: true
             )
-            
             if isComplete {
-                finalize()
+                finalizeLocked()
             } else {
                 trimPredictions()
             }
+        }
+    }
+
+    /// Add a speaker to the timeline at a given slot, or update their name if one already exists
+    /// - Parameters:
+    ///   - index: The diarizer index of the speaker. If left as `nil`, the first unused index will be chosen.
+    ///   - name: The speaker's name
+    /// - Returns: The upserted speaker if created successfully
+    @discardableResult
+    public func upsertSpeaker(atIndex index: Int? = nil, name: String? = nil) -> DiarizerSpeaker? {
+        queue.sync(flags: .barrier) {
+            let index = index ?? (0..<config.numSpeakers).first { _speakers[$0] == nil }
+
+            // Ensure index is within bounds
+            guard let index, index >= 0, index < config.numSpeakers else { return nil }
+
+            if let speaker = _speakers[index] {
+                // Update old speaker
+                speaker.name = name
+                return speaker
+            }
+
+            // New speaker
+            let speaker = DiarizerSpeaker(index: index, name: name)
+            _speakers[index] = speaker
+            return speaker
         }
     }
 
@@ -746,8 +969,8 @@ public final class DiarizerTimeline: @unchecked Sendable {
         queue.sync {
             let frameOffset = (frame - _numFinalizedFrames) * config.numSpeakers + _finalizedPredictions.count
             guard frameOffset >= 0,
-                  frameOffset < _finalizedPredictions.count,
-                  speaker < config.numSpeakers
+                frameOffset < _finalizedPredictions.count,
+                speaker < config.numSpeakers
             else { return .nan }
             return _finalizedPredictions[frameOffset + speaker]
         }
@@ -758,8 +981,8 @@ public final class DiarizerTimeline: @unchecked Sendable {
         queue.sync {
             let frameOffset = (frame - _numFinalizedFrames) * config.numSpeakers
             guard frameOffset >= 0,
-                  frameOffset < _tentativePredictions.count,
-                  speaker < config.numSpeakers
+                frameOffset < _tentativePredictions.count,
+                speaker < config.numSpeakers
             else { return .nan }
             return _tentativePredictions[frameOffset + speaker]
         }
@@ -773,7 +996,7 @@ public final class DiarizerTimeline: @unchecked Sendable {
         isFinalized: Bool,
         addTrailingTentative: Bool
     ) {
-        guard numFrames > 0 else { return }
+        guard numFrames > 0 || addTrailingTentative else { return }
 
         let frameOffset = _numFinalizedFrames
         let numSpeakers = config.numSpeakers
@@ -790,7 +1013,7 @@ public final class DiarizerTimeline: @unchecked Sendable {
 
         for speakerIndex in 0..<numSpeakers {
             let state = states[speakerIndex]
-            
+
             var start = state.startFrame
             var speaking = state.isSpeaking
             var lastSegment = state.lastSegment
@@ -818,9 +1041,9 @@ public final class DiarizerTimeline: @unchecked Sendable {
                         finalized: wasLastSegmentFinal,
                         frameDurationSeconds: frameDuration
                     )
-                    
+
                     provideSpeaker(forSlot: speakerIndex).append(newSegment)
-                    
+
                     lastSegment = (start, end)
 
                 } else if predictions[index] > onset {
@@ -855,10 +1078,10 @@ public final class DiarizerTimeline: @unchecked Sendable {
             }
         }
     }
-    
+
     private func provideSpeaker(forSlot speakerIndex: Int) -> DiarizerSpeaker {
         if let speaker = _speakers[speakerIndex] { return speaker }
-        
+
         let newSpeaker = DiarizerSpeaker(index: speakerIndex)
         _speakers[speakerIndex] = newSpeaker
         return newSpeaker
@@ -871,41 +1094,50 @@ public final class DiarizerTimeline: @unchecked Sendable {
             _finalizedPredictions.removeFirst(numToRemove)
         }
     }
-    
+
     private func verifyPredictionCounts(finalized: borrowing [Float], tentative: borrowing [Float]) throws {
         guard finalized.count.isMultiple(of: config.numSpeakers) else {
             throw DiarizerTimelineError.misalignedFinalizedPredictions(finalized.count, config.numSpeakers)
         }
-        
+
         guard tentative.count.isMultiple(of: config.numSpeakers) else {
             throw DiarizerTimelineError.misalignedTentativePredictions(tentative.count, config.numSpeakers)
         }
     }
 }
 
-
 extension DiarizerTimeline {
     @available(*, deprecated, renamed: "finalizedPredictions")
     public var framePredictions: [Float] { finalizedPredictions }
-    
-    @available(*, deprecated, message: "Use Timeline.speakers[index].confirmedSegments to access a speaker's confirmed segments.")
+
+    @available(
+        *, deprecated,
+        message: "Use Timeline.speakers[index].confirmedSegments to access a speaker's confirmed segments."
+    )
     public var segments: [[DiarizerSegment]] {
-        var result: [[DiarizerSegment]] = Array(repeating: [], count: config.numSpeakers)
-        for (index, speaker) in _speakers {
-            result[index] = speaker.finalizedSegments
+        queue.sync {
+            var result: [[DiarizerSegment]] = Array(repeating: [], count: config.numSpeakers)
+            for (index, speaker) in _speakers {
+                result[index] = speaker.finalizedSegments
+            }
+            return result
         }
-        return result
     }
-    
-    @available(*, deprecated, message: "Use Timeline.speakers[index].tentativeSegments to access a speaker's tentative segments.")
+
+    @available(
+        *, deprecated,
+        message: "Use Timeline.speakers[index].tentativeSegments to access a speaker's tentative segments."
+    )
     public var tentativeSegments: [[DiarizerSegment]] {
-        var result: [[DiarizerSegment]] = Array(repeating: [], count: config.numSpeakers)
-        for (index, speaker) in _speakers {
-            result[index] = speaker.tentativeSegments
+        queue.sync {
+            var result: [[DiarizerSegment]] = Array(repeating: [], count: config.numSpeakers)
+            for (index, speaker) in _speakers {
+                result[index] = speaker.tentativeSegments
+            }
+            return result
         }
-        return result
     }
-    
+
     @available(*, deprecated, renamed: "numTentativeFrames")
     public var numTentative: Int { numTentativeFrames }
 }
@@ -916,7 +1148,7 @@ public struct DiarizerTimelineUpdate: Sendable {
     public let finalizedSegments: [DiarizerSegment]
     public let tentativeSegments: [DiarizerSegment]
     public let chunkResult: DiarizerChunkResult
-    
+
     public init(
         finalizedSegments: [DiarizerSegment] = [],
         tentativeSegments: [DiarizerSegment] = [],
@@ -928,19 +1160,20 @@ public struct DiarizerTimelineUpdate: Sendable {
     }
 }
 
-
 public enum DiarizerTimelineError: Error, LocalizedError {
     case misalignedFinalizedPredictions(Int, Int)
     case misalignedTentativePredictions(Int, Int)
-    
+
     public var errorDescription: String? {
         switch self {
-        case let .misalignedFinalizedPredictions(numPreds, numSpeakers):
-            return ("The number of finalized predictions (\(numPreds)) isn't a " +
-                    "multiple of the speaker count (\(numSpeakers)).")
-        case let .misalignedTentativePredictions(numPreds, numSpeakers):
-            return ("The number of tentative predictions (\(numPreds)) isn't a " +
-                    "multiple of the speaker count (\(numSpeakers)).")
+        case .misalignedFinalizedPredictions(let numPreds, let numSpeakers):
+            return
+                ("The number of finalized predictions (\(numPreds)) isn't a "
+                + "multiple of the speaker count (\(numSpeakers)).")
+        case .misalignedTentativePredictions(let numPreds, let numSpeakers):
+            return
+                ("The number of tentative predictions (\(numPreds)) isn't a "
+                + "multiple of the speaker count (\(numSpeakers)).")
         }
     }
 }

@@ -59,9 +59,9 @@ private final class LSEENDInferenceSharedResources {
 
     // Preallocated ANE-aligned input arrays reused across predictStep calls
     let memoryOptimizer: ANEMemoryOptimizer
-    let frameArray: MLMultiArray       // [1, 1, inputDim]
-    let ingestArray: MLMultiArray      // [1]
-    let decodeArray: MLMultiArray      // [1]
+    let frameArray: MLMultiArray  // [1, 1, inputDim]
+    let ingestArray: MLMultiArray  // [1]
+    let decodeArray: MLMultiArray  // [1]
 
     init(
         descriptor: LSEENDModelDescriptor,
@@ -94,7 +94,7 @@ private final class LSEENDInferenceSharedResources {
         configuration.computeUnits = computeUnits
         configuration.allowLowPrecisionAccumulationOnGPU = true
         model = try MLModel(
-            contentsOf: try LSEENDInferenceEngine.compiledModelURL(for: descriptor.modelURL),
+            contentsOf: try LSEENDInferenceHelper.compiledModelURL(for: descriptor.modelURL),
             configuration: configuration
         )
         offlineFeatureExtractor = LSEENDOfflineFeatureExtractor(metadata: metadata, spectrogram: melSpectrogram)
@@ -116,7 +116,7 @@ private final class LSEENDInferenceSharedResources {
     }
 }
 
-/// CoreML inference engine for LS-EEND speaker diarization.
+/// Low level CoreML inference engine for LS-EEND speaker diarization.
 ///
 /// Each engine instance owns its own compiled model, mel spectrogram, and feature extractor.
 /// There are no shared singletons — multiple engines can run concurrently without interference.
@@ -127,14 +127,7 @@ private final class LSEENDInferenceSharedResources {
 ///   incremental audio processing.
 /// - **Simulation**: ``simulateStreaming(audioFileURL:chunkSeconds:)`` to replay a file through the
 ///   streaming pipeline with fixed-size chunks.
-///
-/// Typical usage:
-/// ```swift
-/// let descriptor = try await LSEENDModelDescriptor.loadFromHuggingFace(variant: .dihard3)
-/// let engine = try LSEENDInferenceEngine(descriptor: descriptor)
-/// let result = try engine.infer(audioFileURL: url)
-/// ```
-public final class LSEENDInferenceEngine {
+public final class LSEENDInferenceHelper {
     private let logger = AppLogger(category: "LSEENDInference")
     private let sharedResources: LSEENDInferenceSharedResources
 
@@ -460,23 +453,9 @@ public final class LSEENDInferenceEngine {
 /// Created via ``LSEENDInferenceEngine/createSession(inputSampleRate:)``.
 /// The session maintains internal RNN state across calls to ``pushAudio(_:)``.
 ///
-/// Typical usage:
-/// ```swift
-/// let session = try engine.createSession(inputSampleRate: 8000)
-/// for chunk in audioChunks {
-///     if let update = try session.pushAudio(chunk) {
-///         // Handle committed + preview frames
-///     }
-/// }
-/// if let final = try session.finalize() {
-///     // Handle remaining frames
-/// }
-/// let result = session.snapshot()  // Full assembled result
-/// ```
-///
 /// - Important: This class is **not** thread-safe. All calls must be serialized externally.
 public final class LSEENDStreamingSession {
-    fileprivate let engine: LSEENDInferenceEngine
+    fileprivate let engine: LSEENDInferenceHelper
     /// The sample rate of audio being fed to this session.
     public let inputSampleRate: Int
     fileprivate let featureExtractor: LSEENDStreamingFeatureExtractor
@@ -490,7 +469,7 @@ public final class LSEENDStreamingSession {
     fileprivate var emittedFrames = 0
 
     fileprivate init(
-        engine: LSEENDInferenceEngine, inputSampleRate: Int, melSpectrogram: NeMoMelSpectrogram? = nil
+        engine: LSEENDInferenceHelper, inputSampleRate: Int, melSpectrogram: NeMoMelSpectrogram? = nil
     ) throws {
         guard inputSampleRate == engine.targetSampleRate else {
             throw LSEENDError.unsupportedAudio(
@@ -684,6 +663,7 @@ private func roundedMillis(_ value: Double) -> Double {
 
 /// Clone an MLMultiArray into a new ANE-aligned allocation.
 private func cloneAlignedMultiArray(_ source: MLMultiArray) throws -> MLMultiArray {
+
     let copy = try ANEMemoryUtils.createAlignedArray(
         shape: source.shape,
         dataType: .float32,

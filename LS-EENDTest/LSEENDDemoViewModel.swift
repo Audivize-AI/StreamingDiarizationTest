@@ -141,6 +141,7 @@ struct LSEENDHeatmapSnapshot {
     let previewStartSeconds: Double?
     let previewEndSeconds: Double?
     let binary: Bool
+    let vadActiveRanges: [(start: Double, end: Double)]
 }
 
 final class LSEENDDemoViewModel: ObservableObject {
@@ -151,8 +152,8 @@ final class LSEENDDemoViewModel: ObservableObject {
     @Published var threshold: Double = 0.5
     @Published var medianWidth: Int = 11
     @Published var windowSeconds: Double = 120
-    @Published var blockSeconds: Double = 0.5
-    @Published var refreshSeconds: Double = 0.25
+    @Published var blockSeconds: Double = 0.1
+    @Published var refreshSeconds: Double = 0.1
     @Published var simulateSpeed: Double = 1.0
     @Published var simulationPath = ""
 
@@ -170,10 +171,16 @@ final class LSEENDDemoViewModel: ObservableObject {
 
     private let processingQueue = DispatchQueue(label: "LS-EEND.Processing", qos: .userInitiated)
     private let processor = LSEENDDiarizer()
+    private let vadResampler = AudioConverter(sampleRate: Double(VadManager.sampleRate))
     private var audioSource: LSEENDAudioSource?
     private var currentDescriptor: LSEENDModelDescriptor?
     private var pendingAudioCount = 0
     private var totalSamplesReceived = 0
+    private var vadManager: VadManager?
+    private var vadStreamState = VadStreamState.initial()
+    private var vadPendingSamples: [Float] = []
+    private var vadActivityFrames: [Bool] = []
+    private var vadProcessedSamples = 0
     private let outputDirectory: URL = {
         if let override = ProcessInfo.processInfo.environment["LSEEND_WORKSPACE_ROOT"], !override.isEmpty {
             return URL(fileURLWithPath: override, isDirectory: true).appendingPathComponent("artifacts/mic_gui_swift", isDirectory: true)
@@ -191,6 +198,7 @@ final class LSEENDDemoViewModel: ObservableObject {
             statusText = "Tests running."
             sourceText = "UI demo disabled during tests"
         } else {
+            initializeVAD()
             reloadModel()
         }
     }
@@ -211,7 +219,8 @@ final class LSEENDDemoViewModel: ObservableObject {
             endSeconds: Double(ordered.rows) / frameRate,
             previewStartSeconds: previewRange.start,
             previewEndSeconds: previewRange.end,
-            binary: false
+            binary: false,
+            vadActiveRanges: []
         )
     }
 
@@ -230,8 +239,26 @@ final class LSEENDDemoViewModel: ObservableObject {
             endSeconds: Double(ordered.rows) / frameRate,
             previewStartSeconds: previewRange.start,
             previewEndSeconds: previewRange.end,
-            binary: true
+            binary: true,
+            vadActiveRanges: vadOverlayRanges(startFrame: startFrame, endFrame: startFrame + shown.rows)
         )
+    }
+
+    private func initializeVAD() {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let manager = try await VadManager()
+                self.processingQueue.async {
+                    self.vadManager = manager
+                    self.resetVADStateLocked()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.statusText = "Ready. VAD unavailable: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     func applyVariantDefaults() {
@@ -442,6 +469,7 @@ final class LSEENDDemoViewModel: ObservableObject {
                 self.processor.reset()
                 self.totalSamplesReceived = 0
                 self.pendingAudioCount = 0
+                self.resetVADStateLocked()
                 DispatchQueue.main.async {
                     self.sourceText = "Not started"
                     self.updateBufferText(receivedSamples: 0)
@@ -457,6 +485,7 @@ final class LSEENDDemoViewModel: ObservableObject {
             }
 
             do {
+                try self.flushPendingVADIfNeeded()
                 // Flush pending audio and finalize
                 let _ = try self.processor.finalizeSession()
                 let timeline = self.processor.timeline
@@ -489,6 +518,7 @@ final class LSEENDDemoViewModel: ObservableObject {
             self.processor.reset()
             self.totalSamplesReceived = 0
             self.pendingAudioCount = 0
+            self.resetVADStateLocked()
             DispatchQueue.main.async {
                 self.sourceText = "Not started"
                 self.resetTimelineUI(clearStatus: clearStatus, receivedSamples: 0)
@@ -573,6 +603,7 @@ final class LSEENDDemoViewModel: ObservableObject {
             guard let self, self.processor.isAvailable else { return }
             do {
                 self.processor.addAudio(chunk)
+                try self.ingestVAD(chunk)
                 self.totalSamplesReceived += chunk.count
                 self.pendingAudioCount += chunk.count
 
@@ -657,6 +688,87 @@ final class LSEENDDemoViewModel: ObservableObject {
         updateBufferText(receivedSamples: receivedSamples)
         if clearStatus {
             statusText = "Timeline reset."
+        }
+    }
+
+    private func resetVADStateLocked() {
+        vadStreamState = VadStreamState.initial()
+        vadPendingSamples.removeAll(keepingCapacity: true)
+        vadActivityFrames.removeAll(keepingCapacity: true)
+        vadProcessedSamples = 0
+    }
+
+    private func blockingAwait<T>(_ operation: @escaping () async throws -> T) throws -> T {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Result<T, Error>?
+        Task {
+            do {
+                result = .success(try await operation())
+            } catch {
+                result = .failure(error)
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return try result!.get()
+    }
+
+    private func ingestVAD(_ diarizerSamples: [Float]) throws {
+        guard let vadManager else { return }
+        guard !diarizerSamples.isEmpty else { return }
+
+        let diarizerRate = Double(processor.targetSampleRate ?? 8000)
+        let vadSamples = try vadResampler.resample(diarizerSamples, from: diarizerRate)
+        guard !vadSamples.isEmpty else { return }
+
+        vadPendingSamples.append(contentsOf: vadSamples)
+        while vadPendingSamples.count >= VadManager.chunkSize {
+            let chunk = Array(vadPendingSamples.prefix(VadManager.chunkSize))
+            vadPendingSamples.removeFirst(VadManager.chunkSize)
+            try processVADChunk(chunk, manager: vadManager)
+        }
+    }
+
+    private func flushPendingVADIfNeeded() throws {
+        guard let vadManager else { return }
+        guard !vadPendingSamples.isEmpty else { return }
+        let chunk = vadPendingSamples
+        vadPendingSamples.removeAll(keepingCapacity: true)
+        try processVADChunk(chunk, manager: vadManager)
+    }
+
+    private func processVADChunk(_ chunk: [Float], manager: VadManager) throws {
+        let chunkStartSample = vadProcessedSamples
+        let result = try blockingAwait {
+            try await manager.processStreamingChunk(
+                chunk,
+                state: self.vadStreamState,
+                config: .default,
+                returnSeconds: false
+            )
+        }
+        vadStreamState = result.state
+        vadProcessedSamples += chunk.count
+        appendVADActivity(
+            active: result.state.triggered,
+            startSample: chunkStartSample,
+            endSample: vadProcessedSamples
+        )
+    }
+
+    private func appendVADActivity(active: Bool, startSample: Int, endSample: Int) {
+        guard let frameRate = processor.modelFrameHz else { return }
+        guard endSample > startSample else { return }
+        let startFrame = Int(floor((Double(startSample) / Double(VadManager.sampleRate)) * frameRate))
+        let endFrame = Int(ceil((Double(endSample) / Double(VadManager.sampleRate)) * frameRate))
+        guard endFrame > startFrame else { return }
+        if vadActivityFrames.count < endFrame {
+            vadActivityFrames.append(contentsOf: repeatElement(false, count: endFrame - vadActivityFrames.count))
+        }
+        if active {
+            for frameIndex in startFrame..<endFrame {
+                vadActivityFrames[frameIndex] = true
+            }
         }
     }
 
@@ -764,6 +876,35 @@ final class LSEENDDemoViewModel: ObservableObject {
             Double(previewStart) / frameRate,
             Double(previewEnd) / frameRate
         )
+    }
+
+    private func vadOverlayRanges(startFrame: Int, endFrame: Int) -> [(start: Double, end: Double)] {
+        guard let frameRate = processor.modelFrameHz else { return [] }
+        guard endFrame > startFrame, !vadActivityFrames.isEmpty else { return [] }
+
+        let lower = max(0, min(startFrame, vadActivityFrames.count))
+        let upper = max(lower, min(endFrame, vadActivityFrames.count))
+        guard upper > lower else { return [] }
+
+        var ranges: [(start: Double, end: Double)] = []
+        var rangeStart: Int?
+
+        for frameIndex in lower..<upper {
+            if vadActivityFrames[frameIndex] {
+                if rangeStart == nil {
+                    rangeStart = frameIndex
+                }
+            } else if let start = rangeStart {
+                ranges.append((Double(start) / frameRate, Double(frameIndex) / frameRate))
+                rangeStart = nil
+            }
+        }
+
+        if let start = rangeStart {
+            ranges.append((Double(start) / frameRate, Double(upper) / frameRate))
+        }
+
+        return ranges
     }
 
     private func nextOutputStem() -> String {

@@ -264,19 +264,6 @@ extension LSEENDVariant: Identifiable {
 
 /// Locates the CoreML model and metadata files for a specific LS-EEND variant.
 ///
-/// Create a descriptor either from local file paths or by downloading from HuggingFace:
-/// ```swift
-/// // From HuggingFace (downloads on first call, then uses cache)
-/// let descriptor = try await LSEENDModelDescriptor.loadFromHuggingFace(variant: .dihard3)
-///
-/// // From local paths
-/// let descriptor = LSEENDModelDescriptor(
-///     variant: .dihard3,
-///     modelURL: modelURL,
-///     metadataURL: metadataURL
-/// )
-/// ```
-///
 /// Pass the descriptor to ``LSEENDInferenceEngine/init(descriptor:computeUnits:)``
 /// or ``LSEENDDiarizer/initialize(descriptor:)`` to load the model.
 public struct LSEENDModelDescriptor: Sendable {
@@ -490,12 +477,13 @@ public struct LSEENDModelMetadata: Decodable, Sendable {
         hopLength ?? 80
     }
 
-    /// Effective FFT size. Uses ``nFFT`` if present, otherwise the smallest power of 2
-    /// that is ≥ ``resolvedWinLength``.
+    /// Effective FFT size used by the LS-EEND frontend.
+    ///
+    /// The upstream Python LS-EEND feature extractor derives the actual STFT size from
+    /// `win_length` via `1 << (win_length - 1).bit_length()`, even when the YAML also
+    /// contains a larger `data.feat.n_fft` value. To preserve parity with the Python
+    /// implementation, the Swift frontend follows that effective behavior here.
     public var resolvedFFTSize: Int {
-        if let nFFT {
-            return nFFT
-        }
         var fft = 1
         while fft < resolvedWinLength {
             fft <<= 1

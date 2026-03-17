@@ -286,6 +286,23 @@ private struct LSEENDHeatmapView: View {
             }
         }
 
+        if snapshot.binary, !snapshot.vadActiveRanges.isEmpty {
+            let duration = max(snapshot.endSeconds - snapshot.startSeconds, 0.001)
+            for range in snapshot.vadActiveRanges where range.end > range.start {
+                let startRatio = (range.start - snapshot.startSeconds) / duration
+                let endRatio = (range.end - snapshot.startSeconds) / duration
+                let clampedStart = max(0, min(1, startRatio))
+                let clampedEnd = max(clampedStart, min(1, endRatio))
+                let overlay = CGRect(
+                    x: size.width * CGFloat(clampedStart),
+                    y: 0,
+                    width: size.width * CGFloat(clampedEnd - clampedStart),
+                    height: size.height
+                )
+                context.fill(Path(overlay), with: .color(Color(red: 0.0, green: 0.72, blue: 0.72).opacity(0.18)))
+            }
+        }
+
         if let previewStartSeconds = snapshot.previewStartSeconds,
            let previewEndSeconds = snapshot.previewEndSeconds,
            previewEndSeconds > previewStartSeconds {
@@ -298,9 +315,22 @@ private struct LSEENDHeatmapView: View {
                 width: size.width * CGFloat(endRatio - startRatio),
                 height: size.height
             )
-            context.fill(Path(overlay), with: .color(.orange.opacity(0.12)))
-            let marker = CGRect(x: overlay.minX, y: 0, width: 1, height: size.height)
-            context.fill(Path(marker), with: .color(.orange))
+            let bandHeight = min(8, max(4, size.height * 0.03))
+            let topBand = CGRect(
+                x: overlay.minX,
+                y: 0,
+                width: overlay.width,
+                height: bandHeight
+            )
+            context.fill(Path(topBand), with: .color(.orange.opacity(0.85)))
+
+            let startMarker = CGRect(x: overlay.minX, y: 0, width: 1, height: size.height)
+            context.fill(Path(startMarker), with: .color(.orange))
+
+            if overlay.width > 1 {
+                let endMarker = CGRect(x: max(overlay.maxX - 1, overlay.minX), y: 0, width: 1, height: size.height)
+                context.fill(Path(endMarker), with: .color(.orange.opacity(0.8)))
+            }
         }
     }
 

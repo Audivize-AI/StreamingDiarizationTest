@@ -9,10 +9,11 @@ public enum Repo: String, CaseIterable {
     case parakeetCtc06b = "FluidInference/parakeet-ctc-0.6b-coreml"
     case parakeetEou160 = "FluidInference/parakeet-realtime-eou-120m-coreml/160ms"
     case parakeetEou320 = "FluidInference/parakeet-realtime-eou-120m-coreml/320ms"
+    case parakeetEou1280 = "FluidInference/parakeet-realtime-eou-120m-coreml/1280ms"
     case diarizer = "FluidInference/speaker-diarization-coreml"
     case kokoro = "FluidInference/kokoro-82m-coreml"
     case sortformer = "FluidInference/diar-streaming-sortformer-coreml"
-    case lseend = "GradientDescent2718/ls-eend-coreml"
+    case lseend = "FluidInference/ls-eend-coreml"
     case pocketTts = "FluidInference/pocket-tts-coreml"
     case qwen3Asr = "FluidInference/qwen3-asr-0.6b-coreml/f32"
     case qwen3AsrInt8 = "FluidInference/qwen3-asr-0.6b-coreml/int8"
@@ -35,6 +36,8 @@ public enum Repo: String, CaseIterable {
             return "parakeet-realtime-eou-120m-coreml/160ms"
         case .parakeetEou320:
             return "parakeet-realtime-eou-120m-coreml/320ms"
+        case .parakeetEou1280:
+            return "parakeet-realtime-eou-120m-coreml/1280ms"
         case .diarizer:
             return "speaker-diarization-coreml"
         case .kokoro:
@@ -61,12 +64,12 @@ public enum Repo: String, CaseIterable {
             return "FluidInference/parakeet-ctc-110m-coreml"
         case .parakeetCtc06b:
             return "FluidInference/parakeet-ctc-0.6b-coreml"
-        case .parakeetEou160, .parakeetEou320:
+        case .parakeetEou160, .parakeetEou320, .parakeetEou1280:
             return "FluidInference/parakeet-realtime-eou-120m-coreml"
         case .sortformer:
             return "FluidInference/diar-streaming-sortformer-coreml"
         case .lseend:
-            return "GradientDescent2718/ls-eend-coreml"
+            return "FluidInference/ls-eend-coreml"
         case .qwen3Asr, .qwen3AsrInt8:
             return "FluidInference/qwen3-asr-0.6b-coreml"
         default:
@@ -81,6 +84,8 @@ public enum Repo: String, CaseIterable {
             return "160ms"
         case .parakeetEou320:
             return "320ms"
+        case .parakeetEou1280:
+            return "1280ms"
         case .qwen3Asr:
             return "f32"
         case .qwen3AsrInt8:
@@ -99,6 +104,8 @@ public enum Repo: String, CaseIterable {
             return "parakeet-eou-streaming/160ms"
         case .parakeetEou320:
             return "parakeet-eou-streaming/320ms"
+        case .parakeetEou1280:
+            return "parakeet-eou-streaming/1280ms"
         case .sortformer:
             return "sortformer"
         case .lseend:
@@ -233,18 +240,18 @@ public enum ModelNames {
     /// Sortformer streaming diarization model names
     public enum Sortformer {
         public enum Variant: CaseIterable, Sendable {
-            case gradientDecentV2
-            case gradientDecentV2_1
+            case gradientDescentV2
+            case gradientDescentV2_1
             case nvidiaLowLatencyV2
             case nvidiaLowLatencyV2_1
             case nvidiaHighLatencyV2
             case nvidiaHighLatencyV2_1
-            
+
             public var name: String {
                 switch self {
-                case .gradientDecentV2:
+                case .gradientDescentV2:
                     return "Sortformer_v2"
-                case .gradientDecentV2_1:
+                case .gradientDescentV2_1:
                     return "Sortformer_v2.1"
                 case .nvidiaLowLatencyV2:
                     return "SortformerNvidiaLow_v2"
@@ -256,13 +263,13 @@ public enum ModelNames {
                     return "SortformerNvidiaHigh_v2.1"
                 }
             }
-            
+
             public var defaultConfiguration: SortformerConfig {
                 switch self {
-                case .gradientDecentV2:
-                    return .gradientDescentV2
-                case .gradientDecentV2_1:
-                    return .gradientDescentV2_1
+                case .gradientDescentV2:
+                    return .fastestV2
+                case .gradientDescentV2_1:
+                    return .fastestV2_1
                 case .nvidiaLowLatencyV2:
                     return .nvidiaLowLatencyV2
                 case .nvidiaLowLatencyV2_1:
@@ -273,24 +280,24 @@ public enum ModelNames {
                     return .nvidiaHighLatencyV2_1
                 }
             }
-            
+
             public var fileName: String {
                 return "\(name).mlmodelc"
             }
-            
+
             public func isCompatible(with config: SortformerConfig) -> Bool {
                 defaultConfiguration.isCompatible(with: config)
             }
         }
-        
+
         /// Lowest latency for streaming
-        public static let defaultVariant: Variant = .gradientDecentV2_1
-        
+        public static let defaultVariant: Variant = .gradientDescentV2_1
+
         /// Bundle name for a specific variant
-        public static func bundle(for varient: Variant) -> String {
-            return varient.fileName
+        public static func bundle(for variant: Variant) -> String {
+            return variant.fileName
         }
-        
+
         /// Bundle name for a given configuration
         public static func bundle(for config: SortformerConfig) -> String? {
             guard let variant = config.modelVariant else {
@@ -299,7 +306,7 @@ public enum ModelNames {
             assert(variant.isCompatible(with: config), "ERROR: Model variant and configuration are not compatible.")
             return variant.fileName
         }
-        
+
         /// Default bundle name
         public static var defaultBundle: String {
             return defaultVariant.fileName
@@ -310,7 +317,7 @@ public enum ModelNames {
             Set(Variant.allCases.map(\.fileName))
         }
     }
-    
+
     /// LS-EEND streaming diarization model names
     public enum LSEEND {
         public enum Variant: String, CaseIterable, Sendable, CustomStringConvertible {
@@ -318,7 +325,7 @@ public enum ModelNames {
             case callhome = "CALLHOME"
             case dihard2 = "DIHARD II"
             case dihard3 = "DIHARD III"
-            
+
             public var name: String {
                 switch self {
                 case .ami:
@@ -331,26 +338,26 @@ public enum ModelNames {
                     return "ls_eend_dih3_step"
                 }
             }
-            
+
             public var description: String { rawValue }
-            
+
             public var stem: String { "\(rawValue)/\(name)" }
-            
+
             public var modelFile: String { "\(stem).mlmodelc" }
-            
+
             public var configFile: String { "\(stem).json" }
-            
+
             public var fileNames: [String] { [modelFile, configFile] }
         }
-        
+
         /// Lowest latency for streaming
         public static let defaultVariant: Variant = .dihard3
-        
+
         /// Bundle name for a specific variant
-        public static func bundle(for varient: Variant) -> [String] {
-            return varient.fileNames
+        public static func bundle(for variant: Variant) -> [String] {
+            return variant.fileNames
         }
-        
+
         /// Default bundle name
         public static var defaultBundle: [String] {
             return defaultVariant.fileNames
@@ -508,7 +515,7 @@ public enum ModelNames {
             return ModelNames.ASR.requiredModels
         case .parakeetCtc110m, .parakeetCtc06b:
             return ModelNames.CTC.requiredModels
-        case .parakeetEou160, .parakeetEou320:
+        case .parakeetEou160, .parakeetEou320, .parakeetEou1280:
             return ModelNames.ParakeetEOU.requiredModels
         case .diarizer:
             if variant == "offline" {
@@ -532,7 +539,7 @@ public enum ModelNames {
             return ModelNames.Sortformer.requiredModels
         case .lseend:
             if let variant = variant {
-                return [ variant + ".mlmodelc", variant + ".json" ]
+                return [variant + ".mlmodelc", variant + ".json"]
             }
             return ModelNames.LSEEND.requiredModels
         case .qwen3Asr, .qwen3AsrInt8:

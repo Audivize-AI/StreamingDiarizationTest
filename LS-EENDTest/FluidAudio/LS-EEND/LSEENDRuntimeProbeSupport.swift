@@ -37,17 +37,34 @@ enum LSEENDRuntimeProbeSupport {
         }
 
         switch command {
+        case "offline-features":
+            let variant = try parseVariant(from: arguments)
+            let audioURL = try parseAudioURL(from: arguments)
+            let descriptor = try await LSEENDModelDescriptor.loadFromHuggingFace(variant: variant)
+            let metadataData = try Data(contentsOf: descriptor.metadataURL)
+            let metadata = try JSONDecoder().decode(LSEENDModelMetadata.self, from: metadataData)
+            let converter = AudioConverter(
+                targetFormat: AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: Double(metadata.resolvedSampleRate),
+                    channels: 1,
+                    interleaved: false
+                )!
+            )
+            let audio = try converter.resampleAudioFile(audioURL)
+            let extractor = LSEENDOfflineFeatureExtractor(metadata: metadata)
+            return try encodeJSON(ProbeMatrix(extractor.extractFeatures(audio: audio)))
         case "offline":
             let variant = try parseVariant(from: arguments)
             let audioURL = try parseAudioURL(from: arguments)
-            let engine = try LSEENDInferenceEngine(
+            let engine = try LSEENDInferenceHelper(
                 descriptor: await .loadFromHuggingFace(variant: variant), computeUnits: .cpuOnly)
             return try encodeJSON(ProbeInferenceResult(engine.infer(audioFileURL: audioURL)))
         case "streaming":
             let variant = try parseVariant(from: arguments)
             let audioURL = try parseAudioURL(from: arguments)
             let chunkSeconds = try parseDouble(flag: "--chunk-seconds", from: arguments)
-            let engine = try LSEENDInferenceEngine(
+            let engine = try LSEENDInferenceHelper(
                 descriptor: await .loadFromHuggingFace(variant: variant), computeUnits: .cpuOnly)
             return try encodeJSON(
                 ProbeStreamingResult(engine.simulateStreaming(audioFileURL: audioURL, chunkSeconds: chunkSeconds)))
@@ -67,7 +84,7 @@ enum LSEENDRuntimeProbeSupport {
         audioURL: URL,
         chunkSeconds: Double
     ) async throws -> ProbeSessionCheckResult {
-        let engine = try LSEENDInferenceEngine(
+        let engine = try LSEENDInferenceHelper(
             descriptor: await .loadFromHuggingFace(variant: variant), computeUnits: .cpuOnly
         )
         let converter = AudioConverter(
