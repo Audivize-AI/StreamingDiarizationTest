@@ -1,6 +1,6 @@
 import Foundation
 
-@testable import LLS_EENDTest
+@testable import LS_EENDTest
 
 struct NPYFloatArray {
     let shape: [Int]

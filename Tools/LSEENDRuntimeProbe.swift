@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreML
 import Foundation
 
 private struct ProbeMatrix: Codable {
@@ -66,6 +67,62 @@ private struct ProbeSessionCheckResult: Codable {
     let repeatedSnapshotProbabilities: ProbeMatrix
 }
 
+/// Lightweight variant info for the standalone probe (avoids pulling in ModelNames + its dependencies).
+private enum ProbeVariant: String {
+    case ami, callhome, dihard2, dihard3
+
+    /// Subfolder name in the HuggingFace cache (e.g. "AMI", "DIHARD III").
+    var folderName: String {
+        switch self {
+        case .ami: return "AMI"
+        case .callhome: return "CALLHOME"
+        case .dihard2: return "DIHARD II"
+        case .dihard3: return "DIHARD III"
+        }
+    }
+
+    /// Base file stem (e.g. "ls_eend_ami_step").
+    var stem: String {
+        switch self {
+        case .ami: return "ls_eend_ami_step"
+        case .callhome: return "ls_eend_callhome_step"
+        case .dihard2: return "ls_eend_dih2_step"
+        case .dihard3: return "ls_eend_dih3_step"
+        }
+    }
+
+    /// Resolve a descriptor from the standard HuggingFace model cache directory.
+    func resolveDescriptor() throws -> LSEENDModelDescriptor {
+        let cacheDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("FluidAudio/Models/ls-eend")
+            .appendingPathComponent(folderName)
+        let modelURL = cacheDir.appendingPathComponent("\(stem).mlmodelc")
+        let metadataURL = cacheDir.appendingPathComponent("\(stem).json")
+
+        guard FileManager.default.fileExists(atPath: modelURL.path) else {
+            throw ProbeError.invalidArguments("Model not found at \(modelURL.path). Run the app first to download models.")
+        }
+        guard FileManager.default.fileExists(atPath: metadataURL.path) else {
+            throw ProbeError.invalidArguments("Metadata not found at \(metadataURL.path).")
+        }
+
+        // We need an LSEENDVariant for the descriptor init, but we can't use it directly
+        // without pulling in ModelNames. Instead we use the variant that matches our folder.
+        // The descriptor only uses variant for labeling, not for path resolution.
+        return LSEENDModelDescriptor(variant: lseendVariant, modelURL: modelURL, metadataURL: metadataURL)
+    }
+
+    /// Map to the actual LSEENDVariant enum value.
+    var lseendVariant: LSEENDVariant {
+        switch self {
+        case .ami: return .ami
+        case .callhome: return .callhome
+        case .dihard2: return .dihard2
+        case .dihard3: return .dihard3
+        }
+    }
+}
+
 @main
 private struct LSEENDRuntimeProbe {
     static func main() throws {
@@ -80,25 +137,26 @@ private struct LSEENDRuntimeProbe {
         case "offline-features":
             let variant = try parseVariant(from: arguments)
             let audioURL = try parseAudioURL(from: arguments)
-            let descriptor = LSEENDModelDescriptor.defaultDescriptor(for: variant)
-            let engine = try LSEENDInferenceEngine(descriptor: descriptor, computeUnits: .cpuOnly)
+            let descriptor = try variant.resolveDescriptor()
+            let metadataData = try Data(contentsOf: descriptor.metadataURL)
+            let metadata = try JSONDecoder().decode(LSEENDModelMetadata.self, from: metadataData)
             let converter = AudioConverter(
                 targetFormat: AVAudioFormat(
                     commonFormat: .pcmFormatFloat32,
-                    sampleRate: Double(engine.targetSampleRate),
+                    sampleRate: Double(metadata.resolvedSampleRate),
                     channels: 1,
                     interleaved: false
                 )!
             )
             let audio = try converter.resampleAudioFile(audioURL)
-            let extractor = LSEENDOfflineFeatureExtractor(metadata: engine.metadata)
+            let extractor = LSEENDOfflineFeatureExtractor(metadata: metadata)
             payload = try encodeJSON(ProbeMatrix(extractor.extractFeatures(audio: audio)))
         case "streaming-features":
             let variant = try parseVariant(from: arguments)
             let audioURL = try parseAudioURL(from: arguments)
             let chunkSeconds = try parseDouble(flag: "--chunk-seconds", from: arguments)
-            let descriptor = LSEENDModelDescriptor.defaultDescriptor(for: variant)
-            let engine = try LSEENDInferenceEngine(descriptor: descriptor, computeUnits: .cpuOnly)
+            let descriptor = try variant.resolveDescriptor()
+            let engine = try LSEENDInferenceHelper(descriptor: descriptor, computeUnits: .cpuOnly)
             let converter = AudioConverter(
                 targetFormat: AVAudioFormat(
                     commonFormat: .pcmFormatFloat32,
@@ -128,19 +186,23 @@ private struct LSEENDRuntimeProbe {
         case "offline":
             let variant = try parseVariant(from: arguments)
             let audioURL = try parseAudioURL(from: arguments)
-            let engine = try LSEENDInferenceEngine(descriptor: .defaultDescriptor(for: variant), computeUnits: .cpuOnly)
+            let engine = try LSEENDInferenceHelper(
+                descriptor: variant.resolveDescriptor(), computeUnits: .cpuOnly)
             payload = try encodeJSON(ProbeInferenceResult(engine.infer(audioFileURL: audioURL)))
         case "streaming":
             let variant = try parseVariant(from: arguments)
             let audioURL = try parseAudioURL(from: arguments)
             let chunkSeconds = try parseDouble(flag: "--chunk-seconds", from: arguments)
-            let engine = try LSEENDInferenceEngine(descriptor: .defaultDescriptor(for: variant), computeUnits: .cpuOnly)
-            payload = try encodeJSON(ProbeStreamingResult(engine.simulateStreaming(audioFileURL: audioURL, chunkSeconds: chunkSeconds)))
+            let engine = try LSEENDInferenceHelper(
+                descriptor: variant.resolveDescriptor(), computeUnits: .cpuOnly)
+            payload = try encodeJSON(
+                ProbeStreamingResult(engine.simulateStreaming(audioFileURL: audioURL, chunkSeconds: chunkSeconds)))
         case "session-check":
             let variant = try parseVariant(from: arguments)
             let audioURL = try parseAudioURL(from: arguments)
             let chunkSeconds = try parseDouble(flag: "--chunk-seconds", from: arguments)
-            payload = try encodeJSON(try runSessionCheck(variant: variant, audioURL: audioURL, chunkSeconds: chunkSeconds))
+            payload = try encodeJSON(
+                try runSessionCheck(variant: variant, audioURL: audioURL, chunkSeconds: chunkSeconds))
         default:
             throw ProbeError.invalidArguments("Unknown command: \(command)")
         }
@@ -153,11 +215,12 @@ private struct LSEENDRuntimeProbe {
     }
 
     private static func runSessionCheck(
-        variant: LSEENDModelVariant,
+        variant: ProbeVariant,
         audioURL: URL,
         chunkSeconds: Double
     ) throws -> ProbeSessionCheckResult {
-        let engine = try LSEENDInferenceEngine(descriptor: .defaultDescriptor(for: variant), computeUnits: .cpuOnly)
+        let engine = try LSEENDInferenceHelper(
+            descriptor: variant.resolveDescriptor(), computeUnits: .cpuOnly)
         let converter = AudioConverter(
             targetFormat: AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
@@ -210,20 +273,12 @@ private struct LSEENDRuntimeProbe {
         return try encoder.encode(value)
     }
 
-    private static func parseVariant(from arguments: [String]) throws -> LSEENDModelVariant {
+    private static func parseVariant(from arguments: [String]) throws -> ProbeVariant {
         let raw = try parseString(flag: "--variant", from: arguments)
-        switch raw.lowercased() {
-        case "ami":
-            return .ami
-        case "callhome":
-            return .callhome
-        case "dihard2":
-            return .dihard2
-        case "dihard3":
-            return .dihard3
-        default:
+        guard let variant = ProbeVariant(rawValue: raw.lowercased()) else {
             throw ProbeError.invalidArguments("Unsupported variant: \(raw)")
         }
+        return variant
     }
 
     private static func parseAudioURL(from arguments: [String]) throws -> URL {

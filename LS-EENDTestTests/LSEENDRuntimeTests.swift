@@ -10,8 +10,13 @@ final class LSEENDRuntimeTests: XCTestCase {
         if let path = ProcessInfo.processInfo.environment["LSEEND_WORKSPACE_ROOT"] {
             return URL(fileURLWithPath: path, isDirectory: true)
         }
-        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
-            .appendingPathComponent("LS-EENDWorkspace")
+        // Walk up from this test file to find the LS-EEND workspace root.
+        // Path: .../LS-EEND/LS-EENDTest/LS-EENDTestTests/LSEENDRuntimeTests.swift
+        let thisFile = URL(fileURLWithPath: #file, isDirectory: false)
+        return thisFile
+            .deletingLastPathComponent()  // LS-EENDTestTests/
+            .deletingLastPathComponent()  // LS-EENDTest/
+            .deletingLastPathComponent()  // LS-EEND/
     }
 
     private static let probeExecutableURL = rootURL.appendingPathComponent("artifacts/bin/lseend_runtime_probe")
@@ -21,13 +26,21 @@ final class LSEENDRuntimeTests: XCTestCase {
         rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Shared/AppLogger.swift"),
         rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Shared/AudioConverter.swift"),
         rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Shared/NeMoMelSpectrogram.swift"),
-        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/LS-EEND-Diarizer/LSEENDSupport.swift"),
-        rootURL.appendingPathComponent(
-            "LS-EENDTest/LS-EENDTest/FluidAudio/LS-EEND-Diarizer/LSEENDFeatureExtraction.swift"),
-        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/LS-EEND-Diarizer/LSEENDInference.swift"),
-        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/LS-EEND-Diarizer/LSEENDEvaluation.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Shared/SystemInfo.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Shared/DownloadUtils.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Shared/DiarizerTypes.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Shared/ANEMemoryOptimizer.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Shared/ANEMemoryUtils.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Shared/DiarizerTimeline.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/ModelNames.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/ModelRegistry.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/Sortformer/SortformerTypes.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/LS-EEND/LSEENDDatatypes.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/LS-EEND/LSEENDPreprocessor.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/LS-EEND/LSEENDModelInference.swift"),
+        rootURL.appendingPathComponent("LS-EENDTest/LS-EENDTest/FluidAudio/LS-EEND/LSEENDEvaluation.swift"),
     ]
-    nonisolated(unsafe) private static var cachedEngines: [LSEENDVariant: LSEENDInferenceEngine] = [:]
+    nonisolated(unsafe) private static var cachedEngines: [LSEENDVariant: LSEENDInferenceHelper] = [:]
     nonisolated(unsafe) private static var didEnsureProbeExecutable = false
     private static let workspaceSetupHint =
         "Set LSEEND_WORKSPACE_ROOT to an LS-EEND workspace checkout that includes the runtime probe sources and parity artifacts."
@@ -209,7 +222,7 @@ final class LSEENDRuntimeTests: XCTestCase {
                 "Missing metadata for \(variant.rawValue)")
 
             let engine = try await makeEngine(variant: variant)
-            let metadata = engine.metadata
+            let metadata = await engine.metadata
             XCTAssertEqual(metadata.realOutputDim, expectedColumns[variant])
             XCTAssertEqual(metadata.fullOutputDim, (expectedColumns[variant] ?? 0) + 2)
         }
@@ -441,12 +454,12 @@ final class LSEENDRuntimeTests: XCTestCase {
         )
     }
 
-    private func makeEngine(variant: LSEENDVariant) async throws -> LSEENDInferenceEngine {
+    private func makeEngine(variant: LSEENDVariant) async throws -> LSEENDInferenceHelper {
         if let cached = Self.cachedEngines[variant] {
             return cached
         }
         let descriptor = try await LSEENDModelDescriptor.loadFromHuggingFace(variant: variant)
-        let created = try LSEENDInferenceEngine(descriptor: descriptor, computeUnits: .cpuOnly)
+        let created = try await LSEENDInferenceHelper(descriptor: descriptor, computeUnits: .cpuOnly)
         Self.cachedEngines[variant] = created
         return created
     }
@@ -503,12 +516,12 @@ final class LSEENDRuntimeTests: XCTestCase {
     }
 
     private func requireExistingPath(_ url: URL, description: String) throws -> URL {
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw XCTSkip(
-                "Skipping LS-EEND runtime parity test: missing \(description) under \(Self.rootURL.path). "
-                    + Self.workspaceSetupHint
-            )
-        }
+//        guard FileManager.default.fileExists(atPath: url.path) else {
+//            throw XCTSkip(
+//                "Skipping LS-EEND runtime parity test: missing \(description) under \(Self.rootURL.path). "
+//                    + Self.workspaceSetupHint
+//            )
+//        }
         return url
     }
 
@@ -646,12 +659,12 @@ final class LSEENDRuntimeTests: XCTestCase {
 
         let fileManager = FileManager.default
         let missingSources = probeSourceURLs.filter { !fileManager.fileExists(atPath: $0.path) }
-        guard missingSources.isEmpty else {
-            throw XCTSkip(
-                "Skipping LS-EEND runtime parity test: missing runtime probe sources under \(rootURL.path). "
-                    + workspaceSetupHint
-            )
-        }
+//        guard missingSources.isEmpty else {
+//            throw XCTSkip(
+//                "Skipping LS-EEND runtime parity test: missing runtime probe sources under \(rootURL.path). "
+//                    + workspaceSetupHint
+//            )
+//        }
         let binaryExists = fileManager.fileExists(atPath: probeExecutableURL.path)
         let binaryDate = binaryExists ? try modificationDate(for: probeExecutableURL) : .distantPast
         let newestSourceDate =
