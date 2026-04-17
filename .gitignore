@@ -1,0 +1,25 @@
+## macOS / Xcode
+.DS_Store
+*.swp
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+build/
+DerivedData/
+*.xcscmblueprint
+*.xccheckout
+
+## Xcode project local state
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+## CoreML / binary model artifacts
+# The .mlpackage ships with the app; keep only the one referenced by the
+# project. Add additional variants via LSEEND_LOCAL_MODELS_DIR instead.
+*.mlmodelc/
+LS-EEND-Test/*.mlpackage.bak/
+
+## Test / CI
+*.xcresult/
+/tmp/
