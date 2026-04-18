@@ -126,7 +126,6 @@ final class LSEENDParityTests: XCTestCase {
         let swiftFeat = try diarizer.debugExtractFeatures(audio, sourceSampleRate: nil)
         let sFrames = swiftFeat.count / 345
         let rFrames = refFeat.count / 345
-        print("feat345: swift=\(sFrames) python=\(rFrames)")
 
         let n = min(sFrames, rFrames) * 345
         var maxAbs: Float = 0
@@ -135,11 +134,43 @@ final class LSEENDParityTests: XCTestCase {
             let d = abs(swiftFeat[i] - refFeat[i])
             if d > maxAbs { maxAbs = d; argmax = i }
         }
-        let frame = argmax / 345
-        let bin = argmax % 345
-        print("feat345 max|Δ|=\(maxAbs) at frame=\(frame) bin=\(bin)")
-        print("  swift=\(swiftFeat[argmax]) python=\(refFeat[argmax])")
-        XCTAssertLessThan(maxAbs, 1e-3)
+        let frame = argmax / 345, bin = argmax % 345
+        // Compute per-frame deltas so we can see if the mismatch is
+        // per-frame noise or a frame-shift.
+        var perFrameMax = [Float](repeating: 0, count: min(sFrames, rFrames))
+        for f in 0..<perFrameMax.count {
+            var m: Float = 0
+            for j in 0..<345 {
+                m = max(m, abs(swiftFeat[f*345 + j] - refFeat[f*345 + j]))
+            }
+            perFrameMax[f] = m
+        }
+        let firstBigFrame = perFrameMax.firstIndex(where: { $0 > 0.01 }) ?? -1
+        // Centre bin of the stacked window: context-frame 7, mel-bin 11 →
+        // flat index 7 * 23 + 11 = 172. This is the "real" center frame,
+        // not left-padding.
+        let centerBin = 7 * 23 + 11
+        func frameStr(_ buf: [Float], _ f: Int) -> String {
+            let row = buf[f*345 ..< f*345 + 345]
+            return "[center]=\(String(format: "%+.4f", row[row.startIndex + centerBin])) " +
+                   "bin100=\(String(format: "%+.4f", row[row.startIndex + 100])) " +
+                   "bin200=\(String(format: "%+.4f", row[row.startIndex + 200]))"
+        }
+        let dFrame = max(firstBigFrame, 0)
+        let diag = """
+            feat345: swift=\(sFrames) frames, python=\(rFrames) frames
+            max|Δ|=\(maxAbs) at frame=\(frame) bin=\(bin)
+              swift[\(argmax)]=\(swiftFeat[argmax]) python[\(argmax)]=\(refFeat[argmax])
+            first frame w/ Δ>0.01: \(firstBigFrame)
+            frame \(dFrame) (first-diff):
+              swift:  \(frameStr(swiftFeat, dFrame))
+              python: \(frameStr(refFeat, dFrame))
+            frame 50 (mid):
+              swift:  \(frameStr(swiftFeat, min(50, sFrames-1)))
+              python: \(frameStr(refFeat, min(50, rFrames-1)))
+            perFrameMax[0..<10]=\(perFrameMax.prefix(10).map { String(format: "%.3f", $0) })
+            """
+        XCTAssertLessThan(maxAbs, 1e-3, diag)
     }
 
     // MARK: - Stage 5: .flac file path (AVAudioFile + AudioConverter)
@@ -203,6 +234,55 @@ final class LSEENDParityTests: XCTestCase {
         print(diag)
     }
 
+    /// Regression guard for the `convDelay` warmup-trim in
+    /// `LSEENDDiarizer.drainAndUpdate`: running `processComplete` twice on
+    /// the same diarizer must produce the same frame count both times. If
+    /// the trim were ever applied to an already-warm KV cache, the second
+    /// run would drop real frames and shrink. Pins the second-run count to
+    /// within ±2 frames of the first.
+    func testProcessCompleteIsIdempotentOnFrameCount() throws {
+        guard let flacPath = ProcessInfo.processInfo.environment["LSEEND_PARITY_FLAC"],
+              FileManager.default.fileExists(atPath: flacPath)
+        else {
+            throw XCTSkip("Set LSEEND_PARITY_FLAC to a .flac audio file path.")
+        }
+        guard let modelURL = Self.modelPackageURL("ls_eend_dih3_300ms.mlpackage"),
+              FileManager.default.fileExists(atPath: modelURL.path)
+        else {
+            throw XCTSkip("Set LSEEND_LOCAL_MODELS_DIR to a dir containing ls_eend_dih3_300ms.mlpackage.")
+        }
+        let flacURL = URL(fileURLWithPath: flacPath)
+        let compiled = try MLModel.compileModel(at: modelURL)
+        let model = try LSEENDModel(modelURL: compiled, computeUnits: .cpuOnly)
+        let diarizer = try LSEENDDiarizer(model: model)
+
+        let t1 = try diarizer.processComplete(
+            audioFileURL: flacURL,
+            keepingEnrolledSpeakers: false,
+            finalizeOnCompletion: true,
+            progressCallback: nil
+        )
+        let n1 = t1.numFinalizedFrames
+        XCTAssertGreaterThan(n1, 400, "first run produced implausibly few frames")
+
+        let t2 = try diarizer.processComplete(
+            audioFileURL: flacURL,
+            keepingEnrolledSpeakers: false,
+            finalizeOnCompletion: true,
+            progressCallback: nil
+        )
+        let n2 = t2.numFinalizedFrames
+
+        // Second run may differ by one or two frames due to trailing-silence
+        // rounding, but must not shrink by `convDelay` (=9) — that would
+        // indicate the warmup trim is being applied twice.
+        XCTAssertLessThanOrEqual(
+            abs(n1 - n2), 2,
+            "second processComplete diverged by more than 2 frames "
+            + "(\(n1) → \(n2)) — warmup trim likely applied to already-warm state"
+        )
+    }
+
     // MARK: - Stage 6: end-to-end probs parity (T=3, uses bundled model)
 
     func testEndToEndProbsParityT3() throws {
@@ -245,15 +325,17 @@ final class LSEENDParityTests: XCTestCase {
         let frame = argmax / maxSpk, spk = argmax % maxSpk
         var diag = "probs T=3 max|Δ|=\(maxAbs) at frame=\(frame) spk=\(spk)\n"
         // Probe actual model output shape with a single prediction call.
-        do {
-            let zeros = [Float](repeating: 0, count: 3 * 345)
-            let mask = [Float](repeating: 1, count: 3)
-            var s = try LSEENDState(from: model.metadata)
-            let out = try model.predict(state: &s, features: zeros, frameMask: mask)
-            diag += "probe: probs element count = \(out.count) (expect T*maxSpk=\(3*maxSpk))\n"
-        } catch {
-            diag += "probe failed: \(error)\n"
-        }
+        // WIP: `LSEENDState(from:)` signature changed in Benjamin's refactor
+        // — probe block disabled until the new ctor is available.
+        // do {
+        //     let zeros = [Float](repeating: 0, count: 3 * 345)
+        //     let mask = [Float](repeating: 1, count: 3)
+        //     var s = try LSEENDState(from: model.metadata)
+        //     let out = try model.predict(state: &s, features: zeros, frameMask: mask)
+        //     diag += "probe: probs element count = \(out.count) (expect T*maxSpk=\(3*maxSpk))\n"
+        // } catch {
+        //     diag += "probe failed: \(error)\n"
+        // }
         diag += "swift=\(swiftProbs[argmax]) python=\(refProbs[argmax])\n"
         diag += "Swift frame 0: \(Array(swiftProbs[0..<maxSpk]))\n"
         diag += "Python frame 0: \(Array(refProbs[0..<maxSpk]))\n"

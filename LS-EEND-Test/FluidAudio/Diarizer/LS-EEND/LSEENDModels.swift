@@ -7,14 +7,14 @@
 
 import Foundation
 import CoreML
+import Accelerate
 
 public class LSEENDModel {
     public let metadata: LSEENDMetadata
+    
     private let model: MLModel
     
-    private let melBuffer: MLMultiArray
-    private let validBuffer: MLMultiArray
-    private let probsBuffer: MLMultiArray  // contiguous [1, T, maxSpk] for stride-aware readback
+    private let lock = NSLock()
     
     private static let logger = AppLogger(category: "LS-EEND Model")
     
@@ -35,28 +35,19 @@ public class LSEENDModel {
         
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-
         self.metadata = try decoder.decode(LSEENDMetadata.self, from: Data(json.utf8))
         
-        // Initialize preallocated input buffers
-        let T = NSNumber(value: metadata.chunkSize)
-        let F = NSNumber(value: metadata.featDim)
-        let S = NSNumber(value: metadata.maxSpeakers)
-        self.melBuffer = try MLMultiArray(shape: [1, T, F], dataType: .float32)
-        self.validBuffer = try MLMultiArray(shape: [T], dataType: .float32)
-        self.probsBuffer = try MLMultiArray(shape: [1, T, S], dataType: .float32)
+        
     }
     
-    /// Download LS-EEND models from HuggingFace and construct a descriptor.
-    ///
-    /// Downloads all variant files on first call; subsequent calls use the cache.
-    /// The returned descriptor points at the cached `.mlmodelc` and `.json` files.
+    /// Download LS-EEND models from HuggingFace.
     ///
     /// - Parameters:
     ///   - variant: The model variant to load (default: `.dihard3`).
+    ///   - stepSize: The model step size to load (default: `.step100ms`).
     ///   - cacheDirectory: Directory to cache downloaded models (defaults to app support)
-    ///   - computeUnits: Model compute units (.cpuOnly seems to be fastest for this model)
-    /// - Returns: A descriptor ready for ``LSEENDInferenceEngine/init(descriptor:computeUnits:)``.
+    ///   - computeUnits: Model compute units (`.cpuOnly` seems to be fastest for this model)
+    /// - Returns: LS-EEND Model Wrapper
     public static func loadFromHuggingFace(
         variant: LSEENDVariant = .dihard3,
         stepSize: LSEENDStepSize = .step100ms,
@@ -64,145 +55,116 @@ public class LSEENDModel {
         computeUnits: MLComputeUnits = .cpuOnly,
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> LSEENDModel {
-//        await SystemInfo.logOnce(using: logger)
-
+        //        await SystemInfo.logOnce(using: logger)
+        
         let directory =
-            cacheDirectory
-            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        cacheDirectory
+        ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("FluidAudio/Models")
-
+        
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-
-        let repo = Repo.lseend
+        
+        let repo = variant.repo
         let repoPath = directory.appendingPathComponent(repo.folderName)
-        let requiredModels = ModelNames.getRequiredModelNames(for: repo, variant: variant.fileName(forStep: stepSize))
+        let modelRelPath = variant.fileName(forStep: stepSize)
+        // LS-EEND repos live under a `subPath` inside the HF repo
+        // (e.g. `optimized/dih3`). Both the remote listing path and the
+        // local save path must include it — `downloadSubdirectory` saves
+        // files at `repoPath + <repo-relative path>`, so `modelURL` has to
+        // mirror that layout or the exists-check never fires.
+        let fullRelPath = repo.subPath.map { "\($0)/\(modelRelPath)" } ?? modelRelPath
+        let modelURL = repoPath.appendingPathComponent(fullRelPath)
 
-        let allModelsExist = requiredModels.allSatisfy { model in
-            let modelPath = repoPath.appendingPathComponent(model)
-            return FileManager.default.fileExists(atPath: modelPath.path)
+        let modelExists = FileManager.default.fileExists(atPath: modelURL.path)
+
+        if !modelExists {
+            // Narrow to just the one mlmodelc — listing the whole step dir
+            // is fine here since each step dir contains only its own mlmodelc.
+            logger.info("Models not found in cache at \(modelURL.path); downloading \(fullRelPath)…")
+            try await DownloadUtils.downloadSubdirectory(
+                repo, subdirectory: fullRelPath, to: repoPath
+            )
         }
-
-        if !allModelsExist {
-            logger.info("Models not found in cache at \(repoPath.path)")
-            try await DownloadUtils.downloadSubdirectory(repo, subdirectory: variant.subPath, to: directory)
+        
+        guard FileManager.default.fileExists(atPath: modelURL.path) else {
+            throw LSEENDError.initializationFailed(
+                "HF download completed but mlmodelc missing at \(modelURL.path). "
+                + "Expected HF path: \(modelRelPath)"
+            )
         }
-
-        let modelURL = repoPath.appendingPathComponent(variant.fileName(forStep: stepSize))
         
         return try LSEENDModel(modelURL: modelURL, computeUnits: computeUnits)
     }
     
-    // MARK: Inference
+    // MARK: - Inference
     
-    public func predict(
-        state: inout LSEENDState,
-        features: [Float],
-        frameMask: [Float]
-    ) throws -> [Float] {
-        guard features.count == melBuffer.count else {
-            throw LSEENDError.inferenceFailed(
-                "Invalid feature count: got \(features.count), expected \(melBuffer.count)")
-        }
-        guard frameMask.count == validBuffer.count else {
-            throw LSEENDError.inferenceFailed(
-                "Invalid frame mask size: got \(frameMask.count), expected \(validBuffer.count)")
-        }
+    public func predict(from input: LSEENDInput) throws -> [Float] {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        return try autoreleasepool {
+            let prediction = try model.prediction(from: input)
+            
+            guard let probsMA = prediction.featureValue(for: "probs")?.multiArrayValue,
+                  let encKvMA = prediction.featureValue(for: "enc_kv_new")?.multiArrayValue,
+                  let encScaleMA = prediction.featureValue(for: "enc_scale_new")?.multiArrayValue,
+                  let encConvCacheMA = prediction.featureValue(for: "enc_conv_cache_new")?.multiArrayValue,
+                  let cnnWindowMA = prediction.featureValue(for: "cnn_window_new")?.multiArrayValue,
+                  let decKvMA = prediction.featureValue(for: "dec_kv_new")?.multiArrayValue,
+                  let decScaleMA = prediction.featureValue(for: "dec_scale_new")?.multiArrayValue
+            else {
+                throw LSEENDError.inferenceFailed("Failed to extract predictions from CoreML model.")
+            }
+            
+            input.state.encRetKv = encKvMA
+            input.state.encRetScale = encScaleMA
+            input.state.encConvCache = encConvCacheMA
+            input.state.cnnWindow = cnnWindowMA
+            input.state.decRetKv = decKvMA
+            input.state.decRetScale = decScaleMA
 
-        let floatStride = MemoryLayout<Float>.stride
-        features.withUnsafeBufferPointer { featPtr in
-            if let base = featPtr.baseAddress {
-                memcpy(melBuffer.dataPointer, base, melBuffer.count * floatStride)
+            return Self.readProbsStrideAware(probsMA)
+        }
+    }
+
+    /// CoreML returns `probs` with tile-padded inner strides (e.g. logical
+    /// shape `[1, T, 10]`, strides `[16, 16, 1]`) — baked at mlpackage
+    /// compile time even when `.cpuOnly` is requested. A flat
+    /// `withUnsafeBufferPointer` reads the physical `T × 16` footprint and
+    /// leaves 6 garbage lanes per row, which the timeline rejects with
+    /// `misalignedFinalizedPredictions`. Copy row-by-row using the
+    /// published strides so the returned array is exactly `T × S` logical
+    /// elements.
+    private static func readProbsStrideAware(_ probsMA: MLMultiArray) -> [Float] {
+        let shape = probsMA.shape.map { $0.intValue }
+        let strides = probsMA.strides.map { $0.intValue }
+        guard let innerCount = shape.last, strides.last == 1 else {
+            preconditionFailure(
+                "probs must be non-empty with innermost stride 1; got shape=\(shape) strides=\(strides)"
+            )
+        }
+        let outerCount = shape.dropLast().reduce(1, *)
+        var out = [Float](repeating: 0, count: outerCount * innerCount)
+        probsMA.withUnsafeBufferPointer(ofType: Float.self) { buf in
+            guard let src = buf.baseAddress else { return }
+            let rowBytes = innerCount * MemoryLayout<Float>.stride
+            var idx = [Int](repeating: 0, count: max(shape.count - 1, 0))
+            for outer in 0..<outerCount {
+                var srcOff = 0
+                for d in 0..<idx.count { srcOff += idx[d] * strides[d] }
+                out.withUnsafeMutableBufferPointer { dst in
+                    memcpy(dst.baseAddress!.advanced(by: outer * innerCount),
+                           src.advanced(by: srcOff),
+                           rowBytes)
+                }
+                for d in stride(from: idx.count - 1, through: 0, by: -1) {
+                    idx[d] += 1
+                    if idx[d] < shape[d] { break }
+                    idx[d] = 0
+                }
             }
         }
-        frameMask.withUnsafeBufferPointer { maskPtr in
-            if let base = maskPtr.baseAddress {
-                memcpy(validBuffer.dataPointer, base, validBuffer.count * floatStride)
-            }
-        }
-
-        let input = LSEENDInput(
-            state: state,
-            melFeatures: melBuffer,
-            validMask: validBuffer
-        )
-        let prediction = try model.prediction(from: input)
-
-        func extract(_ name: String) throws -> MLMultiArray {
-            guard let v = prediction.featureValue(for: name)?.multiArrayValue else {
-                throw LSEENDError.inferenceFailed("Missing output feature '\(name)'")
-            }
-            return v
-        }
-        let probs = try extract("probs")
-        let newState: [(String, MLMultiArray, WritableKeyPath<LSEENDState, MLMultiArray>)] = [
-            ("enc_kv_new",         try extract("enc_kv_new"),         \.encRetKv),
-            ("enc_scale_new",      try extract("enc_scale_new"),      \.encRetScale),
-            ("enc_conv_cache_new", try extract("enc_conv_cache_new"), \.encConvCache),
-            ("cnn_window_new",     try extract("cnn_window_new"),     \.cnnWindow),
-            ("dec_kv_new",         try extract("dec_kv_new"),         \.decRetKv),
-            ("dec_scale_new",      try extract("dec_scale_new"),      \.decRetScale),
-        ]
-
-        // Swap refs when strides are contiguous (common on CPU, zero-copy);
-        // fall back to stride-aware memcpy otherwise. Either way, the inner
-        // buffer for the next call is the latest CoreML-vended MLMultiArray.
-        for (_, src, kp) in newState {
-            if src.strides.last?.intValue == 1,
-               src.strides == state[keyPath: kp].strides
-            {
-                state[keyPath: kp] = src  // zero-copy ref swap
-            } else {
-                ANEMemoryUtils.strideAwareCopy(from: src, to: state[keyPath: kp])
-            }
-        }
-
-        // probs strides may be non-contiguous (ANE tile padding). Copy into
-        // our contiguous probsBuffer via ANEMemoryUtils.strideAwareCopy, then
-        // flat-memcpy out into a Swift array.
-        ANEMemoryUtils.strideAwareCopy(from: probs, to: probsBuffer)
-        let count = probsBuffer.count
-        return [Float](unsafeUninitializedCapacity: count) { buf, outCount in
-            memcpy(buf.baseAddress!, probsBuffer.dataPointer, count * floatStride)
-            outCount = count
-        }
+        return out
     }
 }
 
-struct LSEENDOutput {
-    let state: LSEENDState
-    let preds: [Float]
-}
-
-private class LSEENDInput: MLFeatureProvider {
-    let state: LSEENDState
-    let melFeatures: MLMultiArray
-    let validMask: MLMultiArray
-    
-    var featureNames: Set<String> {[
-        "features",
-        "enc_kv", "enc_scale",
-        "enc_conv_cache", "cnn_window",
-        "dec_kv", "dec_scale",
-        "valid_mask"
-    ]}
-    
-    init(state: LSEENDState, melFeatures: MLMultiArray, validMask: MLMultiArray) {
-        self.state = state
-        self.melFeatures = melFeatures
-        self.validMask = validMask
-    }
-    
-    func featureValue(for featureName: String) -> MLFeatureValue? {
-        switch featureName {
-        case "features": return MLFeatureValue(multiArray: melFeatures)
-        case "enc_kv": return MLFeatureValue(multiArray: state.encRetKv)
-        case "enc_scale": return MLFeatureValue(multiArray: state.encRetScale)
-        case "enc_conv_cache": return MLFeatureValue(multiArray: state.encConvCache)
-        case "cnn_window": return MLFeatureValue(multiArray: state.cnnWindow)
-        case "dec_kv": return MLFeatureValue(multiArray: state.decRetKv)
-        case "dec_scale": return MLFeatureValue(multiArray: state.decRetScale)
-        case "valid_mask": return MLFeatureValue(multiArray: validMask)
-        default: return nil
-        }
-    }
-}

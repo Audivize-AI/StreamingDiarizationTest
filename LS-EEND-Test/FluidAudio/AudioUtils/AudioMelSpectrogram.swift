@@ -342,7 +342,8 @@ public final class AudioMelSpectrogram {
             let paddedCount = audioCount + 2 * padLength
             computedFrames = 1 + (paddedCount - winLength) / hopLength
         case .prePadded:
-            computedFrames = max(0, (audioCount - nFFT) / hopLength + 1)
+            // max(0, (audioCount - nFFT) / hopLength + 1) is incorrect due to integer truncation
+            computedFrames = max(0, (audioCount - nFFT + hopLength) / hopLength)
         }
         let numFrames = expectedFrameCount ?? computedFrames
 

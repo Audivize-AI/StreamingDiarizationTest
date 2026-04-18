@@ -9,6 +9,11 @@ import CoreML
 import Foundation
 import SwiftUI
 
+/// File-scope logger so nonisolated contexts (the mic tap closure, the
+/// serial inference queue) can log without a MainActor hop. `AppLogger` is
+/// `Sendable`, so a plain `let` at file scope is safe.
+private let log = AppLogger(category: "DiarizerViewModel")
+
 @MainActor
 final class DiarizerViewModel: ObservableObject {
 
@@ -16,6 +21,24 @@ final class DiarizerViewModel: ObservableObject {
         case idle
         case loading(progress: Double)
         case ready
+        case failed(String)
+    }
+
+    /// Events posted from off-main contexts (AVAudioEngine tap thread, the
+    /// serial inference queue) and drained on MainActor via an `AsyncStream`.
+    ///
+    /// Replaces the previous `MainActorSink` + `DispatchQueue.main.async`
+    /// bridge. The tap closure never spawns a `Task`; it only calls
+    /// `continuation.yield(...)` which is `@Sendable` + nonisolated and so
+    /// doesn't trip Swift 6's `_swift_task_checkIsolatedSwift` on the
+    /// real-time audio thread. The consumer `Task` is created from this
+    /// `@MainActor init`, so it inherits MainActor isolation already — no
+    /// `Task { @MainActor in }` indirection from the RT thread.
+    private enum UIEvent: Sendable {
+        case snapshot
+        case progress(Double)
+        case status(String)
+        case done
         case failed(String)
     }
 
@@ -27,8 +50,8 @@ final class DiarizerViewModel: ObservableObject {
     @Published var progress: Double = 0
     @Published var statusMessage: String = ""
 
-    // Snapshots used by the UI. Copied out of the DiarizerTimeline on the
-    // main actor after every process() tick so SwiftUI can diff safely.
+    // Snapshots copied out of the DiarizerTimeline on the main actor after
+    // every process() tick so SwiftUI can diff safely.
     @Published var segments: [DiarizerSegment] = []
     @Published var speakers: [Int: String?] = [:]
     @Published var finalizedPredictions: [Float] = []
@@ -43,10 +66,58 @@ final class DiarizerViewModel: ObservableObject {
     private var micEngine: AVAudioEngine?
     private var micTapFormat: AVAudioFormat?
     private var micSourceRate: Double = 0
-    private lazy var mainActorSink: MainActorSink = MainActorSink(owner: self)
 
-    init() {
-        Task { await reload() }
+    // Continuations and tasks must be reachable from `deinit`, which runs
+    // on whatever thread releases the last reference — not guaranteed to
+    // be MainActor. `nonisolated let` on the continuation keeps Swift 6
+    // strict concurrency happy (it's Sendable). `eventTask` is assigned
+    // once inside `init` after all other properties are initialized, so it
+    // needs `nonisolated(unsafe) var` — Task is Sendable but the compiler
+    // can't prove definite-assignment before self escapes into the task's
+    // `[weak self]` capture without the `var` indirection.
+    private nonisolated let eventContinuation: AsyncStream<UIEvent>.Continuation
+    private nonisolated(unsafe) var eventTask: Task<Void, Never>?
+
+    init(skipAutoLoad: Bool = false) {
+        let (stream, cont) = AsyncStream<UIEvent>.makeStream(bufferingPolicy: .unbounded)
+        self.eventContinuation = cont
+        self.eventTask = nil   // definite-assignment — replaced immediately
+        // Task inherits MainActor isolation from this @MainActor init — so
+        // the consumer loop runs on the main actor without re-hopping.
+        self.eventTask = Task { [weak self] in
+            for await event in stream {
+                guard let self else { break }
+                self.apply(event)
+            }
+        }
+        if !skipAutoLoad {
+            Task { await self.reload() }
+        }
+    }
+
+    deinit {
+        eventContinuation.finish()
+        eventTask?.cancel()
+    }
+
+    private func apply(_ event: UIEvent) {
+        switch event {
+        case .snapshot:
+            snapshotTimeline()
+        case .progress(let p):
+            progress = p
+            snapshotTimeline()
+        case .status(let msg):
+            statusMessage = msg
+        case .done:
+            snapshotTimeline()
+            isProcessing = false
+            progress = 1
+            statusMessage = "Done."
+        case .failed(let msg):
+            isProcessing = false
+            statusMessage = "Failed: \(msg)"
+        }
     }
 
     // MARK: - Model lifecycle
@@ -55,23 +126,20 @@ final class DiarizerViewModel: ObservableObject {
         if let v = variant { self.variant = v }
         if let s = stepSize { self.stepSize = s }
 
-        print("[DiarizerVM] reload variant=\(self.variant) step=\(self.stepSize.suffix)")
+        log.debug("reload variant=\(self.variant) step=\(self.stepSize.description)")
         await stopMicrophone()
         loadState = .loading(progress: 0)
-        statusMessage = "Loading \(self.variant.name) @ \(self.stepSize.suffix)…"
+        statusMessage = "Loading \(self.variant.name) @ \(self.stepSize.description)…"
 
         do {
             let d: LSEENDDiarizer
             let v = self.variant, s = self.stepSize
-            // Prefer local coreml/out/ packages — HF uploads are stale for
-            // non-dih3 variants. HF load triggers on local-miss only.
-            let localURL = Self.localOutURL(variant: v, stepSize: s)
-            print("[DiarizerVM] local package path: \(localURL?.path ?? "<none>") exists=\(Self.localOutExists(variant: v, stepSize: s))")
             if Self.localOutExists(variant: v, stepSize: s) {
+                log.debug("using local package for \(v.name)/\(s.description)")
                 d = try await Self.loadFromLocalOut(variant: v, stepSize: s)
-                print("[DiarizerVM] loaded locally")
             } else {
-                d = try await LSEENDDiarizer.loadFromHuggingFace(
+                log.debug("local miss — HF fallback for \(v.name)/\(s.description)")
+                let model = try await LSEENDModel.loadFromHuggingFace(
                     variant: v,
                     stepSize: s,
                     computeUnits: .cpuOnly,
@@ -82,6 +150,7 @@ final class DiarizerViewModel: ObservableObject {
                         }
                     }
                 )
+                d = try LSEENDDiarizer(model: model)
             }
             self.diarizer = d
             self.numSpeakerChannels = d.numSpeakers ?? 0
@@ -90,6 +159,7 @@ final class DiarizerViewModel: ObservableObject {
             self.statusMessage = "Ready."
             clearSnapshot()
         } catch {
+            log.error("reload failed: \(error.localizedDescription)")
             loadState = .failed("\(error)")
             statusMessage = "Load failed: \(error.localizedDescription)"
         }
@@ -118,32 +188,29 @@ final class DiarizerViewModel: ObservableObject {
 
         let capturedDiarizer = diarizer
         let didStartAccess = url.startAccessingSecurityScopedResource()
-        let sink = self.mainActorSink
-        print("[DiarizerVM] processFile start url=\(url.path) scoped=\(didStartAccess)")
+        let events = self.eventContinuation
+        log.debug("processFile start file=\(url.lastPathComponent) scoped=\(didStartAccess)")
+
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async {
                 defer {
                     if didStartAccess { url.stopAccessingSecurityScopedResource() }
                     cont.resume()
-                    print("[DiarizerVM] processFile queue defer complete")
                 }
                 do {
-                    print("[DiarizerVM] calling processComplete…")
-                    let timeline = try capturedDiarizer.processComplete(
+                    _ = try capturedDiarizer.processComplete(
                         audioFileURL: url,
                         keepingEnrolledSpeakers: nil,
                         finalizeOnCompletion: true,
                         progressCallback: { done, total, _ in
                             let p = total > 0 ? Double(done) / Double(total) : 0
-                            print("[DiarizerVM] progress \(done)/\(total) (\(Int(p*100))%)")
-                            sink.postProgress(p)
+                            events.yield(.progress(p))
                         }
                     )
-                    print("[DiarizerVM] processComplete OK frames=\(timeline.numFinalizedFrames) speakers=\(timeline.speakers.count)")
-                    sink.postDone()
+                    events.yield(.done)
                 } catch {
-                    print("[DiarizerVM] processComplete FAILED: \(error)")
-                    sink.postFail(error.localizedDescription)
+                    log.error("processComplete failed: \(error.localizedDescription)")
+                    events.yield(.failed(error.localizedDescription))
                 }
             }
         }
@@ -152,21 +219,21 @@ final class DiarizerViewModel: ObservableObject {
     // MARK: - Microphone
 
     func startMicrophone() async throws {
-        print("[DiarizerVM] startMicrophone entry")
         guard let diarizer = diarizer else {
-            print("[DiarizerVM] startMicrophone: diarizer is nil")
-            return
+            throw NSError(
+                domain: "LSEEND.Mic", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Model not ready."]
+            )
         }
-        guard micEngine == nil else {
-            print("[DiarizerVM] startMicrophone: engine already running")
-            return
-        }
+        guard micEngine == nil else { return }
 
         let granted = await AVCaptureDevice.requestAccess(for: .audio)
-        print("[DiarizerVM] mic permission granted=\(granted)")
         guard granted else {
             statusMessage = "Microphone permission denied."
-            return
+            throw NSError(
+                domain: "LSEEND.Mic", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Microphone permission denied."]
+            )
         }
 
         let capturedDiarizer = diarizer
@@ -185,40 +252,39 @@ final class DiarizerViewModel: ObservableObject {
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0 else {
             statusMessage = "Mic unavailable: zero sample rate."
-            return
+            throw NSError(
+                domain: "LSEEND.Mic", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Microphone unavailable."]
+            )
         }
         micSourceRate = format.sampleRate
         micTapFormat = format
 
-        let capturedRate = format.sampleRate
-        let capturedQueue = queue
-        // Swift 6's runtime isolation checks crash when a MainActor-isolated
-        // class is referenced (even weakly) from an AVAudioEngine tap's
-        // real-time thread. Route UI updates through a nonisolated dispatch
-        // sink that doesn't know about MainActor at all.
-        let sink = self.mainActorSink
-        print("[DiarizerVM] installTap nativeFormat=\(input.inputFormat(forBus: 0)) tapFormat=nil")
         Self.installMicTap(
             on: input,
             diarizer: capturedDiarizer,
-            queue: capturedQueue,
-            sampleRate: capturedRate,
-            sink: sink
+            queue: queue,
+            sampleRate: format.sampleRate,
+            events: eventContinuation
         )
 
         engine.prepare()
         do {
             try engine.start()
         } catch {
-            print("[DiarizerVM] engine.start() threw: \(error)")
+            log.error("engine.start() threw: \(error.localizedDescription)")
             statusMessage = "Engine start failed: \(error.localizedDescription)"
-            return
+            input.removeTap(onBus: 0)
+            throw error
         }
         self.micEngine = engine
         self.statusMessage = "Microphone active (\(Int(format.sampleRate)) Hz)."
-        print("[DiarizerVM] engine started sampleRate=\(format.sampleRate)")
+        log.debug("engine started sampleRate=\(format.sampleRate)")
     }
 
+    /// `removeTap` must run before the engine is released — otherwise a tap
+    /// fired on the RT thread could still reach the continuation after
+    /// `deinit` called `finish()` on it.
     func stopMicrophone() async {
         guard let engine = micEngine else { return }
         engine.inputNode.removeTap(onBus: 0)
@@ -227,12 +293,12 @@ final class DiarizerViewModel: ObservableObject {
 
         if let diarizer = diarizer {
             let captured = diarizer
-            let sink = self.mainActorSink
+            let events = self.eventContinuation
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 queue.async {
                     _ = try? captured.finalize()
-                    sink.postSnapshot()
-                    sink.postStatus("Microphone stopped.")
+                    events.yield(.snapshot)
+                    events.yield(.status("Microphone stopped."))
                     cont.resume()
                 }
             }
@@ -246,15 +312,24 @@ final class DiarizerViewModel: ObservableObject {
         statusMessage = "Enrolling \(name)…"
         let captured = diarizer
         let didStartAccess = url.startAccessingSecurityScopedResource()
-        let sink = self.mainActorSink
+        let events = self.eventContinuation
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async {
                 defer {
                     if didStartAccess { url.stopAccessingSecurityScopedResource() }
                     cont.resume()
                 }
+                let samples: [Float]
                 do {
-                    let samples = AVAudioFile_safeRead(url: url)
+                    samples = try AudioConverter(sampleRate: 8000)
+                        .resampleAudioFile(url)
+                } catch {
+                    events.yield(.status(
+                        "Enrollment failed: audio unreadable — \(error.localizedDescription)"
+                    ))
+                    return
+                }
+                do {
                     let speaker = try captured.enrollSpeaker(
                         withAudio: samples,
                         sourceSampleRate: nil,
@@ -262,10 +337,12 @@ final class DiarizerViewModel: ObservableObject {
                         overwritingAssignedSpeakerName: true
                     )
                     let desc = speaker?.description ?? name
-                    sink.postSnapshot()
-                    sink.postStatus("Enrolled \(desc).")
+                    events.yield(.snapshot)
+                    events.yield(.status("Enrolled \(desc)."))
                 } catch {
-                    sink.postStatus("Enrollment failed: \(error.localizedDescription)")
+                    events.yield(.status(
+                        "Enrollment failed: \(error.localizedDescription)"
+                    ))
                 }
             }
         }
@@ -273,26 +350,22 @@ final class DiarizerViewModel: ObservableObject {
 
     // MARK: - Mic tap (nonisolated helper)
 
-    /// nonisolated `static` so the installed tap closure inherits no actor
-    /// isolation from the caller. Without this, Swift 6 infers the tap
-    /// closure as MainActor-isolated (because startMicrophone is @MainActor)
-    /// and the real-time audio thread trips `_swift_task_checkIsolatedSwift`
-    /// at every invocation → SIGTRAP.
-    nonisolated static func installMicTap(
+    /// `nonisolated static` so the installed tap closure inherits no actor
+    /// isolation. The closure only calls `continuation.yield(...)` — which is
+    /// `@Sendable` and nonisolated — so the RT thread never triggers Swift
+    /// 6's runtime isolation check. No `Task { ... }` is created from here.
+    private nonisolated static func installMicTap(
         on input: AVAudioInputNode,
         diarizer: LSEENDDiarizer,
         queue: DispatchQueue,
         sampleRate: Double,
-        sink: MainActorSink
+        events: AsyncStream<UIEvent>.Continuation
     ) {
         let counter = TapCounter()
         input.installTap(onBus: 0, bufferSize: 4096, format: nil) { buffer, _ in
             let n = counter.inc()
             let frameCount = Int(buffer.frameLength)
-            if n <= 3 {
-                print("[DiarizerVM][tap#\(n)] frames=\(frameCount) format=\(buffer.format)")
-            }
-            guard frameCount > 0 else { return }
+            guard frameCount > 0, buffer.format.channelCount > 0 else { return }
             let samples: [Float]
             if let floatChannels = buffer.floatChannelData {
                 samples = Array(UnsafeBufferPointer(start: floatChannels[0], count: frameCount))
@@ -300,16 +373,21 @@ final class DiarizerViewModel: ObservableObject {
                 let raw = UnsafeBufferPointer(start: int16Channels[0], count: frameCount)
                 samples = raw.map { Float($0) / 32768.0 }
             } else {
-                if n <= 3 { print("[DiarizerVM][tap] unsupported sample format") }
+                if n <= 3 { log.warning("tap: unsupported sample format") }
                 return
             }
             queue.async {
                 do {
                     _ = try diarizer.process(samples: samples, sourceSampleRate: sampleRate)
-                    sink.postSnapshot()
+                    events.yield(.snapshot)
                 } catch {
-                    print("[DiarizerVM][tap process] error \(error)")
-                    sink.postStatus("Mic error: \(error)")
+                    // `\(error)` exposes enum-case associated values (e.g.
+                    // `.invalidInputSize("mel features … 14490 != 13455")`);
+                    // `localizedDescription` only shows the generic NSError
+                    // string because LSEENDError's LocalizedError impl is
+                    // incomplete.
+                    log.error("tap process error: \(error)")
+                    events.yield(.status("Mic error: \(error)"))
                 }
             }
         }
@@ -321,12 +399,25 @@ final class DiarizerViewModel: ObservableObject {
     ///   1. `LSEEND_LOCAL_MODELS_DIR` environment variable
     ///   2. User-selected bookmark persisted under
     ///      `localModelsBookmark` in `UserDefaults`
-    /// Returns nil when neither is set — HF path is used instead.
+    /// Returns nil when neither is set/valid — HF path is used instead.
     /// No absolute user paths are baked into the binary or entitlements.
     private static func localOutDir() -> URL? {
         if let envPath = ProcessInfo.processInfo.environment["LSEEND_LOCAL_MODELS_DIR"],
            !envPath.isEmpty {
-            return URL(fileURLWithPath: envPath, isDirectory: true)
+            // Env var is user-controlled (Xcode scheme / shell). Reject
+            // anything that isn't an absolute, canonical, existing directory
+            // before handing it to `URL` or touching disk.
+            guard envPath.hasPrefix("/") else {
+                log.warning("LSEEND_LOCAL_MODELS_DIR rejected: path is not absolute")
+                return nil
+            }
+            let resolved = URL(fileURLWithPath: envPath, isDirectory: true)
+                .standardizedFileURL
+            guard isDirectory(resolved) else {
+                log.warning("LSEEND_LOCAL_MODELS_DIR rejected: not a directory")
+                return nil
+            }
+            return resolved
         }
         let defaults = UserDefaults.standard
         if let bookmark = defaults.data(forKey: "localModelsBookmark") {
@@ -337,10 +428,19 @@ final class DiarizerViewModel: ObservableObject {
                 relativeTo: nil,
                 bookmarkDataIsStale: &stale
             ) {
+                if stale {
+                    defaults.removeObject(forKey: "localModelsBookmark")
+                    log.notice("stale models bookmark dropped — re-select folder")
+                    return nil
+                }
                 return url
             }
         }
         return nil
+    }
+
+    private static func isDirectory(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
     }
 
     private static func localOutURL(
@@ -350,7 +450,7 @@ final class DiarizerViewModel: ObservableObject {
         // Build path without appendingPathComponent — on macOS 26 that
         // auto-stats and appends a trailing "/" for directories, which
         // MLModel.compileModel rejects with "Input stream is not valid".
-        let pkgName = "\(variant.name)_\(stepSize.suffix).mlpackage"
+        let pkgName = "\(variant.name)_\(stepSize.description).mlpackage"
         return URL(
             fileURLWithPath: dir.path + "/" + pkgName,
             isDirectory: false
@@ -369,15 +469,26 @@ final class DiarizerViewModel: ObservableObject {
     private static func loadFromLocalOut(
         variant: LSEENDVariant, stepSize: LSEENDStepSize
     ) async throws -> LSEENDDiarizer {
-        guard let pkgURL = localOutURL(variant: variant, stepSize: stepSize) else {
+        guard let dir = localOutDir() else {
             throw NSError(
                 domain: "LSEEND.LocalFallback", code: 1,
                 userInfo: [NSLocalizedDescriptionKey:
                     "No local models dir configured. Set LSEEND_LOCAL_MODELS_DIR or pick a folder."]
             )
         }
-        let needsScope = pkgURL.startAccessingSecurityScopedResource()
-        defer { if needsScope { pkgURL.stopAccessingSecurityScopedResource() } }
+        // Scope the *directory* bookmark (not the package) so access stays
+        // open across compile + load and is released when we return.
+        let needsScope = dir.startAccessingSecurityScopedResource()
+        defer { if needsScope { dir.stopAccessingSecurityScopedResource() } }
+
+        let pkgName = "\(variant.name)_\(stepSize.description).mlpackage"
+        let pkgURL = URL(fileURLWithPath: dir.path + "/" + pkgName, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: pkgURL.path) else {
+            throw NSError(
+                domain: "LSEEND.LocalFallback", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Missing local package: \(pkgName)"]
+            )
+        }
         let compiled = try await MLModel.compileModel(at: pkgURL)
         let model = try LSEENDModel(modelURL: compiled, computeUnits: .cpuOnly)
         return try LSEENDDiarizer(model: model)
@@ -393,7 +504,8 @@ final class DiarizerViewModel: ObservableObject {
                 relativeTo: nil
             )
             UserDefaults.standard.set(data, forKey: "localModelsBookmark")
-            statusMessage = "Local models: \(url.path)"
+            // Display folder name only — don't leak full path to UI/logs.
+            statusMessage = "Local models: \(url.lastPathComponent)"
         } catch {
             statusMessage = "Bookmark failed: \(error.localizedDescription)"
         }
@@ -401,25 +513,23 @@ final class DiarizerViewModel: ObservableObject {
 
     func renameSpeaker(slot: Int, to name: String) {
         guard let diarizer = diarizer else { return }
-        _ = diarizer.timeline.upsertSpeaker(named: name.isEmpty ? nil : name, atIndex: slot)
+        _ = diarizer.timeline.upsertSpeaker(
+            named: name.isEmpty ? nil : name, atIndex: slot
+        )
         snapshotTimeline()
     }
 
     func reset() {
-        guard let diarizer = diarizer else { return }
-        // Serialize onto the same queue that owns inference.
+        guard let diarizer = diarizer else {
+            clearSnapshot()
+            return
+        }
         let captured = diarizer
         queue.async { captured.reset() }
         clearSnapshot()
     }
 
     // MARK: - Snapshot
-
-    /// Public so MainActorSink can drive it from the dispatch-main hop.
-    /// Must only be called on the main thread.
-    func refreshSnapshotFromMainSink() {
-        snapshotTimeline()
-    }
 
     private func snapshotTimeline() {
         guard let d = diarizer else { return }
@@ -430,7 +540,9 @@ final class DiarizerViewModel: ObservableObject {
         self.tentativeFrameCount = tl.numTentativeFrames
         self.frameDurationSeconds = tl.config.frameDurationSeconds
         self.numSpeakerChannels = tl.speakerCapacity
-        self.speakers = Dictionary(uniqueKeysWithValues: tl.speakers.map { ($0.key, $0.value.name) })
+        self.speakers = Dictionary(
+            uniqueKeysWithValues: tl.speakers.map { ($0.key, $0.value.name) }
+        )
 
         var allSegs: [DiarizerSegment] = []
         for (_, sp) in tl.speakers {
@@ -440,65 +552,20 @@ final class DiarizerViewModel: ObservableObject {
         allSegs.sort()
         self.segments = allSegs
     }
-}
 
-/// Helper: load an audio file into `[Float]` at the target sample rate via
-/// `AudioConverter`. Kept out-of-line so the ViewModel stays readable.
-private func AVAudioFile_safeRead(url: URL) -> [Float] {
-    let converter = AudioConverter(sampleRate: 8000)
-    return (try? converter.resampleAudioFile(url)) ?? []
-}
+    // MARK: - Test hooks
 
-/// Fully nonisolated sink that receives update requests from real-time /
-/// background threads and bounces them to the MainActor without ever
-/// capturing a MainActor-isolated reference in a `@Sendable` boundary.
-///
-/// Swift 6's runtime isolation check crashes when a `Task { @MainActor in }`
-/// is created while the enclosing context captures a MainActor-isolated
-/// `self` (even weakly). The tap closure on AVAudioEngine runs on a
-/// real-time thread, so any self-weak capture there triggers the crash.
-/// This sink solves that by holding an `@unchecked Sendable` weak owner and
-/// posting via `DispatchQueue.main.async`, which uses a dispatch hop — not
-/// an actor hop — and bypasses the runtime isolation check.
-final class MainActorSink: @unchecked Sendable {
-    private weak var owner: DiarizerViewModel?
-    init(owner: DiarizerViewModel) { self.owner = owner }
-
-    func postSnapshot() {
-        DispatchQueue.main.async { [weak self] in
-            self?.owner?.objectWillChange.send()
-            self?.owner?.refreshSnapshotFromMainSink()
-        }
+    #if DEBUG
+    /// Test-only: inject events into the UI pipeline and observe the
+    /// MainActor mutation via `await Task.yield()`. Keeps the stream
+    /// private to the ViewModel.
+    func _testInjectProgress(_ p: Double) {
+        eventContinuation.yield(.progress(p))
     }
-
-    func postStatus(_ msg: String) {
-        DispatchQueue.main.async { [weak self] in
-            self?.owner?.statusMessage = msg
-        }
+    func _testInjectStatus(_ msg: String) {
+        eventContinuation.yield(.status(msg))
     }
-
-    func postProgress(_ p: Double) {
-        DispatchQueue.main.async { [weak self] in
-            self?.owner?.progress = p
-            self?.owner?.refreshSnapshotFromMainSink()
-        }
-    }
-
-    func postDone() {
-        DispatchQueue.main.async { [weak self] in
-            self?.owner?.refreshSnapshotFromMainSink()
-            self?.owner?.isProcessing = false
-            self?.owner?.progress = 1
-            self?.owner?.statusMessage = "Done."
-        }
-    }
-
-    func postFail(_ msg: String) {
-        DispatchQueue.main.async { [weak self] in
-            self?.owner?.isProcessing = false
-            self?.owner?.statusMessage = "Failed: \(msg)"
-        }
-    }
+    #endif
 }
 
 /// Thread-safe counter for real-time callbacks to increment without mutating

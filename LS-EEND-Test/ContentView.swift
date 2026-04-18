@@ -22,13 +22,9 @@ struct ContentView: View {
     }
 
     @State private var mode: Mode = .file
-    @State private var importerKind: ImporterKind?
+    @State private var showProcessImporter: Bool = false
+    @State private var showEnrollImporter: Bool = false
     @State private var enrollName = "Speaker"
-
-    private enum ImporterKind: Identifiable {
-        case process, enroll
-        var id: Self { self }
-    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -55,31 +51,25 @@ struct ContentView: View {
                 rename: { slot, name in vm.renameSpeaker(slot: slot, to: name) }
             )
         }
+        // Two separate importers — each bound to its own @State bool so the
+        // completion handler can act on a single, stable action. Avoids the
+        // old shared-state timing workaround where isPresented was read
+        // before the setter had run.
         .fileImporter(
-            isPresented: Binding(
-                get: { importerKind != nil },
-                // Don't clear importerKind here — SwiftUI toggles isPresented
-                // off *before* the completion handler runs, so clearing now
-                // makes the completion see a nil kind and skip the dispatch.
-                set: { _ in }
-            ),
+            isPresented: $showProcessImporter,
             allowedContentTypes: [UTType.audio],
             allowsMultipleSelection: false
         ) { result in
-            let kind = importerKind
-            importerKind = nil
-            guard case .success(let urls) = result, let url = urls.first else {
-                return
-            }
-            print("[ContentView] fileImporter completed kind=\(String(describing: kind)) url=\(url.path)")
-            switch kind {
-            case .process:
-                Task { await vm.processFile(url) }
-            case .enroll:
-                Task { await vm.enroll(name: enrollName, from: url) }
-            case .none:
-                break
-            }
+            guard case .success(let urls) = result, let url = urls.first else { return }
+            Task { await vm.processFile(url) }
+        }
+        .fileImporter(
+            isPresented: $showEnrollImporter,
+            allowedContentTypes: [UTType.audio],
+            allowsMultipleSelection: false
+        ) { result in
+            guard case .success(let urls) = result, let url = urls.first else { return }
+            Task { await vm.enroll(name: enrollName, from: url) }
         }
     }
 
@@ -88,17 +78,14 @@ struct ContentView: View {
             Text("LS-EEND Diarizer")
                 .font(.title2).bold()
             Spacer()
-            ModelPickerView(
-                variant: Binding(
-                    get: { vm.variant },
-                    set: { v in Task { await vm.reload(variant: v) } }
-                ),
-                stepSize: Binding(
-                    get: { vm.stepSize },
-                    set: { s in Task { await vm.reload(stepSize: s) } }
-                )
-            )
-            .disabled(vm.isProcessing)
+            ModelPickerView(variant: $vm.variant, stepSize: $vm.stepSize)
+                .disabled(vm.isProcessing)
+                .onChange(of: vm.variant) { _, newValue in
+                    Task { await vm.reload(variant: newValue) }
+                }
+                .onChange(of: vm.stepSize) { _, newValue in
+                    Task { await vm.reload(stepSize: newValue) }
+                }
         }
         .padding()
     }
@@ -109,11 +96,12 @@ struct ContentView: View {
                 ForEach(Mode.allCases) { m in Text(m.label).tag(m) }
             }
             .pickerStyle(.segmented)
+            .accessibilityLabel("Mode")
 
             switch mode {
             case .file:
                 HStack {
-                    Button("Pick audio file") { importerKind = .process }
+                    Button("Pick audio file") { showProcessImporter = true }
                         .disabled(!isReady || vm.isProcessing)
                     if vm.isProcessing {
                         ProgressView(value: vm.progress).frame(width: 120)
@@ -125,7 +113,10 @@ struct ContentView: View {
             case .microphone:
                 HStack {
                     Button("Start mic") {
-                        Task { try? await vm.startMicrophone() }
+                        Task {
+                            do { try await vm.startMicrophone() }
+                            catch { vm.statusMessage = error.localizedDescription }
+                        }
                     }.disabled(!isReady)
                     Button("Stop & finalize") {
                         Task { await vm.stopMicrophone() }
@@ -136,7 +127,7 @@ struct ContentView: View {
             case .enroll:
                 HStack {
                     TextField("Name", text: $enrollName).frame(maxWidth: 160)
-                    Button("Enroll from file") { importerKind = .enroll }
+                    Button("Enroll from file") { showEnrollImporter = true }
                         .disabled(!isReady || enrollName.isEmpty)
                     Spacer()
                     Text("LS-EEND learns speakers online — enrolling conditions state and names the first-detected slot.")

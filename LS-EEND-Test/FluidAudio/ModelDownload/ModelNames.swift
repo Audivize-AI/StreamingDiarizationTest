@@ -18,7 +18,10 @@ public enum Repo: String, CaseIterable, Sendable {
     case nemotronStreaming80 = "FluidInference/nemotron-speech-streaming-en-0.6b-coreml/80ms"
     case diarizer = "FluidInference/speaker-diarization-coreml"
     case kokoro = "FluidInference/kokoro-82m-coreml"
-    case lseend = "GradientDescent2718/ls-eend-coreml/optimized"
+    case lseendAmi = "GradientDescent2718/ls-eend-coreml/optimized/ami"
+    case lseendCallHome = "GradientDescent2718/ls-eend-coreml/optimized/ch"
+    case lseendDihard2 = "GradientDescent2718/ls-eend-coreml/optimized/dih2"
+    case lseendDihard3 = "GradientDescent2718/ls-eend-coreml/optimized/dih3"
     case pocketTts = "FluidInference/pocket-tts-coreml"
     case qwen3Asr = "FluidInference/qwen3-asr-0.6b-coreml/f32"
     case qwen3AsrInt8 = "FluidInference/qwen3-asr-0.6b-coreml/int8"
@@ -60,8 +63,14 @@ public enum Repo: String, CaseIterable, Sendable {
             return "speaker-diarization-coreml"
         case .kokoro:
             return "kokoro-82m-coreml"
-        case .lseend:
-            return "ls-eend-coreml/optimized"
+        case .lseendAmi:
+            return "ls-eend-coreml/optimized/ami"
+        case .lseendCallHome:
+            return "ls-eend-coreml/optimized/ch"
+        case .lseendDihard2:
+            return "ls-eend-coreml/optimized/dih2"
+        case .lseendDihard3:
+            return "ls-eend-coreml/optimized/dih3"
         case .pocketTts:
             return "pocket-tts-coreml"
         case .qwen3Asr:
@@ -86,7 +95,7 @@ public enum Repo: String, CaseIterable, Sendable {
             return "FluidInference/parakeet-realtime-eou-120m-coreml"
         case .nemotronStreaming1120, .nemotronStreaming560, .nemotronStreaming160, .nemotronStreaming80:
             return "FluidInference/nemotron-speech-streaming-en-0.6b-coreml"
-        case .lseend:
+        case .lseendAmi, .lseendCallHome, .lseendDihard2, .lseendDihard3:
             return "GradientDescent2718/ls-eend-coreml"
         case .qwen3Asr, .qwen3AsrInt8:
             return "FluidInference/qwen3-asr-0.6b-coreml"
@@ -118,8 +127,14 @@ public enum Repo: String, CaseIterable, Sendable {
             return "nemotron_coreml_160ms"
         case .nemotronStreaming80:
             return "nemotron_coreml_80ms"
-        case .lseend:
-            return "optimized"
+        case .lseendAmi:
+            return "optimized/ami"
+        case .lseendCallHome:
+            return "optimized/ch"
+        case .lseendDihard2:
+            return "optimized/dih2"
+        case .lseendDihard3:
+            return "optimized/dih3"
         default:
             return nil
         }
@@ -154,8 +169,14 @@ public enum Repo: String, CaseIterable, Sendable {
             return "parakeet-ja"
         case .parakeetTdtCtc110m:
             return "parakeet-tdt-ctc-110m"
-        case .lseend:
-            return "ls-eend"
+        case .lseendAmi:
+            return "ls-eend/ami"
+        case .lseendCallHome:
+            return "ls-eend/ch"
+        case .lseendDihard2:
+            return "ls-eend/dih2"
+        case .lseendDihard3:
+            return "ls-eend/dih3"
         default:
             return name.replacingOccurrences(of: "-coreml", with: "")
         }
@@ -394,12 +415,12 @@ public enum ModelNames {
             case dihard2
             case dihard3
 
-            public var subPath: String {
+            public var repo: Repo {
                 switch self {
-                case .ami: return "AMI"
-                case .callhome: return "CALLHOME"
-                case .dihard2: return "DIHARD II"
-                case .dihard3: return "DIHARD III"
+                case .ami: return .lseendAmi
+                case .callhome: return .lseendCallHome
+                case .dihard2: return .lseendDihard2
+                case .dihard3: return .lseendDihard3
                 }
             }
             
@@ -417,20 +438,24 @@ public enum ModelNames {
             }
             
             public var description: String { name }
-            public var stem: String { "\(subPath)/\(name)" }
-            public func name(forStep step: StepSize) -> String { "\(name)_\(step.suffix)"}
-            public func stem(forStep step: StepSize) -> String { "\(stem)_\(step.suffix)"}
-            public func fileName(forStep step: StepSize) -> String { stem(forStep: step) + ".mlmodelc" }
+            
+            public func name(forStep step: StepSize) -> String {
+                "\(name)_\(step)"
+            }
+            
+            public func fileName(forStep step: StepSize) -> String {
+                "\(step)/\(name)_\(step).mlmodelc"
+            }
         }
         
-        public enum StepSize: Int, CaseIterable, Sendable {
+        public enum StepSize: Int, CaseIterable, Sendable, CustomStringConvertible {
             case step100ms = 1
             case step200ms = 2
             case step300ms = 3
             case step400ms = 4
             case step500ms = 5
             
-            public var suffix: String {
+            public var description: String {
                 switch self {
                 case .step100ms: return "100ms"
                 case .step200ms: return "200ms"
@@ -635,7 +660,7 @@ public enum ModelNames {
                 .union(ModelNames.MultilingualG2P.requiredModels)
         case .pocketTts:
             return ModelNames.PocketTTS.requiredModels
-        case .lseend:
+        case .lseendAmi, .lseendCallHome, .lseendDihard2, .lseendDihard3:
             if let variant = variant {
                 return [variant + ".mlmodelc"]
             }

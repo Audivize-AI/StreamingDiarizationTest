@@ -1,0 +1,10 @@
+{
+  "MLModelDescriptionKey" : "LS-EEND DIHARD III streaming diarizer (pipeline, T=1, max_speakers=10)",
+  "MLModelCreatorDefinedKey" : {
+    "com.github.apple.coremltools.conversion_date" : "2026-04-16",
+    "config" : "{\"model_name\": \"dih3\", \"model_label\": \"DIHARD III\", \"variant\": \"pipeline\", \"chunk_size\": 1, \"step_duration_ms\": 100, \"frame_duration_ms\": 100, \"frame_duration_seconds\": 0.1, \"max_speakers\": 10, \"max_nspks\": 12, \"n_units\": 256, \"n_heads\": 4, \"enc_n_layers\": 4, \"dec_n_layers\": 2, \"conv_kernel_size\": 16, \"conv_delay\": 9, \"sample_rate\": 8000, \"win_length\": 200, \"hop_length\": 80, \"n_mels\": 23, \"context_size\": 7, \"subsampling\": 10, \"feat_type\": \"logmel23_cummn\", \"pure_roll\": true}",
+    "com.github.apple.coremltools.source" : "torch==2.6.0",
+    "com.github.apple.coremltools.version" : "9.0",
+    "com.github.apple.coremltools.source_dialect" : "TorchScript"
+  }
+}

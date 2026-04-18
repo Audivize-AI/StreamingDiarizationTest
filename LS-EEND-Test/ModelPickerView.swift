@@ -13,7 +13,7 @@ struct ModelPickerView: View {
         HStack(spacing: 12) {
             Picker("Variant", selection: $variant) {
                 ForEach(LSEENDVariant.allCases, id: \.self) { v in
-                    Text(v.subPath).tag(v)
+                    Text(v.description).tag(v)
                 }
             }
             .labelsHidden()
@@ -21,7 +21,7 @@ struct ModelPickerView: View {
 
             Picker("Step", selection: $stepSize) {
                 ForEach(LSEENDStepSize.allCases, id: \.self) { s in
-                    Text(s.suffix).tag(s)
+                    Text(s.description).tag(s)
                 }
             }
             .labelsHidden()

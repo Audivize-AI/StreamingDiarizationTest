@@ -10,8 +10,6 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
-	<key>com.apple.security.network.server</key>
-	<true/>
 	<!-- Models loaded via either (a) LSEEND_LOCAL_MODELS_DIR env var
 	     (set in Xcode scheme for dev, not baked into the binary), or
 	     (b) user-selected security-scoped bookmark — both skip the

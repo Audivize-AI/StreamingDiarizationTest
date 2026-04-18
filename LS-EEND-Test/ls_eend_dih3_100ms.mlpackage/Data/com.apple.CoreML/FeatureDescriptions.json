@@ -1,0 +1,57 @@
+{
+  "Inputs" : {
+    "dec_kv" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "enc_kv" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "enc_scale" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "cnn_window" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "enc_conv_cache" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "dec_scale" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "valid_mask" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "features" : {
+      "MLFeatureShortDescription" : ""
+    }
+  },
+  "Outputs" : {
+    "dec_scale_new" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "enc_scale_new" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "dec_kv_new" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "cnn_window_new" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "probs" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "enc_kv_new" : {
+      "MLFeatureShortDescription" : ""
+    },
+    "enc_conv_cache_new" : {
+      "MLFeatureShortDescription" : ""
+    }
+  },
+  "TrainingInputs" : {
+
+  },
+  "States" : {
+
+  }
+}

@@ -29,6 +29,14 @@ struct TimelineHeatmapView: View {
         (0.993, 0.906, 0.144),  // 1.000 — yellow
     ]
 
+    private static func predictionValue(
+        _ arr: [Float], frame: Int, slot: Int, numSpeakers: Int
+    ) -> Float? {
+        let offset = frame * numSpeakers + slot
+        guard offset >= 0, offset < arr.count else { return nil }
+        return arr[offset]
+    }
+
     private static func viridis(_ t: Float) -> Color {
         let clamped = Double(min(max(t, 0), 1))
         let scaled = clamped * Double(viridisStops.count - 1)
@@ -94,9 +102,12 @@ struct TimelineHeatmapView: View {
                         let (arr, idx) = isFinalized
                             ? (finalized, globalFrame)
                             : (tentative, globalFrame - finalizedFrameCount)
-                        let offset = idx * numSpeakers + slot
-                        guard offset >= 0, offset < arr.count else { continue }
-                        let p = arr[offset]
+                        // Predictions are laid out [frame0_slot0, frame0_slot1,
+                        // …, frame1_slot0, …]. Anything that diverges from
+                        // this stride breaks the heatmap silently.
+                        guard let p = Self.predictionValue(arr, frame: idx, slot: slot, numSpeakers: numSpeakers) else {
+                            continue
+                        }
                         let rect = CGRect(
                             x: CGFloat(f) * colW,
                             y: y,
