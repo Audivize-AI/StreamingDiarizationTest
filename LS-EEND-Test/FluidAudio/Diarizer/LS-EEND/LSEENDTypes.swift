@@ -209,6 +209,7 @@ public class LSEENDSession {
             self.cmnMean = snapshot.cmnMean
             self.cmnCount = snapshot.cmnCount
             self.decoderMaskEnd = snapshot.decoderMaskEnd
+            self.input = try LSEENDInput(from: metadata, state: snapshot.state)
         } else {
             self.melQueue = SlidingWindowBuffer(
                 chunkLength: chunkMels,
@@ -402,8 +403,8 @@ public class LSEENDInput: MLFeatureProvider {
         "valid_mask"
     ]}
 
-    public init(from metadata: LSEENDMetadata) throws {
-        self.state = try LSEENDState(from: metadata)
+    public init(from metadata: LSEENDMetadata, state: LSEENDState? = nil) throws {
+        self.state = try state ?? LSEENDState(from: metadata)
         let T = NSNumber(value: metadata.chunkSize)
         let M = NSNumber(value: metadata.melFrames)
         let N = NSNumber(value: metadata.nMels)

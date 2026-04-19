@@ -208,6 +208,13 @@ public struct DiarizerChunkResult: Sendable {
 // MARK: - Speaker
 
 public class DiarizerSpeaker: Identifiable {
+    public struct Snapshot {
+        public let name: String?
+        public let index: Int
+        public let finalizedSegments: [DiarizerSegment]
+        public let tentativeSegments: [DiarizerSegment]
+    }
+    
     /// Speaker ID
     public let id: UUID
     
@@ -297,6 +304,15 @@ public class DiarizerSpeaker: Identifiable {
         self.name = name
     }
     
+    /// Initialize from a snapshot of a diarizer speaker
+    public init(from snapshot: consuming Snapshot) {
+        self.id = UUID()
+        self.index = snapshot.index
+        self.name = snapshot.name
+        self.finalizedSegments = snapshot.finalizedSegments
+        self.tentativeSegments = snapshot.tentativeSegments
+    }
+    
     /// Rename the speaker
     public func rename(to name: String?) {
         self.name = name
@@ -319,10 +335,26 @@ public class DiarizerSpeaker: Identifiable {
         tentativeSegments.removeAll()
         finalizedSegments.removeAll()
     }
+    
+    public func rollback(to snapshot: consuming Snapshot, keepingName: Bool = false) {
+        if !keepingName { self.name = snapshot.name }
+        self.index = snapshot.index
+        self.finalizedSegments = snapshot.finalizedSegments
+        self.tentativeSegments = snapshot.tentativeSegments
+    }
+    
+    public func takeSnapshot() -> Snapshot {
+        Snapshot(
+            name: name,
+            index: index,
+            finalizedSegments: finalizedSegments,
+            tentativeSegments: tentativeSegments
+        )
+    }
 
     /// Clear all tentative segments
     /// - Parameter keepingCapacity: Whether to keep the reserved capacity in the tentative segments list.
-    public func removeAllTentative(keepingCapacity: Bool = false) {
+    public func clearTentative(keepingCapacity: Bool = false) {
         tentativeSegments.removeAll(keepingCapacity: keepingCapacity)
     }
 
@@ -533,6 +565,19 @@ public enum DiarizerActivityType: Sendable {
 /// Generalizes `SortformerTimeline` for any frame-based diarizer. Works with
 /// both Sortformer (fixed 4 speakers) and LS-EEND (variable speaker count).
 public class DiarizerTimeline {
+    public struct ConfiguredSnapshot {
+        let config: DiarizerTimelineConfig
+        let snapshot: Snapshot
+    }
+    
+    public struct Snapshot {
+        public let speakers: [Int : DiarizerSpeaker.Snapshot]
+        public let finalizedPredictions: [Float]
+        public let tentativePredictions: [Float]
+        public let numFinalizedFrames: Int
+        internal let scratches: [SegmentScratch]
+    }
+    
     public enum KeptOnReset {
         case nothing
         case namedSpeakers
@@ -541,7 +586,7 @@ public class DiarizerTimeline {
         case speakersWithSegments
     }
     
-    private struct Scratch {
+    internal struct SegmentScratch {
         var speaking: Bool = false
         var hasSegment: Bool = false
         var startFrame: Int = .min
@@ -596,9 +641,8 @@ public class DiarizerTimeline {
         config.numSpeakers
     }
     
-    
     private var finalizedCursorFrame: Int = 0
-    private var states: [Scratch]
+    private var scratches: [SegmentScratch]
     private static let logger = AppLogger(category: "DiarizerTimeline")
     
     // MARK: - Init
@@ -606,7 +650,7 @@ public class DiarizerTimeline {
     /// Initialize for streaming usage
     public init(config: DiarizerTimelineConfig) {
         self.config = config
-        states = Array(repeating: .init(), count: config.numSpeakers)
+        scratches = Array(repeating: .init(), count: config.numSpeakers)
         speakers = [:]
     }
 
@@ -638,6 +682,26 @@ public class DiarizerTimeline {
             config: config,
             isComplete: isComplete
         )
+    }
+    
+    /// Initialize from a snapshot
+    public init(from snapshot: consuming Snapshot, withConfig config: DiarizerTimelineConfig) {
+        self.config = config
+        self.finalizedPredictions = snapshot.finalizedPredictions
+        self.tentativePredictions = snapshot.tentativePredictions
+        self.finalizedCursorFrame = snapshot.numFinalizedFrames
+        self.scratches = snapshot.scratches
+        self.speakers = [:]
+        self.speakers.reserveCapacity(snapshot.speakers.count)
+        
+        for (slot, speakerSnapshot) in snapshot.speakers {
+            self.speakers[slot] = DiarizerSpeaker(from: speakerSnapshot)
+        }
+    }
+    
+    /// Initialize from a snapshot
+    public convenience init(from snapshot: consuming ConfiguredSnapshot) {
+        self.init(from: snapshot.snapshot, withConfig: snapshot.config)
     }
 
     // MARK: - Streaming API
@@ -677,7 +741,7 @@ public class DiarizerTimeline {
         
         // Clear tentative segments
         for speaker in speakers.values {
-            speaker.removeAllTentative(keepingCapacity: true)
+            speaker.clearTentative(keepingCapacity: true)
         }
         
         // Extract new segments
@@ -728,14 +792,11 @@ public class DiarizerTimeline {
         finalizedPredictions.removeAll()
         tentativePredictions.removeAll()
         finalizedCursorFrame = 0
-        states = Array(repeating: .init(), count: speakerCapacity)
+        scratches = Array(repeating: .init(), count: speakerCapacity)
         
-        for (slot, speaker) in speakers {
-            if !condition(speaker) {
-                speakers[slot] = nil
-            } else {
-                speaker.reset()
-            }
+        speakers = speakers.filter { _, speaker in condition(speaker) }
+        for speaker in speakers.values {
+            speaker.reset()
         }
     }
 
@@ -745,7 +806,7 @@ public class DiarizerTimeline {
         finalizedPredictions.removeAll()
         tentativePredictions.removeAll()
         finalizedCursorFrame = 0
-        states = Array(repeating: .init(), count: speakerCapacity)
+        scratches = Array(repeating: .init(), count: speakerCapacity)
 
         if keepingSpeakers {
             for speaker in speakers.values {
@@ -819,6 +880,35 @@ public class DiarizerTimeline {
             chunkResult: consume chunk
         )
     }
+    
+    public func rollback(to snapshot: consuming Snapshot, keepingSpeakers: Bool = false) {
+        self.finalizedPredictions = snapshot.finalizedPredictions
+        self.tentativePredictions = snapshot.tentativePredictions
+        self.finalizedCursorFrame = snapshot.numFinalizedFrames
+        self.scratches = snapshot.scratches
+        
+        for (slot, speakerSnapshot) in snapshot.speakers {
+            speakers[slot]?.rollback(to: speakerSnapshot, keepingName: keepingSpeakers)
+        }
+
+        guard !keepingSpeakers else { return }
+        speakers = speakers.filter { slot, _ in snapshot.speakers[slot] != nil }
+    }
+    
+    public func takeSnapshot() -> Snapshot {
+        var speakersSnapshots: [Int: DiarizerSpeaker.Snapshot] = [:]
+        for (slot, speaker) in speakers {
+            speakersSnapshots[slot] = speaker.takeSnapshot()
+        }
+        
+        return Snapshot(
+            speakers: speakersSnapshots,
+            finalizedPredictions: finalizedPredictions,
+            tentativePredictions: tentativePredictions,
+            numFinalizedFrames: finalizedCursorFrame,
+            scratches: scratches
+        )
+    }
 
     // MARK: Speaker Management
 
@@ -869,10 +959,10 @@ public class DiarizerTimeline {
         }
 
         if transferCurrentSegment,
-           states[index].speaking,
+           scratches[index].speaking,
            let oldSpeaker = speakers[index],
            let segment = oldSpeaker.popLast(
-            if: { [startFrame = states[index].startFrame] in
+            if: { [startFrame = scratches[index].startFrame] in
                 $0.startFrame >= startFrame
             })
         {
@@ -881,7 +971,7 @@ public class DiarizerTimeline {
 
         // Clear current segment if we don't want to transfer it
         if !transferCurrentSegment {
-            states[index] = Scratch()
+            scratches[index] = SegmentScratch()
         }
 
         speakers[index] = speaker
@@ -904,7 +994,7 @@ public class DiarizerTimeline {
             return nil
         }
         if clearCurrentSegment {
-            states[index] = Scratch()
+            scratches[index] = SegmentScratch()
         }
 
         return speakers.removeValue(forKey: index)
@@ -960,7 +1050,7 @@ public class DiarizerTimeline {
         let activityFunc = config.activityType.evaluationFunction
 
         for speakerIndex in 0..<speakerCapacity {
-            var aux = states[speakerIndex]
+            var aux = scratches[speakerIndex]
 
             for i in 0..<numNewFrames {
                 let index = i * speakerCapacity + speakerIndex
@@ -1018,7 +1108,7 @@ public class DiarizerTimeline {
             )
             
             if isFinalized {
-                states[speakerIndex] = aux
+                scratches[speakerIndex] = aux
                 continue
             }
 
@@ -1040,22 +1130,13 @@ public class DiarizerTimeline {
     
     @inline(__always)
     private func commitSegment(
-        from aux: inout Scratch,
+        from aux: inout SegmentScratch,
         toSlot slot: Int,
         isFinalized: Bool,
         emittingIfFinalizedTo finalizedResult: inout [DiarizerSegment],
         emittingIfTentativeTo tentativeResult: inout [DiarizerSegment]
     ) {
         guard aux.hasSegment else { return }
-        
-        let speaker: DiarizerSpeaker
-        if let spk = speakers[slot] {
-            speaker = consume spk
-        } else {
-            let spk = DiarizerSpeaker(index: slot)
-            speakers[slot] = spk
-            speaker = consume spk
-        }
         
         let segment = DiarizerSegment(
             speakerIndex: slot,
@@ -1066,7 +1147,17 @@ public class DiarizerTimeline {
             activity: aux.activeFrameCount > 0 ? aux.activitySum / Float(aux.activeFrameCount) : 0
         )
         
+        let speaker: DiarizerSpeaker
+        if let spk = speakers[slot] {
+            speaker = consume spk
+        } else {
+            let spk = DiarizerSpeaker(index: slot)
+            speakers[slot] = spk
+            speaker = consume spk
+        }
+        
         speaker.append(segment)
+        
         if isFinalized {
             finalizedResult.append(consume segment)
         } else {
