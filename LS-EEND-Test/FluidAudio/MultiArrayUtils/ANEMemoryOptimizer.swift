@@ -177,7 +177,6 @@ public final class ANEMemoryOptimizer {
             }
         }
     }
-
 }
 
 /// Extension for MLMultiArray to enable zero-copy operations
