@@ -23,12 +23,21 @@ final class LSEENDParityTests: XCTestCase {
         return URL(fileURLWithPath: p, isDirectory: true)
     }
 
-    /// Local mlpackage path — same pattern. Set `LSEEND_LOCAL_MODELS_DIR`.
-    private static func modelPackageURL(_ filename: String) -> URL? {
-        guard let p = ProcessInfo.processInfo.environment["LSEEND_LOCAL_MODELS_DIR"],
-              !p.isEmpty
-        else { return nil }
-        return URL(fileURLWithPath: p + "/" + filename, isDirectory: false)
+    /// Fetch + construct an LS-EEND diarizer for parity tests straight from
+    /// Hugging Face. The HTTPS download is cached by `LSEENDModel`, so the
+    /// first test run per model is slow and the rest are fast. Switching
+    /// away from `LSEEND_LOCAL_MODELS_DIR` ensures the tests exercise the
+    /// currently-published raw-mel-input model shape rather than whatever
+    /// stale stacked-input mlpackage is sitting in `coreml/out/`.
+    private static func loadDiarizerFromHF(
+        stepSize: LSEENDStepSize = .step300ms
+    ) async throws -> LSEENDDiarizer {
+        let model = try await LSEENDModel.loadFromHuggingFace(
+            variant: .dihard3,
+            stepSize: stepSize,
+            computeUnits: .cpuOnly
+        )
+        return try LSEENDDiarizer(model: model)
     }
 
     private func skipIfNoFixtures() throws {
@@ -109,19 +118,19 @@ final class LSEENDParityTests: XCTestCase {
 
     // MARK: - Stage 4: subsampled+context feature parity
 
-    func testFeat345Parity() throws {
+    func testFeat345Parity() async throws {
         try skipIfNoFixtures()
         let audio = try readFloats("audio_8k.f32")
         let refFeat = try readFloats("feat345.f32")
 
-        guard let modelURL = Self.modelPackageURL("ls_eend_dih3_300ms.mlpackage"),
-              FileManager.default.fileExists(atPath: modelURL.path)
-        else {
-            throw XCTSkip("Set LSEEND_LOCAL_MODELS_DIR to a dir containing ls_eend_dih3_300ms.mlpackage.")
-        }
-        let compiled = try MLModel.compileModel(at: modelURL)
-        let model = try LSEENDModel(modelURL: compiled, computeUnits: .cpuOnly)
-        let diarizer = try LSEENDDiarizer(model: model)
+        // Python's `feat345.f32` was dumped with `T=1` (one subsampled
+        // output per emit), so each 345-float row = raw CMN'd mel rows
+        // `[k*subsampling - ctx … k*subsampling + ctx]` flattened. To byte-
+        // match that, Swift needs `chunkFrames=1` too, i.e. the 100 ms
+        // model. The now-internal stacking in higher-step models produces
+        // a different window shape per emit (`melFrames·nMels` > 345), so
+        // the 300 ms variant can no longer be used here.
+        let diarizer = try await Self.loadDiarizerFromHF(stepSize: .step100ms)
 
         let swiftFeat = try diarizer.debugExtractFeatures(audio, sourceSampleRate: nil)
         let sFrames = swiftFeat.count / 345
@@ -180,21 +189,14 @@ final class LSEENDParityTests: XCTestCase {
     /// byte-compared to Python (different resampler kernels) but must
     /// produce a sane timeline: non-empty, finite duration, at least
     /// one finalized segment for the 3-speaker DIHARD III sample.
-    func testEndToEndFromFlac() throws {
+    func testEndToEndFromFlac() async throws {
         guard let flacPath = ProcessInfo.processInfo.environment["LSEEND_PARITY_FLAC"],
               FileManager.default.fileExists(atPath: flacPath)
         else {
             throw XCTSkip("Set LSEEND_PARITY_FLAC to a .flac audio file path.")
         }
         let flacURL = URL(fileURLWithPath: flacPath)
-        guard let modelURL = Self.modelPackageURL("ls_eend_dih3_300ms.mlpackage"),
-              FileManager.default.fileExists(atPath: modelURL.path)
-        else {
-            throw XCTSkip("Set LSEEND_LOCAL_MODELS_DIR to a dir containing ls_eend_dih3_300ms.mlpackage.")
-        }
-        let compiled = try MLModel.compileModel(at: modelURL)
-        let model = try LSEENDModel(modelURL: compiled, computeUnits: .cpuOnly)
-        let diarizer = try LSEENDDiarizer(model: model)
+        let diarizer = try await Self.loadDiarizerFromHF()
 
         var lastProgress = (done: 0, total: 0, chunks: 0)
         let timeline = try diarizer.processComplete(
@@ -240,21 +242,14 @@ final class LSEENDParityTests: XCTestCase {
     /// the trim were ever applied to an already-warm KV cache, the second
     /// run would drop real frames and shrink. Pins the second-run count to
     /// within ±2 frames of the first.
-    func testProcessCompleteIsIdempotentOnFrameCount() throws {
+    func testProcessCompleteIsIdempotentOnFrameCount() async throws {
         guard let flacPath = ProcessInfo.processInfo.environment["LSEEND_PARITY_FLAC"],
               FileManager.default.fileExists(atPath: flacPath)
         else {
             throw XCTSkip("Set LSEEND_PARITY_FLAC to a .flac audio file path.")
         }
-        guard let modelURL = Self.modelPackageURL("ls_eend_dih3_300ms.mlpackage"),
-              FileManager.default.fileExists(atPath: modelURL.path)
-        else {
-            throw XCTSkip("Set LSEEND_LOCAL_MODELS_DIR to a dir containing ls_eend_dih3_300ms.mlpackage.")
-        }
         let flacURL = URL(fileURLWithPath: flacPath)
-        let compiled = try MLModel.compileModel(at: modelURL)
-        let model = try LSEENDModel(modelURL: compiled, computeUnits: .cpuOnly)
-        let diarizer = try LSEENDDiarizer(model: model)
+        let diarizer = try await Self.loadDiarizerFromHF()
 
         let t1 = try diarizer.processComplete(
             audioFileURL: flacURL,
@@ -285,18 +280,10 @@ final class LSEENDParityTests: XCTestCase {
 
     // MARK: - Stage 6: end-to-end probs parity (T=3, uses bundled model)
 
-    func testEndToEndProbsParityT3() throws {
+    func testEndToEndProbsParityT3() async throws {
         try skipIfNoFixtures()
 
-        guard let modelURL = Self.modelPackageURL("ls_eend_dih3_300ms.mlpackage"),
-              FileManager.default.fileExists(atPath: modelURL.path)
-        else {
-            throw XCTSkip("Set LSEEND_LOCAL_MODELS_DIR to a dir containing ls_eend_dih3_300ms.mlpackage.")
-        }
-        // Compile mlpackage to mlmodelc lazily.
-        let compiled = try MLModel.compileModel(at: modelURL)
-        let model = try LSEENDModel(modelURL: compiled, computeUnits: .cpuOnly)
-        let diarizer = try LSEENDDiarizer(model: model)
+        let diarizer = try await Self.loadDiarizerFromHF()
 
         let audio = try readFloats("audio_8k.f32")
         let refProbs = try readFloats("probs_dih3_T3.f32")
