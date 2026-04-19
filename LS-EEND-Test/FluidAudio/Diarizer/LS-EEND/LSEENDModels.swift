@@ -36,8 +36,6 @@ public class LSEENDModel {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         self.metadata = try decoder.decode(LSEENDMetadata.self, from: Data(json.utf8))
-        
-        
     }
     
     /// Download LS-EEND models from HuggingFace.
@@ -55,8 +53,6 @@ public class LSEENDModel {
         computeUnits: MLComputeUnits = .cpuOnly,
         progressHandler: DownloadUtils.ProgressHandler? = nil
     ) async throws -> LSEENDModel {
-        //        await SystemInfo.logOnce(using: logger)
-        
         let directory =
         cacheDirectory
         ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -99,10 +95,10 @@ public class LSEENDModel {
     // MARK: - Inference
     
     public func predict(from input: LSEENDInput) throws -> [Float] {
-        lock.lock()
-        defer { lock.unlock() }
-        
-        return try autoreleasepool {
+        try autoreleasepool {
+            lock.lock()
+            defer { lock.unlock() }
+            
             let prediction = try model.prediction(from: input)
             
             guard let probsMA = prediction.featureValue(for: "probs")?.multiArrayValue,
@@ -116,55 +112,42 @@ public class LSEENDModel {
                 throw LSEENDError.inferenceFailed("Failed to extract predictions from CoreML model.")
             }
             
+            // Update state
             input.state.encRetKv = encKvMA
             input.state.encRetScale = encScaleMA
             input.state.encConvCache = encConvCacheMA
             input.state.cnnWindow = cnnWindowMA
             input.state.decRetKv = decKvMA
             input.state.decRetScale = decScaleMA
-
-            return Self.readProbsStrideAware(probsMA)
-        }
-    }
-
-    /// CoreML returns `probs` with tile-padded inner strides (e.g. logical
-    /// shape `[1, T, 10]`, strides `[16, 16, 1]`) — baked at mlpackage
-    /// compile time even when `.cpuOnly` is requested. A flat
-    /// `withUnsafeBufferPointer` reads the physical `T × 16` footprint and
-    /// leaves 6 garbage lanes per row, which the timeline rejects with
-    /// `misalignedFinalizedPredictions`. Copy row-by-row using the
-    /// published strides so the returned array is exactly `T × S` logical
-    /// elements.
-    private static func readProbsStrideAware(_ probsMA: MLMultiArray) -> [Float] {
-        let shape = probsMA.shape.map { $0.intValue }
-        let strides = probsMA.strides.map { $0.intValue }
-        guard let innerCount = shape.last, strides.last == 1 else {
-            preconditionFailure(
-                "probs must be non-empty with innermost stride 1; got shape=\(shape) strides=\(strides)"
-            )
-        }
-        let outerCount = shape.dropLast().reduce(1, *)
-        var out = [Float](repeating: 0, count: outerCount * innerCount)
-        probsMA.withUnsafeBufferPointer(ofType: Float.self) { buf in
-            guard let src = buf.baseAddress else { return }
-            let rowBytes = innerCount * MemoryLayout<Float>.stride
-            var idx = [Int](repeating: 0, count: max(shape.count - 1, 0))
-            for outer in 0..<outerCount {
-                var srcOff = 0
-                for d in 0..<idx.count { srcOff += idx[d] * strides[d] }
-                out.withUnsafeMutableBufferPointer { dst in
-                    memcpy(dst.baseAddress!.advanced(by: outer * innerCount),
-                           src.advanced(by: srcOff),
-                           rowBytes)
-                }
-                for d in stride(from: idx.count - 1, through: 0, by: -1) {
-                    idx[d] += 1
-                    if idx[d] < shape[d] { break }
-                    idx[d] = 0
-                }
+            
+            // Copy speaker sigmoids and skip warmup frames
+            let warmup = input.warmupFrames
+            let outputFrames = metadata.chunkSize - warmup
+            let outputSpeakers = metadata.maxSpeakers
+            guard outputFrames > 0, outputSpeakers > 0 else { return [] }
+            
+            guard probsMA.strides.last?.intValue == 1 else {
+                throw LSEENDError.inferenceFailed(
+                    "Probs innermost stride must be 1. CoreML model produced strides: \(probsMA.strides).")
             }
+            let frameStride = probsMA.strides[1].intValue
+
+            var probsOut = [Float](repeating: 0, count: outputFrames * outputSpeakers)
+            let maBase = probsMA.dataPointer.assumingMemoryBound(to: Float.self)
+            
+            probsOut.withUnsafeMutableBufferPointer { flatPtr in
+                vDSP_mmov(
+                    maBase + warmup * frameStride,
+                    flatPtr.baseAddress!,
+                    vDSP_Length(outputSpeakers),
+                    vDSP_Length(outputFrames),
+                    vDSP_Length(frameStride),
+                    vDSP_Length(outputSpeakers)
+                )
+            }
+
+            return probsOut
         }
-        return out
     }
 }
 
