@@ -31,11 +31,17 @@ TEST_RUNNER_LSEEND_LOCAL_MODELS_DIR=/path/to/LS-EEND/coreml/out \
 TEST_RUNNER_LSEEND_PARITY_FLAC=/path/to/LDC2022S14.flac \
 xcodebuild test … -only-testing:LS-EEND-TestTests/LSEENDParityTests
 
+# Enrollment tests require the 6-speaker WAV folder:
+TEST_RUNNER_LSEEND_ENROLL_DIR="/path/to/LS-EEND/6 Speakers" \
+xcodebuild test … -only-testing:LS-EEND-TestTests/LSEENDEnrollmentTests
+
 # Dump Python parity fixtures (run before parity tests)
 cd ../LS-EEND && conda activate NeMo && python coreml/dump_parity_fixtures.py
 ```
 
 Parity fixtures land under `../LS-EEND/coreml/parity/`. `LSEENDParityTests.swift` reads them through the `LSEEND_PARITY_DIR` env var (set in the Xcode scheme for local parity runs) — no absolute paths baked in.
+
+The 6-speaker enrollment fixture lives under `../LS-EEND/6 Speakers/` with files `Speaker 1M.wav` … `Speaker 6F.wav` (mixed M/F @ their native sample rates; `AudioConverter` resamples to 8 kHz). `LSEENDEnrollmentTests.swift` reads `LSEEND_ENROLL_DIR` the same way. Tests skip cleanly when the env var is unset or any file is missing.
 
 ## Architecture
 
