@@ -178,8 +178,6 @@ public class LSEENDSession {
         let contextSamples = metadata.nFFT / 2
         let chunkMels = metadata.subsampling * metadata.chunkSize
         let chunkSamples = metadata.hopLength * chunkMels
-        
-        // TODO: Validate that this can't be reduced further
         let rightSamples = metadata.nFFT / 2 - metadata.hopLength
 
         // (mel ±context + CNN right-lookahead) mels × hop + STFT last-window halfNfft
