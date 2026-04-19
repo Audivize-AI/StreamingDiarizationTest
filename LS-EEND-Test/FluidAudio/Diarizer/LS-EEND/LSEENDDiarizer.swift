@@ -146,7 +146,7 @@ public final class LSEENDDiarizer: Diarizer {
         timeline.reset(keepingSpeakers: keep)
 
         try addAudio(samples, sourceSampleRate: sourceSampleRate)
-        try drainAndUpdate(
+        try flush(
             finalizeOnCompletion: finalizeOnCompletion,
             progressCallback: progressCallback
         )
@@ -167,7 +167,7 @@ public final class LSEENDDiarizer: Diarizer {
         timeline.reset(keepingSpeakers: keep)
 
         try session.enqueueAudioFile(at: audioFileURL)
-        try drainAndUpdate(
+        try flush(
             finalizeOnCompletion: finalizeOnCompletion,
             progressCallback: progressCallback
         )
@@ -176,7 +176,8 @@ public final class LSEENDDiarizer: Diarizer {
 
     /// Shared drain path for both `processComplete` overloads. Runs
     /// session → model → timeline, optionally finalizing the stream.
-    private func drainAndUpdate(
+    private func flush(
+        recordFrames: Bool = true,
         finalizeOnCompletion: Bool,
         progressCallback: ((Int, Int, Int) -> Void)?
     ) throws {
@@ -188,7 +189,7 @@ public final class LSEENDDiarizer: Diarizer {
             try session.finalizeQueuedAudio()
         }
 
-        _ = try flush(progressCallback: progressCallback)
+        _ = try flush(recordFrames: recordFrames, progressCallback: progressCallback)
 
         if finalizeOnCompletion {
             timeline.finalize()
@@ -201,6 +202,7 @@ public final class LSEENDDiarizer: Diarizer {
     /// are stripped per-chunk inside `model.predict` (`input.warmupFrames`),
     /// so the accumulated stream is already 1:1 with real audio time.
     private func flush(
+        recordFrames: Bool = true,
         progressCallback: ((Int, Int, Int) -> Void)?
     ) throws -> DiarizerTimelineUpdate? {
         guard let session, let model else {
@@ -209,20 +211,24 @@ public final class LSEENDDiarizer: Diarizer {
 
         let chunkSize = model.metadata.chunkSize
         let numSpeakers = model.metadata.maxSpeakers
+        let rightContext = model.metadata.convDelay
         let totalChunks = session.readyChunks
 
         var processed = 0
         var newPreds: [Float] = []
         newPreds.reserveCapacity(totalChunks * numSpeakers * chunkSize)
-
+        
         while let input = try session.emitNextChunk() {
+            if recordFrames {
+                input.warmupFrames = max(min(rightContext - numFramesProcessed, chunkSize), 0)
+                numFramesProcessed += chunkSize
+            }
             newPreds.append(contentsOf: try model.predict(from: input))
             processed += 1
             progressCallback?(processed, totalChunks, 1)
         }
 
         guard !newPreds.isEmpty else { return nil }
-        numFramesProcessed += newPreds.count / numSpeakers
 
         return try timeline.addPredictions(
             finalizedPredictions: newPreds,
@@ -250,7 +256,6 @@ public final class LSEENDDiarizer: Diarizer {
         named name: String?,
         overwritingAssignedSpeakerName overwriteAssignedSpeakerName: Bool
     ) throws -> DiarizerSpeaker? where C.Element == Float {
-        let description: String = name.map { "named '\($0)'" } ?? "(no name)"
         guard let session else {
             throw LSEENDError.notInitialized
         }
@@ -258,7 +263,11 @@ public final class LSEENDDiarizer: Diarizer {
         let sessionSnapshot = session.takeSnapshot()
         let timelineSnapshot = timeline.takeSnapshot()
         let isNamed = name != nil
-        let requireNewSpeaker = !isNamed || overwriteAssignedSpeakerName
+        // Only require a previously-unnamed slot when the caller is naming a
+        // speaker AND refuses to overwrite an existing name. `overwrite=true`
+        // (or unenroll, which is inherently an overwrite) allows matching
+        // against named slots too.
+        let requireNewSpeaker = isNamed && !overwriteAssignedSpeakerName
         var succeeded = false
         
         if timeline.hasSegments {
@@ -297,7 +306,7 @@ public final class LSEENDDiarizer: Diarizer {
         try session.finalizeQueuedAudio()
         
         // Process enrollment audio. The new speaker will be extracted from this timeline update.
-        guard let update = try flush(progressCallback: nil),
+        guard let update = try flush(recordFrames: false, progressCallback: nil),
               !update.finalizedSegments.isEmpty
         else { return nil }
         
@@ -305,16 +314,18 @@ public final class LSEENDDiarizer: Diarizer {
         // Fallback to old speaker with the most speech if overwrites are allowed.
         var speechActivities: [Int : Float] = [:]
         for segment in update.finalizedSegments {
-            speechActivities[segment.speakerIndex, default: 0] += segment.activity
+            speechActivities[segment.speakerIndex, default: 0] += segment.activity * Float(segment.length)
         }
         
+        // Comparator is `areInIncreasingOrder` for `max(by:)`: return true
+        // when `$0 < $1`. Ordering: NEW > OLD, then by descending activity.
         let bestSlot = speechActivities.max {
             let isFirstOld = oldSlots.contains($0.key)
             let isSecondOld = oldSlots.contains($1.key)
             if isFirstOld == isSecondOld {
-                return $0.value > $1.value
+                return $0.value < $1.value
             }
-            return isSecondOld
+            return isFirstOld
         }?.key
         
         guard let bestSlot,
