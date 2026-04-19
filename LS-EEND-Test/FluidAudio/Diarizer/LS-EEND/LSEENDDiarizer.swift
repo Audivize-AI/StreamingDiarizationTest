@@ -18,7 +18,7 @@ public final class LSEENDDiarizer: Diarizer {
 
     // MARK: - Dependencies
     private var model: LSEENDModel? = nil
-    private var preprocessor: LSEENDPreprocessor? = nil
+    private var session: LSEENDSession? = nil
 
     public var timeline: DiarizerTimeline
 
@@ -32,18 +32,14 @@ public final class LSEENDDiarizer: Diarizer {
 
     private var finalized: Bool = false
 
-    /// Frames of CNN-warmup output remaining to drop before predictions map
-    /// 1:1 to real audio time. Initialized to `metadata.convDelay` at every
-    /// reset; decremented as warmup predictions are dropped from either
-    /// streaming `process()` or bulk `drainAndUpdate`.
-    private var warmupFramesRemaining: Int = 0
+    private let logger = AppLogger(category: "LSEENDDiarizer")
 
     // MARK: - Init
 
     public init(model: LSEENDModel) throws {
         self.model = model
         let metadata = model.metadata
-        self.preprocessor = try LSEENDPreprocessor(from: metadata)
+        self.session = try LSEENDSession(from: metadata)
 
         self.timeline = DiarizerTimeline(
             config: .default(
@@ -55,7 +51,6 @@ public final class LSEENDDiarizer: Diarizer {
         self.targetSampleRate = metadata.sampleRate
         self.modelFrameHz = Double(metadata.sampleRate) / Double(metadata.hopLength * metadata.subsampling)
         self.numSpeakers = metadata.maxSpeakers
-        self.warmupFramesRemaining = metadata.convDelay
         self.isAvailable = true
     }
 
@@ -74,7 +69,7 @@ public final class LSEENDDiarizer: Diarizer {
             progressHandler: progressHandler
         )
         self.model = model
-        self.preprocessor = try LSEENDPreprocessor(from: model.metadata)
+        self.session = try LSEENDSession(from: model.metadata)
         // Re-seed warmup counter + clear any prior streaming state — the
         // new model may have a different `convDelay`, so leaving stale
         // state around would mis-trim the first chunk after hot-swap.
@@ -84,7 +79,7 @@ public final class LSEENDDiarizer: Diarizer {
     // MARK: - Debug helpers (parity tests)
 
     #if DEBUG
-    /// Drive `samples` through preprocessor → STFT → log10-mel → CMN →
+    /// Drive `samples` through session → STFT → log10-mel → CMN →
     /// subsample+context stack, and return the flat `[N × featDim]`
     /// stacked features that would be fed to CoreML. Used by
     /// `testFeat345Parity` to byte-compare against the Python fixture
@@ -92,17 +87,13 @@ public final class LSEENDDiarizer: Diarizer {
     internal func debugExtractFeatures<C: Collection>(
         _ samples: C, sourceSampleRate: Double?
     ) throws -> [Float] where C.Element == Float {
-        guard let preprocessor, let model else { throw LSEENDError.notInitialized }
-        preprocessor.reset()
-        try preprocessor.enqueueAudio(
-            (samples as? [Float]) ?? Array(samples),
-            withSampleRate: sourceSampleRate
-        )
-        try preprocessor.finalize()
+        guard let session else { throw LSEENDError.notInitialized }
+        session.reset()
+        try session.enqueueAudio(samples, withSampleRate: sourceSampleRate)
+        try session.finalizeQueuedAudio()
 
-        let featDim = model.metadata.featDim
         var out: [Float] = []
-        while let input = try preprocessor.emitNextChunk() {
+        while let input = try session.emitNextChunk() {
             // `input.melFeatures` is preallocated + reused — copy out each
             // pass. Caller-allocated input arrays have tight strides, so a
             // flat read is safe (unlike model *output* arrays, which get
@@ -111,7 +102,6 @@ public final class LSEENDDiarizer: Diarizer {
                 out.append(contentsOf: buf)
             }
         }
-        _ = featDim  // exported so tests can sanity-check division
         return out
     }
     #endif
@@ -122,38 +112,14 @@ public final class LSEENDDiarizer: Diarizer {
     where C.Element == Float
     {
         guard !samples.isEmpty else { return }
-        guard let preprocessor else {
+        guard let session else {
             throw LSEENDError.notInitialized
         }
-        try preprocessor.enqueueAudio(
-            (samples as? [Float]) ?? Array(samples),
-            withSampleRate: sourceSampleRate
-        )
+        try session.enqueueAudio(samples, withSampleRate: sourceSampleRate)
     }
 
     public func process() throws -> DiarizerTimelineUpdate? {
-        guard let preprocessor, let model else {
-            throw LSEENDError.notInitialized
-        }
-
-        let chunkSize = model.metadata.chunkSize
-        let numSpeakers = model.metadata.maxSpeakers
-        var newPreds: [Float] = []
-        newPreds.reserveCapacity(preprocessor.readyChunks * numSpeakers * chunkSize)
-
-        while let input = try preprocessor.emitNextChunk() {
-            newPreds.append(contentsOf: try model.predict(from: input))
-        }
-
-        trimWarmup(&newPreds, numSpeakers: numSpeakers)
-
-        guard !newPreds.isEmpty else { return nil }
-        numFramesProcessed += newPreds.count / numSpeakers
-
-        return try timeline.addPredictions(
-            finalizedPredictions: newPreds,
-            tentativePredictions: []
-        )
+        try flush(progressCallback: nil)
     }
 
     public func process<C: Collection>(
@@ -172,7 +138,7 @@ public final class LSEENDDiarizer: Diarizer {
         finalizeOnCompletion: Bool,
         progressCallback: ((Int, Int, Int) -> Void)?
     ) throws -> DiarizerTimeline where C.Element == Float {
-        guard preprocessor != nil, model != nil else {
+        guard session != nil, model != nil else {
             throw LSEENDError.notInitialized
         }
         let keep = keepSpeakers ?? !timeline.hasSegments
@@ -193,14 +159,14 @@ public final class LSEENDDiarizer: Diarizer {
         finalizeOnCompletion: Bool,
         progressCallback: ((Int, Int, Int) -> Void)?
     ) throws -> DiarizerTimeline {
-        guard let preprocessor, model != nil else {
+        guard let session, model != nil else {
             throw LSEENDError.notInitialized
         }
         let keep = keepSpeakers ?? !timeline.hasSegments
         resetStreamingState()
         timeline.reset(keepingSpeakers: keep)
 
-        try preprocessor.enqueueAudioFile(at: audioFileURL)
+        try session.enqueueAudioFile(at: audioFileURL)
         try drainAndUpdate(
             finalizeOnCompletion: finalizeOnCompletion,
             progressCallback: progressCallback
@@ -209,43 +175,59 @@ public final class LSEENDDiarizer: Diarizer {
     }
 
     /// Shared drain path for both `processComplete` overloads. Runs
-    /// preprocessor → model → timeline, optionally finalizing the stream.
+    /// session → model → timeline, optionally finalizing the stream.
     private func drainAndUpdate(
         finalizeOnCompletion: Bool,
         progressCallback: ((Int, Int, Int) -> Void)?
     ) throws {
-        guard let preprocessor, let model else {
+        guard let session else {
             throw LSEENDError.notInitialized
         }
 
         if finalizeOnCompletion {
-            try preprocessor.finalize()
+            try session.finalizeQueuedAudio()
         }
 
-        let chunkSize = model.metadata.chunkSize
-        let numSpeakers = model.metadata.maxSpeakers
-        let totalChunks = preprocessor.readyChunks
-        var processed = 0
-        var newPreds: [Float] = []
-        newPreds.reserveCapacity(totalChunks * numSpeakers * chunkSize)
-
-        while let input = try preprocessor.emitNextChunk() {
-            newPreds.append(contentsOf: try model.predict(from: input))
-            processed += 1
-            progressCallback?(processed, totalChunks, 1)
-        }
-
-        trimWarmup(&newPreds, numSpeakers: numSpeakers)
-        numFramesProcessed += newPreds.count / numSpeakers
-        _ = try timeline.addPredictions(
-            finalizedPredictions: newPreds,
-            tentativePredictions: []
-        )
+        _ = try flush(progressCallback: progressCallback)
 
         if finalizeOnCompletion {
             timeline.finalize()
             finalized = true
         }
+    }
+
+    /// Drain all ready chunks through `model.predict` → timeline. Returns the
+    /// timeline update, or nil if the drain produced no frames. Warmup rows
+    /// are stripped per-chunk inside `model.predict` (`input.warmupFrames`),
+    /// so the accumulated stream is already 1:1 with real audio time.
+    private func flush(
+        progressCallback: ((Int, Int, Int) -> Void)?
+    ) throws -> DiarizerTimelineUpdate? {
+        guard let session, let model else {
+            throw LSEENDError.notInitialized
+        }
+
+        let chunkSize = model.metadata.chunkSize
+        let numSpeakers = model.metadata.maxSpeakers
+        let totalChunks = session.readyChunks
+
+        var processed = 0
+        var newPreds: [Float] = []
+        newPreds.reserveCapacity(totalChunks * numSpeakers * chunkSize)
+
+        while let input = try session.emitNextChunk() {
+            newPreds.append(contentsOf: try model.predict(from: input))
+            processed += 1
+            progressCallback?(processed, totalChunks, 1)
+        }
+
+        guard !newPreds.isEmpty else { return nil }
+        numFramesProcessed += newPreds.count / numSpeakers
+
+        return try timeline.addPredictions(
+            finalizedPredictions: newPreds,
+            tentativePredictions: []
+        )
     }
 
     // MARK: - Lifecycle
@@ -258,7 +240,7 @@ public final class LSEENDDiarizer: Diarizer {
     public func cleanup() {
         resetStreamingState()
         self.model = nil
-        self.preprocessor = nil
+        self.session = nil
         isAvailable = false
     }
 
@@ -268,75 +250,93 @@ public final class LSEENDDiarizer: Diarizer {
         named name: String?,
         overwritingAssignedSpeakerName overwriteAssignedSpeakerName: Bool
     ) throws -> DiarizerSpeaker? where C.Element == Float {
-        guard let metadata = model?.metadata else {
-            return nil
+        let description: String = name.map { "named '\($0)'" } ?? "(no name)"
+        guard let session else {
+            throw LSEENDError.notInitialized
         }
-        // LS-EEND attractors are learned online — there's no separable
-        // speaker-embedding head to populate from enrollment audio. Two
-        // behaviors are supported:
-        //   1) name-only: reserve the first free slot with this name, don't
-        //      touch streaming state.
-        //   2) seeded: run audio through the diarizer so KV state conditions
-        //      on it; name whichever slot fires strongest.
-        // We pick (2) when audio is provided, (1) otherwise.
-        guard let name = name else { return nil }
-
-        if samples.isEmpty {
-            return timeline.upsertSpeaker(named: name, atIndex: nil)
+        
+        let sessionSnapshot = session.takeSnapshot()
+        let timelineSnapshot = timeline.takeSnapshot()
+        let isNamed = name != nil
+        let requireNewSpeaker = !isNamed || overwriteAssignedSpeakerName
+        var succeeded = false
+        
+        if timeline.hasSegments {
+            logger.warning("Enrolling speaker mid session. The timeline will be reset if successful.")
         }
-
-        let update = try process(samples: samples, sourceSampleRate: sourceSampleRate)
-        let finalizedFrames = update?.chunkResult.finalizedPredictions ?? []
-        let maxSpk = metadata.maxSpeakers
-
-        var bestSlot = -1
-        var bestActivity: Float = -1
-        if !finalizedFrames.isEmpty {
-            let frames = finalizedFrames.count / maxSpk
-            for slot in 0..<maxSpk {
-                var sum: Float = 0
-                for f in 0..<frames {
-                    sum += finalizedFrames[f * maxSpk + slot]
-                }
-                if sum > bestActivity {
-                    bestActivity = sum
-                    bestSlot = slot
-                }
+        
+        defer {
+            if succeeded {
+                timeline.reset(keepingSpeakers: true)
+            } else {
+                session.rollback(to: sessionSnapshot)
+                timeline.rollback(to: timelineSnapshot)
             }
         }
-
-        let slot = bestSlot >= 0 ? bestSlot : nil
-        if let slot, let existing = timeline.speakers[slot], !overwriteAssignedSpeakerName,
-           existing.name != nil
-        {
-            return existing
+        
+        // Flush queued audio, including right context.
+        try session.finalizeQueuedAudio()
+        _ = try flush(progressCallback: nil)
+        
+        // Snapshot old speakers starting here after old audio has been flushed
+        let oldSlots: Set<Int>
+        
+        if isNamed {
+            oldSlots = Set(timeline.speakers.filter { $0.value.name != nil }.keys)
+        } else {
+            oldSlots = Set(timeline.speakers.keys)
         }
-        return timeline.upsertSpeaker(named: name, atIndex: slot)
+        
+        try session.enqueueAudio(
+            samples,
+            withSampleRate: sourceSampleRate,
+            eagerPreprocessing: false
+        )
+        
+        // Flush enrollment audio queued in the right context
+        try session.finalizeQueuedAudio()
+        
+        // Process enrollment audio. The new speaker will be extracted from this timeline update.
+        guard let update = try flush(progressCallback: nil),
+              !update.finalizedSegments.isEmpty
+        else { return nil }
+        
+        // Get the new/unnamed speaker with the most speech if any exist.
+        // Fallback to old speaker with the most speech if overwrites are allowed.
+        var speechActivities: [Int : Float] = [:]
+        for segment in update.finalizedSegments {
+            speechActivities[segment.speakerIndex, default: 0] += segment.activity
+        }
+        
+        let bestSlot = speechActivities.max {
+            let isFirstOld = oldSlots.contains($0.key)
+            let isSecondOld = oldSlots.contains($1.key)
+            if isFirstOld == isSecondOld {
+                return $0.value > $1.value
+            }
+            return isSecondOld
+        }?.key
+        
+        guard let bestSlot,
+              let enrolledSpeaker = timeline.speakers[bestSlot],
+              !requireNewSpeaker || !oldSlots.contains(bestSlot)
+        else {
+            return nil
+        }
+        
+        // Rename speaker and report success
+        enrolledSpeaker.name = name
+        succeeded = true
+        
+        return enrolledSpeaker
     }
 
     // MARK: - Private: state
 
     private func resetStreamingState() {
-        preprocessor?.reset()
+        session?.reset()
         numFramesProcessed = 0
         finalized = false
-        warmupFramesRemaining = model?.metadata.convDelay ?? 0
-    }
-
-    /// Drop leading warmup predictions in place. CNN right-lookahead means
-    /// the first `convDelay` model outputs have no real audio behind them
-    /// and must not reach the timeline — otherwise segment timestamps are
-    /// shifted by `convDelay · frameDurationSeconds`. Safe to call on an
-    /// empty or already-trimmed buffer.
-    private func trimWarmup(_ preds: inout [Float], numSpeakers: Int) {
-        guard warmupFramesRemaining > 0, !preds.isEmpty, numSpeakers > 0 else { return }
-        let newFrames = preds.count / numSpeakers
-        let drop = min(warmupFramesRemaining, newFrames)
-        // `drop * numSpeakers ≤ newFrames * numSpeakers ≤ preds.count`
-        // is guaranteed by the `min` above + integer-division rounding,
-        // so no defensive clamp on `removeFirst` is needed.
-        preds.removeFirst(drop * numSpeakers)
-        warmupFramesRemaining -= drop
     }
 
     // MARK: - Private: finalize
@@ -344,15 +344,14 @@ public final class LSEENDDiarizer: Diarizer {
     @discardableResult
     public func finalize() throws -> DiarizerTimelineUpdate? {
         guard !finalized else { return nil }
-        
-        guard let preprocessor, let model else {
+        guard let session else {
             throw LSEENDError.notInitialized
         }
-        
+
         // Drain pending real audio, capture real-frame target.
-        try preprocessor.finalize()
+        try session.finalizeQueuedAudio()
         let update = try process()
-        
+
         timeline.finalize()
         finalized = true
         return update
