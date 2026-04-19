@@ -257,5 +257,192 @@ public enum ANEMemoryUtils {
             }
         }
     }
+    
+    public static func strideAwareCopy<C: AccelerateBuffer>(
+        from source: C,
+        to destination: MLMultiArray
+    ) where C.Element: MLShapedArrayScalar {
+        guard source.count > 0 else { return }
+        
+        precondition(
+            C.Element.multiArrayDataType == destination.dataType,
+            "Data type mismatch: \(C.Element.self) vs. \(destination.dataType)."
+        )
+
+        precondition(
+            source.count >= destination.count,
+            "Source is too small. Expected: ≥\(destination.count), got: \(source.count)"
+        )
+        
+        precondition(
+            destination.strides.last?.intValue == 1,
+            "Destination inner-most stride must be 1. Strides: \(destination.strides)."
+        )
+        
+        let colStride = MemoryLayout<C.Element>.stride
+        
+        // Memcpy (easy path)
+        @inline(__always)
+        func memcpyFallback() {
+            _ = source.withUnsafeBufferPointer { srcBuf in
+                memcpy(
+                    destination.dataPointer,
+                    srcBuf.baseAddress,
+                    colStride * destination.count
+                )
+            }
+        }
+        
+        let rank = destination.shape.count
+        guard rank > 1 else {
+            memcpyFallback()
+            return
+        }
+        
+        let innerDim = destination.shape[rank-1].intValue
+        let rowStride = destination.strides[rank-2].intValue
+        
+        guard innerDim != rowStride else {
+            memcpyFallback()
+            return
+        }
+        
+        let outerDim = (0..<rank-1).reduce(1) { $0 * destination.shape[$1].intValue }
+        
+        source.withUnsafeBufferPointer { srcBuf in
+            switch destination.dataType {
+            case .float32, .float:
+                srcBuf.withMemoryRebound(to: Float.self) { srcPtr in
+                    let dstPtr = destination.dataPointer.assumingMemoryBound(to: Float.self)
+                    vDSP_mmov(
+                        srcPtr.baseAddress!,
+                        dstPtr,
+                        vDSP_Length(innerDim),
+                        vDSP_Length(outerDim),
+                        vDSP_Length(innerDim),
+                        vDSP_Length(rowStride)
+                    )
+                }
+            case .double:
+                srcBuf.withMemoryRebound(to: Double.self) { srcPtr in
+                    let dstPtr = destination.dataPointer.assumingMemoryBound(to: Double.self)
+                    vDSP_mmovD(
+                        srcPtr.baseAddress!,
+                        dstPtr,
+                        vDSP_Length(innerDim),
+                        vDSP_Length(outerDim),
+                        vDSP_Length(innerDim),
+                        vDSP_Length(rowStride)
+                    )
+                }
+            default:
+                let srcPtr = srcBuf.baseAddress!
+                let dstPtr = destination.dataPointer.assumingMemoryBound(to: C.Element.self)
+                let rowBytes = innerDim * colStride
+                
+                for row in 0..<outerDim {
+                    memcpy(
+                        dstPtr + row * rowStride,
+                        srcPtr + row * innerDim,
+                        rowBytes
+                    )
+                }
+            }
+        }
+    }
+    
+    public static func strideAwareCopy<C: AccelerateMutableBuffer>(
+        from source: MLMultiArray,
+        to destination: inout C
+    ) where C.Element: MLShapedArrayScalar {
+        guard destination.count > 0 else { return }
+        
+        precondition(
+            C.Element.multiArrayDataType == source.dataType,
+            "Data type mismatch: \(C.Element.self) vs. \(source.dataType)."
+        )
+
+        precondition(
+            destination.count >= source.count,
+            "Destination is too small. Expected: ≥\(source.count), got: \(destination.count)"
+        )
+        
+        precondition(
+            source.strides.last?.intValue == 1,
+            "Source inner-most stride must be 1. Strides: \(source.strides)."
+        )
+        
+        let colStride = MemoryLayout<C.Element>.stride
+        
+        // Memcpy (easy path)
+        @inline(__always)
+        func memcpyFallback() {
+            destination.withUnsafeMutableBufferPointer { dstBuf in
+                guard let dstBase = dstBuf.baseAddress else { return }
+                memcpy(
+                    dstBase,
+                    source.dataPointer,
+                    colStride * source.count
+                )
+            }
+        }
+        
+        let rank = source.shape.count
+        guard rank > 1 else {
+            memcpyFallback()
+            return
+        }
+        
+        let innerDim = source.shape[rank-1].intValue
+        let rowStride = source.strides[rank-2].intValue
+        
+        guard innerDim != rowStride else {
+            memcpyFallback()
+            return
+        }
+        
+        let outerDim = (0..<rank-1).reduce(1) { $0 * source.shape[$1].intValue }
+        
+        destination.withUnsafeMutableBufferPointer { dstBuf in
+            switch source.dataType {
+            case .float32, .float:
+                dstBuf.withMemoryRebound(to: Float.self) { dstPtr in
+                    let srcPtr = source.dataPointer.assumingMemoryBound(to: Float.self)
+                    vDSP_mmov(
+                        srcPtr,
+                        dstPtr.baseAddress!,
+                        vDSP_Length(innerDim),
+                        vDSP_Length(outerDim),
+                        vDSP_Length(rowStride),
+                        vDSP_Length(innerDim)
+                    )
+                }
+            case .double:
+                dstBuf.withMemoryRebound(to: Double.self) { dstPtr in
+                    let srcPtr = source.dataPointer.assumingMemoryBound(to: Double.self)
+                    vDSP_mmovD(
+                        srcPtr,
+                        dstPtr.baseAddress!,
+                        vDSP_Length(innerDim),
+                        vDSP_Length(outerDim),
+                        vDSP_Length(rowStride),
+                        vDSP_Length(innerDim)
+                    )
+                }
+            default:
+                let srcPtr = source.dataPointer.assumingMemoryBound(to: C.Element.self)
+                let dstPtr = dstBuf.baseAddress!
+                let rowBytes = innerDim * colStride
+                
+                for row in 0..<outerDim {
+                    memcpy(
+                        dstPtr + row * innerDim,
+                        srcPtr + row * rowStride,
+                        rowBytes
+                    )
+                }
+            }
+        }
+    }
 }
 
