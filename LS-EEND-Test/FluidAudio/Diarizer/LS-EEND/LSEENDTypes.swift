@@ -33,7 +33,9 @@ public struct LSEENDMetadata: Codable {
     public let convKernelSize: Int
     
     public var headDim: Int { nUnits / nHeads }
-    public var featDim: Int { (2 * contextSize + 1) * nMels }
+    
+    public var melFrames: Int { (chunkSize - 1) * subsampling + 2 * contextSize + 1 }
+    
     public var nFFT: Int {
         1 << (Int.bitWidth - (winLength - 1).leadingZeroBitCount)
     }
@@ -53,7 +55,7 @@ public struct LSEENDState {
         encConvCache: MLMultiArray,
         cnnWindow: MLMultiArray,
         decRetKv: MLMultiArray,
-        decRetScale: MLMultiArray,
+        decRetScale: MLMultiArray
     ) {
         self.encRetKv = encRetKv
         self.encRetScale = encRetScale
@@ -73,31 +75,18 @@ public struct LSEENDState {
         let Kcnn = NSNumber(value: 2 * metadata.convDelay)
         let nSpk = NSNumber(value: metadata.maxNspks)
         
-        self.encRetKv = try MLMultiArray(shape: [Lenc, 1, H, hd, hd], dataType: .float32)
-        self.encRetScale = try MLMultiArray(shape: [Lenc, 1], dataType: .float32)
-        self.encConvCache = try MLMultiArray(shape: [Lenc, 1, K, D], dataType: .float32)
-        self.cnnWindow = try MLMultiArray(shape: [1, D, Kcnn], dataType: .float32)
-        self.decRetKv = try MLMultiArray(shape: [Ldec, nSpk, H, hd, hd], dataType: .float32)
-        self.decRetScale = try MLMultiArray(shape: [Ldec, 1], dataType: .float32)
-        // `MLMultiArray(shape:dataType:)` does not zero its backing buffer
-        // — on cold start the model would read garbage KV / conv caches and
-        // emit NaN probs. Zero each buffer so the first chunk sees the
-        // expected identity state.
-        //
-        // `memset` against `ma.count * Float.stride` is only correct when
-        // the array has tight strides (physical layout = logical layout).
-        // Caller-allocated `MLMultiArray(shape:dataType:)` normally does,
-        // but model-output arrays get tile-padded strides (see CLAUDE.md
-        // gotcha #2) — a padded array here would leave physical-padding
-        // bytes uninitialized. The precondition catches that case loudly
-        // instead of returning NaN probs later.
-        for ma in [encRetKv, encRetScale, encConvCache, cnnWindow, decRetKv, decRetScale] {
-            precondition(
-                ma.strides.last?.intValue == 1,
-                "state tensor has non-1 innermost stride; memset-zero would miss padding bytes"
-            )
-            memset(ma.dataPointer, 0, ma.count * MemoryLayout<Float>.stride)
-        }
+        self.encRetKv = try ANEMemoryUtils.createAlignedArray(
+            shape: [Lenc, 1, H, hd, hd], dataType: .float32)
+        self.encRetScale = try ANEMemoryUtils.createAlignedArray(
+            shape: [Lenc, 1], dataType: .float32)
+        self.encConvCache = try ANEMemoryUtils.createAlignedArray(
+            shape: [Lenc, 1, K, D], dataType: .float32)
+        self.cnnWindow = try ANEMemoryUtils.createAlignedArray(
+            shape: [1, D, Kcnn], dataType: .float32)
+        self.decRetKv = try ANEMemoryUtils.createAlignedArray(
+            shape: [Ldec, nSpk, H, hd, hd], dataType: .float32)
+        self.decRetScale = try ANEMemoryUtils.createAlignedArray(
+            shape: [Ldec, 1], dataType: .float32)
     }
     
     public func copy() -> LSEENDState {
@@ -107,7 +96,7 @@ public struct LSEENDState {
             encConvCache: encConvCache.copy() as! MLMultiArray,
             cnnWindow: cnnWindow.copy() as! MLMultiArray,
             decRetKv: decRetKv.copy() as! MLMultiArray,
-            decRetScale: decRetScale.copy() as! MLMultiArray,
+            decRetScale: decRetScale.copy() as! MLMultiArray
         )
     }
     
@@ -119,6 +108,16 @@ public struct LSEENDState {
         ANEMemoryUtils.strideAwareCopy(from: decRetKv, to: dst.decRetKv)
         ANEMemoryUtils.strideAwareCopy(from: decRetScale, to: dst.decRetScale)
     }
+    
+    public func reset() {
+        clearMultiArray(encRetKv)
+        clearMultiArray(encRetScale)
+        clearMultiArray(encConvCache)
+        clearMultiArray(cnnWindow)
+        clearMultiArray(decRetKv)
+        clearMultiArray(decRetScale)
+    }
+    
 }
 
 public enum LSEENDError: Error, LocalizedError {
@@ -128,7 +127,16 @@ public enum LSEENDError: Error, LocalizedError {
     case notInitialized
 }
 
-public class LSEENDPreprocessor {
+public class LSEENDSession {
+    public struct Snapshot {
+        let state: LSEENDState
+        let melQueue: SlidingWindowBuffer
+        let audioQueue: SlidingWindowBuffer
+        let cmnMean: [Float]
+        let cmnCount: Int
+        let decoderMaskEnd: Int
+    }
+    
     /// Number of mel chunks currently ready for `emitNextChunk()`.
     public var readyChunks: Int { lock.withLock { melQueue.readyChunks } }
 
@@ -141,8 +149,10 @@ public class LSEENDPreprocessor {
 
     private var cmnMean: [Float]
     private var cmnCount: Int
+    
+    private var isRightContextEmpty: Bool = true
 
-    private var framesProcessed: Int
+    private var decoderMaskEnd: Int
 
     private let lock = NSLock()
     private let log10Scale: Float = 1.0 / log(10.0)
@@ -152,52 +162,31 @@ public class LSEENDPreprocessor {
     /// buffered real frame through STFT + mel ±context + CNN right-lookahead.
     private let flushSampleCount: Int
     private let chunkFrames: Int
-    private let chunkMels: Int
     private let nMels: Int
-    private let contextSize: Int
-    private let subsampling: Int
-    private let featDim: Int
 
-    public init(from metadata: borrowing LSEENDMetadata) throws {
+    public init(from metadata: borrowing LSEENDMetadata, restoringFrom snapshot: consuming Snapshot? = nil) throws {
         self.nMels = metadata.nMels
-        self.contextSize = metadata.contextSize
-        self.subsampling = metadata.subsampling
-        self.featDim = metadata.featDim
 
         let contextMels = metadata.contextSize
         let contextSamples = metadata.nFFT / 2
         let chunkMels = metadata.subsampling * metadata.chunkSize
         let chunkSamples = metadata.hopLength * chunkMels
+        
+        // TODO: Validate that this can't be reduced further
+        let rightSamples = metadata.nFFT / 2 - metadata.hopLength
 
         // (mel ±context + CNN right-lookahead) mels × hop + STFT last-window halfNfft
         self.flushSampleCount =
             (contextMels + metadata.convDelay * metadata.subsampling) * metadata.hopLength
             + contextSamples
-
-        self.melQueue = SlidingWindowBuffer(
-            chunkLength: chunkMels,
-            halfContextLength: contextMels,
-            stride: nMels
-        )
-        self.audioQueue = SlidingWindowBuffer(
-            chunkLength: chunkSamples,
-            halfContextLength: contextSamples,
-            stride: 1
-        )
         
-        self.cmnMean = .init(repeating: 0, count: nMels)
-        self.cmnCount = 0
-        
-        self.framesProcessed = 0
         self.chunkFrames = metadata.chunkSize
-        self.chunkMels = chunkMels
-        self.decoderMask = (Array(repeating: 0, count: metadata.convDelay) +
-                            Array(repeating: 1, count: metadata.chunkSize))
         
+        var decoderMaskTemp = Array<Float>(repeating: 1, count: metadata.convDelay + metadata.chunkSize)
+        vDSP_vclr(&decoderMaskTemp, 1, vDSP_Length(metadata.convDelay))
+        self.decoderMask = decoderMaskTemp
         
-        // Initialize preprocessor and converter
-        self.input = try LSEENDInput(from: metadata)
-        
+        // Initialize processors
         self.melSpectrogram = AudioMelSpectrogram(
             sampleRate: metadata.sampleRate,
             nMels: metadata.nMels,
@@ -212,6 +201,35 @@ public class LSEENDPreprocessor {
         )
         
         self.converter = AudioConverter(sampleRate: Double(metadata.sampleRate))
+        
+        // Initialize state
+        if let snapshot {
+            self.melQueue = snapshot.melQueue
+            self.audioQueue = snapshot.audioQueue
+            self.cmnMean = snapshot.cmnMean
+            self.cmnCount = snapshot.cmnCount
+            self.decoderMaskEnd = snapshot.decoderMaskEnd
+        } else {
+            self.melQueue = SlidingWindowBuffer(
+                chunkLength: chunkMels,
+                leftContextLength: contextMels,
+                rightContextLength: contextMels + 1 - metadata.subsampling,
+                stride: nMels
+            )
+            self.audioQueue = SlidingWindowBuffer(
+                chunkLength: chunkSamples,
+                leftContextLength: contextSamples,
+                rightContextLength: rightSamples,
+                stride: 1
+            )
+            
+            self.cmnMean = .init(repeating: 0, count: nMels)
+            self.cmnCount = 0
+            self.decoderMaskEnd = 0
+            
+            // Initialize preprocessor and converter
+            self.input = try LSEENDInput(from: metadata)
+        }
     }
     
     /// Clear preprocessor buffers + model recurrence state + frame counter.
@@ -220,7 +238,7 @@ public class LSEENDPreprocessor {
         defer { lock.unlock() }
         vDSP.fill(&cmnMean, with: 0)
         cmnCount = 0
-        framesProcessed = 0
+        decoderMaskEnd = 0
         audioQueue.reset()
         melQueue.reset()
         input.reset()
@@ -231,20 +249,24 @@ public class LSEENDPreprocessor {
     ///   - samples: Audio samples to enqueue
     ///   - sourceSampleRate: Sample rate of audio input
     ///   - eagerPreprocessing: Whether to eagerly feed audio chunks to the mel spectrogram
-    public func enqueueAudio(
-        _ samples: [Float],
+    public func enqueueAudio<C: Collection>(
+        _ samples: C,
         withSampleRate sourceSampleRate: Double? = nil,
         eagerPreprocessing: Bool = true
-    ) throws {
+    ) throws where C.Element == Float {
         lock.lock()
         defer { lock.unlock() }
-        
+
         if let sourceSampleRate {
-            try audioQueue.append(converter.resample(samples, from: sourceSampleRate))
+            // `converter.resample` requires `[Float]`; unavoidable copy on
+            // this branch. The no-resample branch stays copy-free via
+            // `audioQueue.append`'s own `<C: Collection>` generic.
+            let array = (samples as? [Float]) ?? Array(samples)
+            try audioQueue.append(converter.resample(array, from: sourceSampleRate))
         } else {
             audioQueue.append(samples)
         }
-        
+
         if eagerPreprocessing {
             flushAudioQueue()
         }
@@ -269,117 +291,100 @@ public class LSEENDPreprocessor {
     ///
     /// Call once per stream. Re-enqueuing audio after finalize requires
     /// `reset()` first.
-    public func finalize() throws {
+    public func finalizeQueuedAudio(flush: Bool = true) throws {
         lock.lock()
         defer { lock.unlock() }
 
         // 1. Trailing silence covering STFT + mel ±context + CNN right-lookahead.
-        audioQueue.append([Float](repeating: 0, count: flushSampleCount))
+        audioQueue.append(repeatElement(0, count: flushSampleCount))
 
         // 2. Round up to the next audio-chunk boundary so popAllChunks consumes
         //    every real sample plus the silence we just pushed.
-        let unread = audioQueue.unreadSize
-        let chunk  = audioQueue.chunkSize
-        let ctx    = audioQueue.contextSize
+        let unread = audioQueue.unreadFloats
+        let chunk  = audioQueue.chunkFloats
+        let ctx    = audioQueue.contextFloats
         let overCtx = max(0, unread - ctx)
         let shortfall = (chunk - overCtx % chunk) % chunk
         if shortfall > 0 {
-            audioQueue.append([Float](repeating: 0, count: shortfall))
+            audioQueue.append(repeatElement(0, count: shortfall))
         }
 
         // 3. Drain audioQueue → STFT → log10 → CMN → melQueue.
-        flushAudioQueue()
+        if flush {
+            flushAudioQueue()            
+        }
     }
     
-    /// Read the next chunk from the mel thingy
+    /// Read the next chunk from the mel
     public func emitNextChunk() throws -> LSEENDInput? {
         lock.lock()
         defer { lock.unlock() }
 
         flushAudioQueue()
         guard let rawChunk = melQueue.popNextChunk() else { return nil }
+        
+        // Advance decoder mask
+        decoderMaskEnd = min(decoderMaskEnd + chunkFrames, decoderMask.count)
 
-        defer {
-            framesProcessed += chunkFrames
-            framesProcessed = min(framesProcessed, decoderMask.count - chunkFrames)
-        }
-
-        // `rawChunk` layout: `(chunkMels + 2·contextSize) * nMels` floats —
-        // 7 left-context + 10 advance + 7 right-context frames for dih3
-        // (`chunkFrames=1, subsampling=10, contextSize=7`).
-        // For each of the `chunkFrames` output frames k, stack the 15-frame
-        // window `[k·subsampling … k·subsampling + 2·contextSize]`
-        // (inclusive) → `featDim` floats. Left context of the popped chunk
-        // lines up so output k=0 starts at raw-frame offset 0. Model input
-        // expects `[1, chunkFrames, featDim]` = `chunkFrames·featDim` floats.
-        var stacked = [Float](repeating: 0, count: chunkFrames * featDim)
-        let windowMels = 2 * contextSize + 1
-        rawChunk.withUnsafeBufferPointer { srcBuf in
-            stacked.withUnsafeMutableBufferPointer { dstBuf in
-                guard let src = srcBuf.baseAddress, let dst = dstBuf.baseAddress else { return }
-                for k in 0..<chunkFrames {
-                    let srcFrame = k * subsampling
-                    memcpy(
-                        dst.advanced(by: k * featDim),
-                        src.advanced(by: srcFrame * nMels),
-                        windowMels * nMels * MemoryLayout<Float>.stride
-                    )
-                }
-            }
-        }
-
-        // loadInputs is generic on a single `C: AccelerateBuffer` — both
-        // arguments must share the same concrete type. `decoderMask[...]`
-        // is `ArraySlice<Float>`; slice `stacked` the same way.
         try input.loadInputs(
-            melFeatures: stacked[...],
-            decoderMask: decoderMask[framesProcessed..<framesProcessed + chunkFrames]
+            melFeatures: rawChunk,
+            decoderMask: decoderMask[decoderMaskEnd-chunkFrames..<decoderMaskEnd],
+            warmupFrames: min(decoderMask.count - decoderMaskEnd, chunkFrames)
         )
 
         return input
     }
-        
+    
+    public func takeSnapshot() -> Snapshot {
+        return Snapshot(
+            state: input.state.copy(),
+            melQueue: melQueue,
+            audioQueue: audioQueue,
+            cmnMean: cmnMean,
+            cmnCount: cmnCount,
+            decoderMaskEnd: decoderMaskEnd
+        )
+    }
+    
+    public func rollback(to snapshot: consuming Snapshot, keepingState: Bool = false)  {
+        if !keepingState { self.input.state = snapshot.state }
+        self.melQueue = snapshot.melQueue
+        self.audioQueue = snapshot.audioQueue
+        self.cmnMean = snapshot.cmnMean
+        self.cmnCount = snapshot.cmnCount
+        self.decoderMaskEnd = snapshot.decoderMaskEnd
+    }
+    
     private func flushAudioQueue() {
-        // One audio `popNextChunk` → exactly `chunkMels` mel frames. Using
-        // `popAllChunks` here is wrong: the entire pending audio comes back
-        // as one slice, but `computeFlatTransposed(expectedFrameCount:)`
-        // truncates the output to `chunkMels` frames and discards the rest.
-        // Loop per-chunk so every enqueued chunk gets drained.
-        while let audioChunk = audioQueue.popNextChunk() {
-            // .prePadded emits (L - nFFT)/hop + 1 frames; our audio pop is
-            // one hop wider than librosa needs, so pin the count to the
-            // expected chunkMels per pop. Trailing samples reappear in the
-            // next pop via the standard inter-chunk overlap.
-            var (melFeats, melFrames, _) = melSpectrogram.computeFlatTransposed(
-                audio: audioChunk,
-                lastAudioSample: 0,
-                paddingMode: .prePadded,
-                expectedFrameCount: chunkMels
-            )
+        guard let audioChunk = audioQueue.popAllChunks() else { return }
 
-            // Rescale to use log10 instead of ln
-            var scale = log10Scale
-            vDSP_vsmul(melFeats, 1, &scale, &melFeats, 1, vDSP_Length(melFrames * nMels))
+        var (melFeats, melFrames, _) = melSpectrogram.computeFlatTransposed(
+            audio: audioChunk,
+            lastAudioSample: 0,
+            paddingMode: .prePadded,
+            expectedFrameCount: nil
+        )
 
-            // Cumulative mean normalization
-            melFeats.withUnsafeMutableBufferPointer { melFeatsBuffer in
-                let melFrameLength = vDSP_Length(nMels)
-                guard let melBase = melFeatsBuffer.baseAddress else { return }
+        // Rescale to use log10 instead of ln
+        var scale = log10Scale
+        vDSP_vsmul(melFeats, 1, &scale, &melFeats, 1, vDSP_Length(melFrames * nMels))
 
-                for melFrame in stride(from: melBase, to: melBase + melFeatsBuffer.count, by: nMels) {
-                    // µ[k+1] = µ[k] + (mel[k+1] - µ[k]) * 1/(k+1)
-                    cmnCount += 1
-                    var alpha = 1.0 / Float(cmnCount)
-                    vDSP_vintb(cmnMean, 1, melFrame, 1, &alpha, &cmnMean, 1, melFrameLength)
-                    // mel[k+1] <- mel[k+1] - µ[k+1].
-                    // vDSP_vsub(A,_,B,_,C,_,N) computes C = B - A, so A is
-                    // `cmnMean` and B is `melFrame` for a `mel - µ` result.
-                    vDSP_vsub(cmnMean, 1, melFrame, 1, melFrame, 1, melFrameLength)
-                }
+        // Cumulative mean normalization — sequential by definition.
+        melFeats.withUnsafeMutableBufferPointer { melFeatsBuffer in
+            let melFrameLength = vDSP_Length(nMels)
+            guard let melBase = melFeatsBuffer.baseAddress else { return }
+
+            for melFrame in stride(from: melBase, to: melBase + melFeatsBuffer.count, by: nMels) {
+                // µ[k] = µ[k-1] + (mel[k] - µ[k-1]) * 1 / k
+                cmnCount += 1
+                var alpha = 1.0 / Float(cmnCount)
+                vDSP_vintb(cmnMean, 1, melFrame, 1, &alpha, &cmnMean, 1, melFrameLength)
+                // mel[k] <- mel[k] - µ[k]. vDSP_vsub(A,_,B,_,C,_,N) is C = B - A.
+                vDSP_vsub(cmnMean, 1, melFrame, 1, melFrame, 1, melFrameLength)
             }
-
-            melQueue.append(consume melFeats)
         }
+
+        melQueue.append(consume melFeats)
     }
 }
 
@@ -387,7 +392,7 @@ public class LSEENDInput: MLFeatureProvider {
     var state: LSEENDState
     let melFeatures: MLMultiArray
     let decoderMask: MLMultiArray
-    private let metadata: LSEENDMetadata
+    var warmupFrames: Int = 0
 
     public var featureNames: Set<String> {[
         "features",
@@ -398,58 +403,31 @@ public class LSEENDInput: MLFeatureProvider {
     ]}
 
     public init(from metadata: LSEENDMetadata) throws {
-        self.metadata = metadata
-        self.state = try .init(from: metadata)
+        self.state = try LSEENDState(from: metadata)
         let T = NSNumber(value: metadata.chunkSize)
-        let F = NSNumber(value: metadata.featDim)
-        self.melFeatures = try MLMultiArray(shape: [1, T, F], dataType: .float32)
+        let M = NSNumber(value: metadata.melFrames)
+        let N = NSNumber(value: metadata.nMels)
+        self.melFeatures = try MLMultiArray(shape: [1, M, N], dataType: .float32)
         self.decoderMask = try MLMultiArray(shape: [T], dataType: .float32)
     }
 
-    /// Reset state + input buffers for a fresh stream. State is re-allocated
-    /// (rather than memset) because after the first `predict()` the state
-    /// arrays are CoreML-vended and may have non-contiguous strides —
-    /// a flat memset would only zero a prefix.
-    /// `try!` is acceptable here: shapes are fixed from metadata, so failure
-    /// can only come from OOM, which is not recoverable.
+    /// Reset state + input buffers for a fresh stream.
     public func reset() {
-        state = try! LSEENDState(from: metadata)
-        memset(melFeatures.dataPointer, 0, melFeatures.count * MemoryLayout<Float>.stride)
-        memset(decoderMask.dataPointer, 0, decoderMask.count * MemoryLayout<Float>.stride)
+        state.reset()
+        clearMultiArray(melFeatures)
+        clearMultiArray(decoderMask)
     }
     
+    @inline(__always)
     public func loadInputs<C: AccelerateBuffer>(
         melFeatures newMelFeatures: C,
-        decoderMask newDecoderMask: C
+        decoderMask newDecoderMask: C,
+        warmupFrames: Int? = nil
     ) throws where C.Element == Float {
-        try loadMelFeatures(from: newMelFeatures)
-        try loadDecoderMask(from: newDecoderMask)
-    }
-    
-    public func loadDecoderMask<C: AccelerateBuffer>(from newDecoderMask: C) throws
-    where C.Element == Float {
-        guard newDecoderMask.count == decoderMask.count else {
-            throw LSEENDError.invalidInputSize(
-                "decoder mask input size mismatch: new=\(newDecoderMask.count) expected=\(decoderMask.count)")
-        }
-        
-        _ = newDecoderMask.withUnsafeBufferPointer { maskPtr in
-            memcpy(decoderMask.dataPointer, maskPtr.baseAddress,
-                   maskPtr.count * MemoryLayout<Float>.stride)
-        }
-    }
-    
-    public func loadMelFeatures<C: AccelerateBuffer>(from newMelFeatures: C) throws
-    where C.Element == Float {
-        guard newMelFeatures.count == melFeatures.count else {
-            throw LSEENDError.invalidInputSize(
-                "mel features input size mismatch: new=\(newMelFeatures.count) expected=\(melFeatures.count)")
-        }
-        
-        _ = newMelFeatures.withUnsafeBufferPointer { melPtr in
-            memcpy(melFeatures.dataPointer, melPtr.baseAddress,
-                   melPtr.count * MemoryLayout<Float>.stride)
-        }
+        try Self.load(decoderMask, from: newDecoderMask)
+        try Self.load(melFeatures, from: newMelFeatures)
+        self.warmupFrames = warmupFrames ??
+            newDecoderMask.withUnsafeBufferPointer { $0.count(where: \.isZero) }
     }
     
     public func featureValue(for featureName: String) -> MLFeatureValue? {
@@ -465,6 +443,22 @@ public class LSEENDInput: MLFeatureProvider {
         default: return nil
         }
     }
+    
+    @inline(__always)
+    private static func load<C: AccelerateBuffer>(
+        _ multiArray: MLMultiArray,
+        from buffer: C,
+    ) throws {
+        guard buffer.count == multiArray.count else {
+            throw LSEENDError.invalidInputSize(
+                "Input size mismatch: new=\(buffer.count) expected=\(multiArray.count)")
+        }
+        
+        _ = buffer.withUnsafeBufferPointer { buf in
+            memcpy(multiArray.dataPointer, buf.baseAddress,
+                   buf.count * MemoryLayout<Float>.stride)
+        }
+    }
 }
 
 
@@ -472,82 +466,110 @@ public class LSEENDInput: MLFeatureProvider {
 struct SlidingWindowBuffer {
     /// Stride between elements if features are n-dimensional arrays
     let stride: Int
-    
-    /// Context size
-    let contextSize: Int
-    
+
+    /// Total context size in floats (`leftContextFloats + rightContextFloats`).
+    /// Kept as a single value so `popAllChunks` / `readyChunks` arithmetic
+    /// (`unreadSize - contextSize`) stays correct under the asymmetric split.
+    let contextFloats: Int
+
     /// Unpadded chunk size
-    let chunkSize: Int
+    let chunkFloats: Int
+
+    /// Padded chunk size — width of a `popNextChunk` / `popAllChunks` slice.
+    let paddedChunkFloats: Int
     
-    /// Padded chunk size
-    let paddedChunkSize: Int
-    
+    /// Whether the buffer is empty
+    var isEmpty: Bool { buffer.isEmpty }
+
+    /// Pre-pad width in floats — how many leading zeros are seeded at init
+    /// and restored by `reset()`. Under the asymmetric left/right split this
+    /// equals `leftContextFloats`; `contextSize / 2` would be wrong when
+    /// left ≠ right.
+    private let leftContextFloats: Int
+
     /// Number of unread floats
-    public var unreadSize: Int { buffer.count - head }
-    
+    public var unreadFloats: Int { buffer.count - head }
+
     /// Number of full chunks currently poppable via `popNextChunk` / `popAllChunks`.
-    public var readyChunks: Int { max(0, (unreadSize - contextSize) / chunkSize) }
-    
-    /// Start index/index offset
-    private var offset: Int
-    
+    public var readyChunks: Int { max(0, (unreadFloats - contextFloats) / chunkFloats) }
+
     /// Next index at which to start processing
     private var head: Int
-    
+
     /// Data buffer
     private var buffer: [Float] = []
-    
+
+    /// Whether a chunk is ready
     public var hasChunk: Bool {
-        buffer.count - head >= paddedChunkSize
+        buffer.count - head >= paddedChunkFloats
     }
-    
-    public init(chunkLength: Int, halfContextLength: Int, stride: Int) {
+
+    /// Asymmetric left/right context. `rightContextLength` may be negative,
+    /// in which case `head` advances past the popped slice by
+    /// `-rightContextLength` strides each pop — useful when the consumer's
+    /// per-window read is shorter than the advance block. Caller must ensure
+    /// `leftContextLength + rightContextLength >= 0` so `contextFloats`
+    /// (used by `readyChunks` / `popAllChunks`) stays non-negative.
+    public init(
+        chunkLength: Int,
+        leftContextLength: Int,
+        rightContextLength: Int,
+        stride: Int
+    ) {
         self.stride = stride
-        self.chunkSize = chunkLength * stride
-        self.contextSize = 2 * halfContextLength * stride
-        self.paddedChunkSize = chunkSize + contextSize
-        
+        self.chunkFloats = chunkLength * stride
+        self.leftContextFloats = leftContextLength * stride
+        self.contextFloats = (leftContextLength + rightContextLength) * stride
+        self.paddedChunkFloats = chunkFloats + contextFloats
+
         self.head = 0
-        self.offset = 0
-        
-        self.buffer.reserveCapacity(paddedChunkSize * 2)
-        self.buffer.append(contentsOf: repeatElement(0, count: contextSize / 2))
+
+        self.buffer.reserveCapacity(paddedChunkFloats * 2)
+        self.buffer.append(contentsOf: repeatElement(0, count: leftContextFloats))
     }
-    
-    public mutating func append(_ newElements: [Float]) {
+
+    public mutating func append<C: Collection>(_ newElements: C)
+    where C.Element == Float {
         // Lazy trimming
         if buffer.count + newElements.count > buffer.capacity {
             buffer.removeFirst(head)
-            offset += head
             head = 0
         }
-        
+
         // Allow Swift to reserve more memory if needed after the trimming
         buffer.append(contentsOf: newElements)
     }
-    
+
     /// Pop the last chunk
     public mutating func popNextChunk() -> ArraySlice<Float>? {
         guard hasChunk else { return nil }
-        let result = buffer[head..<head+paddedChunkSize]
-        head += chunkSize
+        let result = buffer[head..<head+paddedChunkFloats]
+        head += chunkFloats
         return result
     }
-    
-    /// Pop all availables chunk as one buffer
+
+    /// Pop all available chunks as one buffer
     public mutating func popAllChunks() -> ArraySlice<Float>? {
         guard hasChunk else { return nil }
-        let newHead = head + (buffer.count - head - contextSize) / chunkSize * chunkSize
-        let result = buffer[head..<newHead+contextSize]
+        let newHead = head + (buffer.count - head - contextFloats) / chunkFloats * chunkFloats
+        let result = buffer[head..<newHead+contextFloats]
         head = newHead
         return result
     }
-    
+
     /// Reset buffer
     public mutating func reset() {
         self.head = 0
-        self.offset = 0
         self.buffer.removeAll(keepingCapacity: true)
-        self.buffer.append(contentsOf: repeatElement(0, count: contextSize / 2))
+        self.buffer.append(contentsOf: repeatElement(0, count: leftContextFloats))
+    }
+}
+
+
+@inline(__always)
+private func clearMultiArray(_ buffer: MLMultiArray) {
+    buffer.withUnsafeMutableBufferPointer(ofType: Float.self) { buf, strides in
+        guard let base = buf.baseAddress else { return }
+        vDSP_vclr(base, 1, vDSP_Length(buf.count))
     }
 }
