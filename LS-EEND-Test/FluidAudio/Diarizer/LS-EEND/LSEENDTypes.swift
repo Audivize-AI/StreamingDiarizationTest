@@ -90,13 +90,20 @@ public struct LSEENDState {
     }
     
     public func copy() -> LSEENDState {
-        LSEENDState(
-            encRetKv: encRetKv.copy() as! MLMultiArray,
-            encRetScale: encRetScale.copy() as! MLMultiArray,
-            encConvCache: encConvCache.copy() as! MLMultiArray,
-            cnnWindow: cnnWindow.copy() as! MLMultiArray,
-            decRetKv: decRetKv.copy() as! MLMultiArray,
-            decRetScale: decRetScale.copy() as! MLMultiArray
+        func clone(_ src: MLMultiArray) -> MLMultiArray {
+            let dst = try! ANEMemoryUtils.createAlignedArray(
+                shape: src.shape, dataType: src.dataType
+            )
+            ANEMemoryUtils.strideAwareCopy(from: src, to: dst)
+            return dst
+        }
+        return LSEENDState(
+            encRetKv: clone(encRetKv),
+            encRetScale: clone(encRetScale),
+            encConvCache: clone(encConvCache),
+            cnnWindow: clone(cnnWindow),
+            decRetKv: clone(decRetKv),
+            decRetScale: clone(decRetScale)
         )
     }
     
@@ -337,17 +344,21 @@ public class LSEENDSession {
     }
     
     public func takeSnapshot() -> Snapshot {
-        return Snapshot(
-            state: input.state.copy(),
-            melQueue: melQueue,
-            audioQueue: audioQueue,
-            cmnMean: cmnMean,
-            cmnCount: cmnCount,
-            decoderMaskEnd: decoderMaskEnd
-        )
+        lock.withLock {
+            Snapshot(
+                state: input.state.copy(),
+                melQueue: melQueue,
+                audioQueue: audioQueue,
+                cmnMean: cmnMean,
+                cmnCount: cmnCount,
+                decoderMaskEnd: decoderMaskEnd
+            )
+        }
     }
     
     public func rollback(to snapshot: consuming Snapshot, keepingState: Bool = false)  {
+        lock.lock()
+        defer { lock.unlock() }
         if !keepingState { self.input.state = snapshot.state }
         self.melQueue = snapshot.melQueue
         self.audioQueue = snapshot.audioQueue
