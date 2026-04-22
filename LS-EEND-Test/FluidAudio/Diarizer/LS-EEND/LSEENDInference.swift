@@ -1,10 +1,3 @@
-//
-//  LSEENDModels.swift
-//  LS-EEND-Test
-//
-//  Created by Benjamin Lee on 4/16/26.
-//
-
 import Foundation
 import CoreML
 import Accelerate
