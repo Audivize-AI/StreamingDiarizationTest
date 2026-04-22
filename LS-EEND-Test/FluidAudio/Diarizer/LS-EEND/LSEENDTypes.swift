@@ -13,27 +13,51 @@ import Accelerate
 public typealias LSEENDVariant = ModelNames.LSEEND.Variant
 public typealias LSEENDStepSize = ModelNames.LSEEND.StepSize
 
+// MARK: - Metadata
 
 public struct LSEENDMetadata: Codable {
+    /// Number of output frames to process per model call
     public let chunkSize: Int
+    
+    /// Duration of output frames in seconds
     public let frameDurationSeconds: Float
+    
+    /// Max output speakers
     public let maxSpeakers: Int
+    
+    /// Required audio sample rate
     public let sampleRate: Int
+    
+    /// Number of attractors. Not output speakers
     public let maxNspks: Int
+    
+    /// Mel hop length
     public let hopLength: Int
+    
+    /// Mel window length
     public let winLength: Int
+    
+    /// Number of mel features
     public let nMels: Int
+    
+    /// Number of mel context frames per output frame
     public let contextSize: Int
+    
+    /// Mel -> prediction subsampling
     public let subsampling: Int
+    
+    /// Number of right context output frames
     public let convDelay: Int
+    
+    // Model structure
     public let nUnits: Int
     public let nHeads: Int
     public let encNLayers: Int
     public let decNLayers: Int
     public let convKernelSize: Int
-    
     public var headDim: Int { nUnits / nHeads }
     
+    /// Mel frames per chunk
     public var melFrames: Int { (chunkSize - 1) * subsampling + 2 * contextSize + 1 }
     
     public var nFFT: Int {
@@ -41,104 +65,12 @@ public struct LSEENDMetadata: Codable {
     }
 }
 
-public struct LSEENDState {
-    public var encRetKv: MLMultiArray
-    public var encRetScale: MLMultiArray
-    public var encConvCache: MLMultiArray
-    public var cnnWindow: MLMultiArray
-    public var decRetKv: MLMultiArray
-    public var decRetScale: MLMultiArray
-    
-    public init(
-        encRetKv: MLMultiArray,
-        encRetScale: MLMultiArray,
-        encConvCache: MLMultiArray,
-        cnnWindow: MLMultiArray,
-        decRetKv: MLMultiArray,
-        decRetScale: MLMultiArray
-    ) {
-        self.encRetKv = encRetKv
-        self.encRetScale = encRetScale
-        self.encConvCache = encConvCache
-        self.cnnWindow = cnnWindow
-        self.decRetKv = decRetKv
-        self.decRetScale = decRetScale
-    }
-    
-    public init(from metadata: borrowing LSEENDMetadata) throws {
-        let Lenc = NSNumber(value: metadata.encNLayers)
-        let Ldec = NSNumber(value: metadata.decNLayers)
-        let H = NSNumber(value: metadata.nHeads)
-        let hd = NSNumber(value: metadata.headDim)
-        let D = NSNumber(value: metadata.nUnits)
-        let K = NSNumber(value: metadata.convKernelSize)
-        let Kcnn = NSNumber(value: 2 * metadata.convDelay)
-        let nSpk = NSNumber(value: metadata.maxNspks)
-        
-        self.encRetKv = try ANEMemoryUtils.createAlignedArray(
-            shape: [Lenc, 1, H, hd, hd], dataType: .float32)
-        self.encRetScale = try ANEMemoryUtils.createAlignedArray(
-            shape: [Lenc, 1], dataType: .float32)
-        self.encConvCache = try ANEMemoryUtils.createAlignedArray(
-            shape: [Lenc, 1, K, D], dataType: .float32)
-        self.cnnWindow = try ANEMemoryUtils.createAlignedArray(
-            shape: [1, D, Kcnn], dataType: .float32)
-        self.decRetKv = try ANEMemoryUtils.createAlignedArray(
-            shape: [Ldec, nSpk, H, hd, hd], dataType: .float32)
-        self.decRetScale = try ANEMemoryUtils.createAlignedArray(
-            shape: [Ldec, 1], dataType: .float32)
-    }
-    
-    public func copy() -> LSEENDState {
-        func clone(_ src: MLMultiArray) -> MLMultiArray {
-            let dst = try! ANEMemoryUtils.createAlignedArray(
-                shape: src.shape, dataType: src.dataType
-            )
-            ANEMemoryUtils.strideAwareCopy(from: src, to: dst)
-            return dst
-        }
-        return LSEENDState(
-            encRetKv: clone(encRetKv),
-            encRetScale: clone(encRetScale),
-            encConvCache: clone(encConvCache),
-            cnnWindow: clone(cnnWindow),
-            decRetKv: clone(decRetKv),
-            decRetScale: clone(decRetScale)
-        )
-    }
-    
-    public func copy(to dst: inout LSEENDState) {
-        ANEMemoryUtils.strideAwareCopy(from: encRetKv, to: dst.encRetKv)
-        ANEMemoryUtils.strideAwareCopy(from: encRetScale, to: dst.encRetScale)
-        ANEMemoryUtils.strideAwareCopy(from: encConvCache, to: dst.encConvCache)
-        ANEMemoryUtils.strideAwareCopy(from: cnnWindow, to: dst.cnnWindow)
-        ANEMemoryUtils.strideAwareCopy(from: decRetKv, to: dst.decRetKv)
-        ANEMemoryUtils.strideAwareCopy(from: decRetScale, to: dst.decRetScale)
-    }
-    
-    public func reset() {
-        clearMultiArray(encRetKv)
-        clearMultiArray(encRetScale)
-        clearMultiArray(encConvCache)
-        clearMultiArray(cnnWindow)
-        clearMultiArray(decRetKv)
-        clearMultiArray(decRetScale)
-    }
-    
-}
-
-public enum LSEENDError: Error, LocalizedError {
-    case initializationFailed(String)
-    case inferenceFailed(String)
-    case invalidInputSize(String)
-    case notInitialized
-}
-
-public class LSEENDSession {
-    public struct Snapshot {
+// MARK: - Feature Provider
+public class LSEENDFeatureProvider {
+    public struct Snapshot: ~Copyable {
         let state: LSEENDState
-        let melQueue: SlidingWindowBuffer
-        let audioQueue: SlidingWindowBuffer
+        let melQueue: StreamingChunkQueue
+        let audioQueue: StreamingChunkQueue
         let cmnMean: [Float]
         let cmnCount: Int
         let decoderMaskEnd: Int
@@ -146,13 +78,15 @@ public class LSEENDSession {
     
     /// Number of mel chunks currently ready for `emitNextChunk()`.
     public var readyChunks: Int { lock.withLock { melQueue.readyChunks } }
-
+    
+    // MARK: Private Attributes
+    
     private let melSpectrogram: AudioMelSpectrogram
     private let converter: AudioConverter
     private let input: LSEENDInput
 
-    private var melQueue: SlidingWindowBuffer
-    private var audioQueue: SlidingWindowBuffer
+    private var melQueue: StreamingChunkQueue
+    private var audioQueue: StreamingChunkQueue
 
     private var cmnMean: [Float]
     private var cmnCount: Int
@@ -171,7 +105,11 @@ public class LSEENDSession {
     private let chunkFrames: Int
     private let nMels: Int
 
-    public init(from metadata: borrowing LSEENDMetadata, restoringFrom snapshot: consuming Snapshot? = nil) throws {
+    // MARK: - Init
+    public init(
+        from metadata: borrowing LSEENDMetadata,
+        restoringFrom snapshot: consuming Snapshot? = nil
+    ) throws {
         self.nMels = metadata.nMels
 
         let contextMels = metadata.contextSize
@@ -214,15 +152,15 @@ public class LSEENDSession {
             self.cmnMean = snapshot.cmnMean
             self.cmnCount = snapshot.cmnCount
             self.decoderMaskEnd = snapshot.decoderMaskEnd
-            self.input = try LSEENDInput(from: metadata, state: snapshot.state)
+            self.input = try LSEENDInput(from: metadata, state: consume snapshot.state)
         } else {
-            self.melQueue = SlidingWindowBuffer(
+            self.melQueue = StreamingChunkQueue(
                 chunkLength: chunkMels,
                 leftContextLength: contextMels,
                 rightContextLength: contextMels + 1 - metadata.subsampling,
                 stride: nMels
             )
-            self.audioQueue = SlidingWindowBuffer(
+            self.audioQueue = StreamingChunkQueue(
                 chunkLength: chunkSamples,
                 leftContextLength: contextSamples,
                 rightContextLength: rightSamples,
@@ -238,17 +176,7 @@ public class LSEENDSession {
         }
     }
     
-    /// Clear preprocessor buffers + model recurrence state + frame counter.
-    public func reset() {
-        lock.lock()
-        defer { lock.unlock() }
-        vDSP.fill(&cmnMean, with: 0)
-        cmnCount = 0
-        decoderMaskEnd = 0
-        audioQueue.reset()
-        melQueue.reset()
-        input.reset()
-    }
+    // MARK: - Push Audio
     
     /// Add audio to the processing queue
     /// - Parameters:
@@ -264,9 +192,6 @@ public class LSEENDSession {
         defer { lock.unlock() }
 
         if let sourceSampleRate {
-            // `converter.resample` requires `[Float]`; unavoidable copy on
-            // this branch. The no-resample branch stays copy-free via
-            // `audioQueue.append`'s own `<C: Collection>` generic.
             let array = (samples as? [Float]) ?? Array(samples)
             try audioQueue.append(converter.resample(array, from: sourceSampleRate))
         } else {
@@ -274,7 +199,7 @@ public class LSEENDSession {
         }
 
         if eagerPreprocessing {
-            flushAudioQueue()
+            processAudioQueue()
         }
     }
     
@@ -287,17 +212,13 @@ public class LSEENDSession {
         lock.lock()
         defer { lock.unlock() }
         audioQueue.append(samples)
-        flushAudioQueue()
+        processAudioQueue()
         return samples.count
     }
 
-    /// Drain all buffered real audio through STFT + CMN → melQueue by
-    /// appending enough trailing silence to satisfy STFT, mel ±context, and
-    /// CNN right-lookahead. Caller then drains `emitNextChunk()` until nil.
-    ///
-    /// Call once per stream. Re-enqueuing audio after finalize requires
-    /// `reset()` first.
-    public func finalizeQueuedAudio(flush: Bool = true) throws {
+    /// Add silence to push all queued audio out of the right context
+    /// - Parameter flush Whether to flush the queued audio into the mel spectrogram preprocessor
+    public func drainRightContextWithSilence(flush: Bool = true) throws {
         lock.lock()
         defer { lock.unlock() }
 
@@ -317,16 +238,18 @@ public class LSEENDSession {
 
         // 3. Drain audioQueue → STFT → log10 → CMN → melQueue.
         if flush {
-            flushAudioQueue()            
+            processAudioQueue()            
         }
     }
+    
+    // MARK: - Read Chunk
     
     /// Read the next chunk from the mel
     public func emitNextChunk() throws -> LSEENDInput? {
         lock.lock()
         defer { lock.unlock() }
 
-        flushAudioQueue()
+        processAudioQueue()
         guard let rawChunk = melQueue.popNextChunk() else { return nil }
         
         // Advance decoder mask
@@ -341,20 +264,27 @@ public class LSEENDSession {
         return input
     }
     
+    // MARK: - Snapshot and Rollback
+    
     public func takeSnapshot() -> Snapshot {
-        lock.withLock {
-            Snapshot(
-                state: input.state.copy(),
-                melQueue: melQueue,
-                audioQueue: audioQueue,
-                cmnMean: cmnMean,
-                cmnCount: cmnCount,
-                decoderMaskEnd: decoderMaskEnd
-            )
-        }
+        lock.lock()
+        defer { lock.unlock() }
+        let result = Snapshot(
+            state: input.state.copy(),
+            melQueue: melQueue,
+            audioQueue: audioQueue,
+            cmnMean: cmnMean,
+            cmnCount: cmnCount,
+            decoderMaskEnd: decoderMaskEnd
+        )
+        return result
     }
     
-    public func rollback(to snapshot: consuming Snapshot, keepingState: Bool = false)  {
+    /// Rollback to a previous snapshot.
+    /// - Parameters:
+    ///   - snapshot Snapshot to revert to
+    ///   - keepingState Whether to preserve the current recurrent state
+    public func rollback(to snapshot: consuming Snapshot, keepingState: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
         if !keepingState { self.input.state = snapshot.state }
@@ -365,7 +295,21 @@ public class LSEENDSession {
         self.decoderMaskEnd = snapshot.decoderMaskEnd
     }
     
-    private func flushAudioQueue() {
+    /// Clear preprocessor buffers + model recurrence state + frame counter.
+    public func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        vDSP.fill(&cmnMean, with: 0)
+        cmnCount = 0
+        decoderMaskEnd = 0
+        audioQueue.reset()
+        melQueue.reset()
+        input.resetState()
+    }
+    
+    // MARK: - Helpers
+    
+    private func processAudioQueue() {
         guard let audioChunk = audioQueue.popAllChunks() else { return }
 
         var (melFeats, melFrames, _) = melSpectrogram.computeFlatTransposed(
@@ -398,110 +342,34 @@ public class LSEENDSession {
     }
 }
 
-public class LSEENDInput: MLFeatureProvider {
-    var state: LSEENDState
-    let melFeatures: MLMultiArray
-    let decoderMask: MLMultiArray
-    var warmupFrames: Int = 0
+// MARK: - Streaming Chunk Queue
 
-    public var featureNames: Set<String> {[
-        "features",
-        "enc_kv", "enc_scale",
-        "enc_conv_cache", "cnn_window",
-        "dec_kv", "dec_scale",
-        "valid_mask"
-    ]}
-
-    public init(from metadata: LSEENDMetadata, state: LSEENDState? = nil) throws {
-        self.state = try state ?? LSEENDState(from: metadata)
-        let T = NSNumber(value: metadata.chunkSize)
-        let M = NSNumber(value: metadata.melFrames)
-        let N = NSNumber(value: metadata.nMels)
-        self.melFeatures = try MLMultiArray(shape: [1, M, N], dataType: .float32)
-        self.decoderMask = try MLMultiArray(shape: [T], dataType: .float32)
-    }
-
-    /// Reset state + input buffers for a fresh stream.
-    public func reset() {
-        state.reset()
-        clearMultiArray(melFeatures)
-        clearMultiArray(decoderMask)
-    }
-    
-    @inline(__always)
-    public func loadInputs<C: AccelerateBuffer>(
-        melFeatures newMelFeatures: C,
-        decoderMask newDecoderMask: C,
-        warmupFrames: Int? = nil
-    ) throws where C.Element == Float {
-        try Self.load(decoderMask, from: newDecoderMask)
-        try Self.load(melFeatures, from: newMelFeatures)
-        self.warmupFrames = warmupFrames ??
-            newDecoderMask.withUnsafeBufferPointer { $0.count(where: \.isZero) }
-    }
-    
-    public func featureValue(for featureName: String) -> MLFeatureValue? {
-        switch featureName {
-        case "features": return MLFeatureValue(multiArray: melFeatures)
-        case "enc_kv": return MLFeatureValue(multiArray: state.encRetKv)
-        case "enc_scale": return MLFeatureValue(multiArray: state.encRetScale)
-        case "enc_conv_cache": return MLFeatureValue(multiArray: state.encConvCache)
-        case "cnn_window": return MLFeatureValue(multiArray: state.cnnWindow)
-        case "dec_kv": return MLFeatureValue(multiArray: state.decRetKv)
-        case "dec_scale": return MLFeatureValue(multiArray: state.decRetScale)
-        case "valid_mask": return MLFeatureValue(multiArray: decoderMask)
-        default: return nil
-        }
-    }
-    
-    @inline(__always)
-    private static func load<C: AccelerateBuffer>(
-        _ multiArray: MLMultiArray,
-        from buffer: C,
-    ) throws {
-        guard buffer.count == multiArray.count else {
-            throw LSEENDError.invalidInputSize(
-                "Input size mismatch: new=\(buffer.count) expected=\(multiArray.count)")
-        }
-        
-        _ = buffer.withUnsafeBufferPointer { buf in
-            memcpy(multiArray.dataPointer, buf.baseAddress,
-                   buf.count * MemoryLayout<Float>.stride)
-        }
-    }
-}
-
-
-
-struct SlidingWindowBuffer {
-    /// Stride between elements if features are n-dimensional arrays
-    let stride: Int
+public struct StreamingChunkQueue {
+    /// Stride between frames if features are n-dimensional arrays
+    public let stride: Int
 
     /// Total context size in floats (`leftContextFloats + rightContextFloats`).
-    /// Kept as a single value so `popAllChunks` / `readyChunks` arithmetic
-    /// (`unreadSize - contextSize`) stays correct under the asymmetric split.
-    let contextFloats: Int
+    public let contextFloats: Int
 
     /// Unpadded chunk size
-    let chunkFloats: Int
+    public let chunkFloats: Int
 
     /// Padded chunk size — width of a `popNextChunk` / `popAllChunks` slice.
-    let paddedChunkFloats: Int
+    public let paddedChunkFloats: Int
     
     /// Whether the buffer is empty
-    var isEmpty: Bool { buffer.isEmpty }
-
-    /// Pre-pad width in floats — how many leading zeros are seeded at init
-    /// and restored by `reset()`. Under the asymmetric left/right split this
-    /// equals `leftContextFloats`; `contextSize / 2` would be wrong when
-    /// left ≠ right.
-    private let leftContextFloats: Int
+    public var isEmpty: Bool { buffer.isEmpty }
 
     /// Number of unread floats
     public var unreadFloats: Int { buffer.count - head }
 
     /// Number of full chunks currently poppable via `popNextChunk` / `popAllChunks`.
     public var readyChunks: Int { max(0, (unreadFloats - contextFloats) / chunkFloats) }
+    
+    // MARK: - Private attributes
+    
+    /// Pre-pad width in floats — how many leading zeros are seeded at init
+    private let leftContextFloats: Int
 
     /// Next index at which to start processing
     private var head: Int
@@ -514,12 +382,13 @@ struct SlidingWindowBuffer {
         buffer.count - head >= paddedChunkFloats
     }
 
-    /// Asymmetric left/right context. `rightContextLength` may be negative,
-    /// in which case `head` advances past the popped slice by
-    /// `-rightContextLength` strides each pop — useful when the consumer's
-    /// per-window read is shorter than the advance block. Caller must ensure
-    /// `leftContextLength + rightContextLength >= 0` so `contextFloats`
-    /// (used by `readyChunks` / `popAllChunks`) stays non-negative.
+    // MARK: - Init
+    
+    /// - Parameters:
+    ///   - chunkLength Number of frames in a chunk
+    ///   - leftContextLength Number of frames in a chunk's left context
+    ///   - rightContextLength Number of frames in a chunk's right context (may be negative)
+    ///   - stride Number of floats in a frame
     public init(
         chunkLength: Int,
         leftContextLength: Int,
@@ -537,6 +406,8 @@ struct SlidingWindowBuffer {
         self.buffer.reserveCapacity(paddedChunkFloats * 2)
         self.buffer.append(contentsOf: repeatElement(0, count: leftContextFloats))
     }
+    
+    // MARK: - Append and Pop
 
     public mutating func append<C: Collection>(_ newElements: C)
     where C.Element == Float {
@@ -575,11 +446,11 @@ struct SlidingWindowBuffer {
     }
 }
 
+// MARK: - Errors
 
-@inline(__always)
-private func clearMultiArray(_ buffer: MLMultiArray) {
-    buffer.withUnsafeMutableBufferPointer(ofType: Float.self) { buf, strides in
-        guard let base = buf.baseAddress else { return }
-        vDSP_vclr(base, 1, vDSP_Length(buf.count))
-    }
+public enum LSEENDError: Error, LocalizedError {
+    case initializationFailed(String)
+    case inferenceFailed(String)
+    case invalidInputSize(String)
+    case notInitialized
 }

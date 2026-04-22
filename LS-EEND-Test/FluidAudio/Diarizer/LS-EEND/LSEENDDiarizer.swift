@@ -18,7 +18,7 @@ public final class LSEENDDiarizer: Diarizer {
 
     // MARK: - Dependencies
     private var model: LSEENDModel? = nil
-    private var session: LSEENDSession? = nil
+    private var session: LSEENDFeatureProvider? = nil
 
     public var timeline: DiarizerTimeline
 
@@ -39,7 +39,7 @@ public final class LSEENDDiarizer: Diarizer {
     public init(model: LSEENDModel) throws {
         self.model = model
         let metadata = model.metadata
-        self.session = try LSEENDSession(from: metadata)
+        self.session = try LSEENDFeatureProvider(from: metadata)
 
         self.timeline = DiarizerTimeline(
             config: .default(
@@ -69,7 +69,7 @@ public final class LSEENDDiarizer: Diarizer {
             progressHandler: progressHandler
         )
         self.model = model
-        self.session = try LSEENDSession(from: model.metadata)
+        self.session = try LSEENDFeatureProvider(from: model.metadata)
         // Re-seed warmup counter + clear any prior streaming state — the
         // new model may have a different `convDelay`, so leaving stale
         // state around would mis-trim the first chunk after hot-swap.
@@ -90,7 +90,7 @@ public final class LSEENDDiarizer: Diarizer {
         guard let session else { throw LSEENDError.notInitialized }
         session.reset()
         try session.enqueueAudio(samples, withSampleRate: sourceSampleRate)
-        try session.finalizeQueuedAudio()
+        try session.drainRightContextWithSilence()
 
         var out: [Float] = []
         while let input = try session.emitNextChunk() {
@@ -186,7 +186,7 @@ public final class LSEENDDiarizer: Diarizer {
         }
 
         if finalizeOnCompletion {
-            try session.finalizeQueuedAudio()
+            try session.drainRightContextWithSilence()
         }
 
         _ = try flush(recordFrames: recordFrames, progressCallback: progressCallback)
@@ -263,28 +263,15 @@ public final class LSEENDDiarizer: Diarizer {
         let sessionSnapshot = session.takeSnapshot()
         let timelineSnapshot = timeline.takeSnapshot()
         let isNamed = name != nil
-        // Only require a previously-unnamed slot when the caller is naming a
-        // speaker AND refuses to overwrite an existing name. `overwrite=true`
-        // (or unenroll, which is inherently an overwrite) allows matching
-        // against named slots too.
+
         let requireNewSpeaker = isNamed && !overwriteAssignedSpeakerName
-        var succeeded = false
         
         if timeline.hasSegments {
             logger.warning("Enrolling speaker mid session. The timeline will be reset if successful.")
         }
         
-        defer {
-            if succeeded {
-                timeline.reset(keepingSpeakers: true)
-            } else {
-                session.rollback(to: sessionSnapshot)
-                timeline.rollback(to: timelineSnapshot)
-            }
-        }
-        
         // Flush queued audio, including right context.
-        try session.finalizeQueuedAudio()
+        try session.drainRightContextWithSilence()
         _ = try flush(progressCallback: nil)
         
         // Snapshot old speakers starting here after old audio has been flushed
@@ -303,12 +290,16 @@ public final class LSEENDDiarizer: Diarizer {
         )
         
         // Flush enrollment audio queued in the right context
-        try session.finalizeQueuedAudio()
+        try session.drainRightContextWithSilence()
         
         // Process enrollment audio. The new speaker will be extracted from this timeline update.
         guard let update = try flush(recordFrames: false, progressCallback: nil),
               !update.finalizedSegments.isEmpty
-        else { return nil }
+        else {
+            session.rollback(to: sessionSnapshot)
+            timeline.rollback(to: timelineSnapshot)
+            return nil
+        }
         
         // Get the new/unnamed speaker with the most speech if any exist.
         // Fallback to old speaker with the most speech if overwrites are allowed.
@@ -317,8 +308,7 @@ public final class LSEENDDiarizer: Diarizer {
             speechActivities[segment.speakerIndex, default: 0] += segment.activity * Float(segment.length)
         }
         
-        // Comparator is `areInIncreasingOrder` for `max(by:)`: return true
-        // when `$0 < $1`. Ordering: NEW > OLD, then by descending activity.
+        // Prioritized unnamed speakers; speech activity is secondary
         let bestSlot = speechActivities.max {
             let isFirstOld = oldSlots.contains($0.key)
             let isSecondOld = oldSlots.contains($1.key)
@@ -332,12 +322,14 @@ public final class LSEENDDiarizer: Diarizer {
               let enrolledSpeaker = timeline.speakers[bestSlot],
               !requireNewSpeaker || !oldSlots.contains(bestSlot)
         else {
+            session.rollback(to: sessionSnapshot)
+            timeline.rollback(to: timelineSnapshot)
             return nil
         }
         
         // Rename speaker and report success
         enrolledSpeaker.name = name
-        succeeded = true
+        timeline.reset(keepingSpeakers: true)
         
         return enrolledSpeaker
     }
@@ -360,7 +352,7 @@ public final class LSEENDDiarizer: Diarizer {
         }
 
         // Drain pending real audio, capture real-frame target.
-        try session.finalizeQueuedAudio()
+        try session.drainRightContextWithSilence()
         let update = try process()
 
         timeline.finalize()

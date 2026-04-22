@@ -63,11 +63,6 @@ public class LSEENDModel {
         let repo = variant.repo
         let repoPath = directory.appendingPathComponent(repo.folderName)
         let modelRelPath = variant.fileName(forStep: stepSize)
-        // LS-EEND repos live under a `subPath` inside the HF repo
-        // (e.g. `optimized/dih3`). Both the remote listing path and the
-        // local save path must include it — `downloadSubdirectory` saves
-        // files at `repoPath + <repo-relative path>`, so `modelURL` has to
-        // mirror that layout or the exists-check never fires.
         let fullRelPath = repo.subPath.map { "\($0)/\(modelRelPath)" } ?? modelRelPath
         let modelURL = repoPath.appendingPathComponent(fullRelPath)
 
@@ -151,3 +146,74 @@ public class LSEENDModel {
     }
 }
 
+public class LSEENDInput: MLFeatureProvider {
+    public var state: LSEENDState
+    public let melFeatures: MLMultiArray
+    public let decoderMask: MLMultiArray
+    public var warmupFrames: Int = 0
+
+    public var featureNames: Set<String> {[
+        "features",
+        "enc_kv", "enc_scale",
+        "enc_conv_cache", "cnn_window",
+        "dec_kv", "dec_scale",
+        "valid_mask"
+    ]}
+
+    public init(from metadata: LSEENDMetadata, state: consuming LSEENDState? = nil) throws {
+        self.state = try state ?? LSEENDState(from: metadata)
+        let T = NSNumber(value: metadata.chunkSize)
+        let M = NSNumber(value: metadata.melFrames)
+        let N = NSNumber(value: metadata.nMels)
+        self.melFeatures = try MLMultiArray(shape: [1, M, N], dataType: .float32)
+        self.decoderMask = try MLMultiArray(shape: [T], dataType: .float32)
+    }
+
+    /// Reset state
+    @inline(__always)
+    public func resetState() {
+        state.reset()
+    }
+    
+    @inline(__always)
+    public func loadInputs<C: AccelerateBuffer>(
+        melFeatures newMelFeatures: C,
+        decoderMask newDecoderMask: C,
+        warmupFrames: Int? = nil
+    ) throws where C.Element == Float {
+        try Self.load(decoderMask, from: newDecoderMask)
+        try Self.load(melFeatures, from: newMelFeatures)
+        self.warmupFrames = warmupFrames ??
+            newDecoderMask.withUnsafeBufferPointer { $0.count(where: \.isZero) }
+    }
+    
+    public func featureValue(for featureName: String) -> MLFeatureValue? {
+        switch featureName {
+        case "features": return MLFeatureValue(multiArray: melFeatures)
+        case "enc_kv": return MLFeatureValue(multiArray: state.encRetKv)
+        case "enc_scale": return MLFeatureValue(multiArray: state.encRetScale)
+        case "enc_conv_cache": return MLFeatureValue(multiArray: state.encConvCache)
+        case "cnn_window": return MLFeatureValue(multiArray: state.cnnWindow)
+        case "dec_kv": return MLFeatureValue(multiArray: state.decRetKv)
+        case "dec_scale": return MLFeatureValue(multiArray: state.decRetScale)
+        case "valid_mask": return MLFeatureValue(multiArray: decoderMask)
+        default: return nil
+        }
+    }
+    
+    @inline(__always)
+    private static func load<C: AccelerateBuffer>(
+        _ multiArray: MLMultiArray,
+        from buffer: C,
+    ) throws {
+        guard buffer.count == multiArray.count else {
+            throw LSEENDError.invalidInputSize(
+                "Input size mismatch: new=\(buffer.count) expected=\(multiArray.count)")
+        }
+        
+        _ = buffer.withUnsafeBufferPointer { buf in
+            memcpy(multiArray.dataPointer, buf.baseAddress,
+                   buf.count * MemoryLayout<Float>.stride)
+        }
+    }
+}
